@@ -609,7 +609,6 @@ namespace lfs::vis::gui {
         reg_panel("native.status_bar", "##StatusBar",
                   make_panel(RmlStatusBarPanel(&rml_status_bar_)),
                   PanelSpace::StatusBar, 0);
-        reg.set_panel_disabled_override("lfs.status_bar");
     }
 
     void GuiManager::render() {

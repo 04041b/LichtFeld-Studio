@@ -368,6 +368,7 @@ if (WIN32)
     )
     target_link_libraries(lfs_visualizer PRIVATE
             Ole32       # OLE drag-drop (IDropTarget)
+            dxgi        # DXGI per-process VRAM query
     )
 elseif (UNIX AND NOT APPLE)
     target_link_libraries(lfs_visualizer PRIVATE
