@@ -625,7 +625,7 @@ crf-curve {
     flex: 1;
     min-width: 0;
     box-sizing: border-box;
-    font-family: JetBrainsMono;
+    font-family: "JetBrains Mono";
 }
 
 .num-step-btn {

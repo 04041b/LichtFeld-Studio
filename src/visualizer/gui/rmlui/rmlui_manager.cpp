@@ -83,6 +83,13 @@ namespace lfs::vis::gui {
             } else {
                 LOG_WARN("RmlUI: failed to load NotoSansKR-Regular.ttf");
             }
+
+            const auto mono_path = lfs::vis::getAssetPath("fonts/JetBrainsMono-Regular.ttf");
+            if (Rml::LoadFontFace(mono_path.string(), false)) {
+                LOG_INFO("RmlUI: loaded font {}", mono_path.string());
+            } else {
+                LOG_WARN("RmlUI: failed to load JetBrainsMono-Regular.ttf");
+            }
         } catch (const std::exception& e) {
             LOG_WARN("RmlUI: font not found: {}", e.what());
         }
