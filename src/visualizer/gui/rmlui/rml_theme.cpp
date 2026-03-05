@@ -244,6 +244,8 @@ namespace lfs::vis::gui::rml_theme {
                    ".nav-arrow {{ color: {4}; border-color: {2}; }}\n"
                    ".nav-arrow:hover {{ background-color: {3}; color: {5}; border-color: {8}; }}\n"
                    "#sidebar {{ background-color: {1}; border-color: {2}; }}\n"
+                   ".hk-key {{ background-color: {3}; color: {5}; }}\n"
+                   ".hk-label {{ color: {4}; }}\n"
                    "#status-bar {{ background-color: {1}; border-color: {2}; }}\n"
                    ".status-item {{ color: {4}; }}\n"
                    ".status-counter {{ color: {4}; }}\n"

@@ -93,6 +93,17 @@
     <span class="status-item" id="st-h"></span>
     <span class="status-item" id="st-ch"></span>
     <span class="status-item" id="st-zoom"></span>
+    <span class="status-keys">
+      <span class="hk"><span class="hk-key">&#x2190;&#x2192;</span><span class="hk-label">Navigate</span></span>
+      <span class="hk"><span class="hk-key">F</span><span class="hk-label">Fit</span></span>
+      <span class="hk"><span class="hk-key">1</span><span class="hk-label">100%</span></span>
+      <span class="hk"><span class="hk-key">+ &#x2212; / Scroll</span><span class="hk-label">Zoom</span></span>
+      <span class="hk"><span class="hk-key">I</span><span class="hk-label">Info</span></span>
+      <span class="hk"><span class="hk-key">T</span><span class="hk-label">Thumbs</span></span>
+      <span class="hk"><span class="hk-key">M</span><span class="hk-label">Mask</span></span>
+      <span class="hk"><span class="hk-key">R</span><span class="hk-label">Reset</span></span>
+      <span class="hk"><span class="hk-key">Esc</span><span class="hk-label">Close</span></span>
+    </span>
     <span class="status-counter" id="st-counter"></span>
   </div>
 

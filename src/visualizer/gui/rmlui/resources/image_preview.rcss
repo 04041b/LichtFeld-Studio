@@ -311,6 +311,32 @@
     letter-spacing: 0.5dp;
 }
 
+.status-keys {
+    display: flex;
+    align-items: center;
+    margin-left: auto;
+    margin-right: auto;
+    gap: 8dp;
+}
+
+.hk {
+    display: flex;
+    align-items: center;
+    gap: 2dp;
+}
+
+.hk-key {
+    font-size: 8dp;
+    padding: 1dp 3dp;
+    border-radius: 2dp;
+    letter-spacing: 0.3dp;
+}
+
+.hk-label {
+    font-size: 8dp;
+    letter-spacing: 0.3dp;
+}
+
 .status-counter {
     font-size: 9dp;
     margin-left: auto;

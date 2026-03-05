@@ -23,6 +23,8 @@ KI_R = 29
 KI_T = 31
 KI_OEM_PLUS = 39
 KI_OEM_MINUS = 41
+KI_ADD = 63
+KI_SUBTRACT = 65
 KI_ESCAPE = 81
 KI_END = 88
 KI_HOME = 89
@@ -615,10 +617,10 @@ class ImagePreviewPanel(RmlPanel):
             self._reset_pan()
             self._dirty = True
             event.stop_propagation()
-        elif key == KI_OEM_PLUS:
+        elif key == KI_OEM_PLUS or key == KI_ADD:
             self._zoom_in()
             event.stop_propagation()
-        elif key == KI_OEM_MINUS:
+        elif key == KI_OEM_MINUS or key == KI_SUBTRACT:
             self._zoom_out()
             event.stop_propagation()
         elif key == KI_SPACE:

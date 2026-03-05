@@ -88,6 +88,10 @@ namespace lfs::vis::gui {
             case ImGuiKey_F10: return SDL_SCANCODE_F10;
             case ImGuiKey_F11: return SDL_SCANCODE_F11;
             case ImGuiKey_F12: return SDL_SCANCODE_F12;
+            case ImGuiKey_Equal:          return SDL_SCANCODE_EQUALS;
+            case ImGuiKey_Minus:          return SDL_SCANCODE_MINUS;
+            case ImGuiKey_KeypadAdd:      return SDL_SCANCODE_KP_PLUS;
+            case ImGuiKey_KeypadSubtract: return SDL_SCANCODE_KP_MINUS;
             default: break;
             }
             // clang-format on

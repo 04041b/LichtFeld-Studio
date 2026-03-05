@@ -135,6 +135,10 @@ namespace lfs::vis::gui {
             case SDL_SCANCODE_F10: return Rml::Input::KI_F10;
             case SDL_SCANCODE_F11: return Rml::Input::KI_F11;
             case SDL_SCANCODE_F12: return Rml::Input::KI_F12;
+            case SDL_SCANCODE_EQUALS:   return Rml::Input::KI_OEM_PLUS;
+            case SDL_SCANCODE_MINUS:    return Rml::Input::KI_OEM_MINUS;
+            case SDL_SCANCODE_KP_PLUS:  return Rml::Input::KI_ADD;
+            case SDL_SCANCODE_KP_MINUS: return Rml::Input::KI_SUBTRACT;
             default: break;
             }
             // clang-format on
