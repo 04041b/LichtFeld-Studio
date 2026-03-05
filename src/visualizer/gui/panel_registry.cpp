@@ -177,12 +177,20 @@ namespace lfs::vis::gui {
                         constexpr float kResizeEdge = 6.0f;
                         constexpr float kMinPanelWidth = 300.0f;
                         constexpr float kMinPanelHeight = 150.0f;
+                        const bool on_left = mouse.x >= px - kResizeEdge && mouse.x < px + kResizeEdge;
                         const bool on_right = mouse.x >= px + w - kResizeEdge && mouse.x < px + w + kResizeEdge;
+                        const bool on_top = mouse.y >= py - kResizeEdge && mouse.y < py + kResizeEdge;
                         const bool on_bottom = mouse.y >= py + h - kResizeEdge && mouse.y < py + h + kResizeEdge;
-                        const bool mouse_in_resize_right = on_right && mouse.y >= py && mouse.y < py + h && !on_bottom;
-                        const bool mouse_in_resize_bottom = on_bottom && mouse.x >= px && mouse.x < px + w && !on_right;
-                        const bool mouse_in_resize_corner = on_right && on_bottom;
-                        const bool mouse_in_resize_grip = mouse_in_resize_right || mouse_in_resize_bottom || mouse_in_resize_corner;
+                        const bool on_edge_x = on_left || on_right;
+                        const bool on_edge_y = on_top || on_bottom;
+                        const bool in_y_range = mouse.y >= py - kResizeEdge && mouse.y < py + h + kResizeEdge;
+                        const bool in_x_range = mouse.x >= px - kResizeEdge && mouse.x < px + w + kResizeEdge;
+                        const bool mouse_in_resize_grip =
+                            (on_edge_x && on_edge_y) ||
+                            (on_edge_x && !on_edge_y && in_y_range) ||
+                            (on_edge_y && !on_edge_x && in_x_range);
+                        const int8_t hover_dir_x = on_left ? int8_t(-1) : (on_right ? int8_t(1) : int8_t(0));
+                        const int8_t hover_dir_y = on_top ? int8_t(-1) : (on_bottom ? int8_t(1) : int8_t(0));
 
                         {
                             std::lock_guard lock(mutex_);
@@ -195,11 +203,13 @@ namespace lfs::vis::gui {
                                 if (mouse_in_resize_grip && !any_active && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                                     pi.float_resizing = true;
                                     pi.float_resize_start_w = w;
-                                    pi.float_resize_start_mx = mouse.x;
                                     pi.float_resize_start_h = h;
+                                    pi.float_resize_start_mx = mouse.x;
                                     pi.float_resize_start_my = mouse.y;
-                                    pi.float_resize_x = mouse_in_resize_right || mouse_in_resize_corner;
-                                    pi.float_resize_y = mouse_in_resize_bottom || mouse_in_resize_corner;
+                                    pi.float_resize_start_px = px;
+                                    pi.float_resize_start_py = py;
+                                    pi.float_resize_dir_x = hover_dir_x;
+                                    pi.float_resize_dir_y = hover_dir_y;
                                 } else if (mouse_in_titlebar && !mouse_in_resize_grip && !any_active &&
                                            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                                     pi.float_dragging = true;
@@ -217,20 +227,28 @@ namespace lfs::vis::gui {
                                 }
                                 if (pi.float_resizing) {
                                     if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                                        if (pi.float_resize_x) {
-                                            const float dx = mouse.x - pi.float_resize_start_mx;
+                                        const float dx = mouse.x - pi.float_resize_start_mx;
+                                        const float dy = mouse.y - pi.float_resize_start_my;
+                                        if (pi.float_resize_dir_x == 1) {
                                             w = std::max(kMinPanelWidth, pi.float_resize_start_w + dx);
                                             pi.initial_width = w;
+                                        } else if (pi.float_resize_dir_x == -1) {
+                                            w = std::max(kMinPanelWidth, pi.float_resize_start_w - dx);
+                                            px = pi.float_resize_start_px + pi.float_resize_start_w - w;
+                                            pi.initial_width = w;
                                         }
-                                        if (pi.float_resize_y) {
-                                            const float dy = mouse.y - pi.float_resize_start_my;
+                                        if (pi.float_resize_dir_y == 1) {
                                             h = std::max(kMinPanelHeight, pi.float_resize_start_h + dy);
+                                            pi.float_user_height = h;
+                                        } else if (pi.float_resize_dir_y == -1) {
+                                            h = std::max(kMinPanelHeight, pi.float_resize_start_h - dy);
+                                            py = pi.float_resize_start_py + pi.float_resize_start_h - h;
                                             pi.float_user_height = h;
                                         }
                                     } else {
                                         pi.float_resizing = false;
-                                        pi.float_resize_x = false;
-                                        pi.float_resize_y = false;
+                                        pi.float_resize_dir_x = 0;
+                                        pi.float_resize_dir_y = 0;
                                     }
                                 }
 
@@ -252,14 +270,17 @@ namespace lfs::vis::gui {
                             std::lock_guard lock(mutex_);
                             if (snap.index < panels_.size() && panels_[snap.index].idname == snap.idname) {
                                 const auto& pi = panels_[snap.index];
-                                const bool rx = pi.float_resizing ? pi.float_resize_x : (mouse_in_resize_right || mouse_in_resize_corner);
-                                const bool ry = pi.float_resizing ? pi.float_resize_y : (mouse_in_resize_bottom || mouse_in_resize_corner);
-                                if (rx && ry)
-                                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
-                                else if (rx)
+                                const int8_t dx = pi.float_resizing ? pi.float_resize_dir_x : hover_dir_x;
+                                const int8_t dy = pi.float_resizing ? pi.float_resize_dir_y : hover_dir_y;
+                                if (dx && dy) {
+                                    const bool nw_se = (dx == dy);
+                                    ImGui::SetMouseCursor(nw_se ? ImGuiMouseCursor_ResizeNWSE
+                                                                : ImGuiMouseCursor_ResizeNESW);
+                                } else if (dx) {
                                     ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                                else if (ry)
+                                } else if (dy) {
                                     ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                                }
                             }
                         }
 
