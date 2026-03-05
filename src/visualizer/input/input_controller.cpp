@@ -1406,6 +1406,22 @@ namespace lfs::vis {
             .equirectangular = is_equirectangular}
             .emit();
 
+        // In orthographic mode, recalculate ortho_scale to match the equivalent perspective view
+        if (auto* rm = services().renderingOrNull()) {
+            auto settings = rm->getSettings();
+            if (settings.orthographic && !is_equirectangular) {
+                const float distance_to_pivot = glm::length(viewport_.camera.pivot - viewport_.camera.t);
+                const float half_tan_fov = std::tan(glm::radians(fov_y_deg) * 0.5f);
+                const float viewport_height = static_cast<float>(viewport_.windowSize.y);
+                constexpr float MIN_SCALE = 1.0f;
+                constexpr float MAX_SCALE = 10000.0f;
+                settings.ortho_scale = std::clamp(
+                    viewport_height / (2.0f * distance_to_pivot * half_tan_fov),
+                    MIN_SCALE, MAX_SCALE);
+                rm->updateSettings(settings);
+            }
+        }
+
         // Force immediate camera update
         ui::CameraMove{
             .rotation = viewport_.getRotationMatrix(),
