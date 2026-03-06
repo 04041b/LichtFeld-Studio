@@ -23,8 +23,8 @@
 #include <SDL3/SDL_scancode.h>
 #include <algorithm>
 #include <cassert>
-#include <cmath>
 #include <cfloat>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <format>
