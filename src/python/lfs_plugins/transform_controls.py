@@ -155,6 +155,11 @@ class TransformControlsPanel(RmlPanel):
         header = doc.get_element_by_id("hdr-transform")
         if header:
             header.add_event_listener("click", self._on_toggle_header)
+            section = doc.get_element_by_id("transform-section")
+            arrow = doc.get_element_by_id("arrow-transform")
+            if section:
+                from . import rml_widgets as w
+                w.sync_section_state(section, not self._collapsed, header, arrow)
 
         body = doc.get_element_by_id("body")
         if body:
@@ -496,11 +501,12 @@ class TransformControlsPanel(RmlPanel):
 
     def _on_toggle_header(self, event):
         self._collapsed = not self._collapsed
+        header = self._doc.get_element_by_id("hdr-transform")
         section = self._doc.get_element_by_id("transform-section")
         arrow = self._doc.get_element_by_id("arrow-transform")
         if section:
             from . import rml_widgets as w
-            w.animate_section_toggle(section, not self._collapsed, arrow)
+            w.animate_section_toggle(section, not self._collapsed, arrow, header_element=header)
 
     def _on_input_focus(self, event):
         if self._focus_active:

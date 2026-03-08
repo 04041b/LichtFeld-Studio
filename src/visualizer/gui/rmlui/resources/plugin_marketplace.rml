@@ -37,11 +37,11 @@
     <div id="manual-feedback"></div>
 
     <!-- Supported formats (collapsible) -->
-    <div id="formats-header" class="mp-formats-header">
+    <div id="formats-header" class="section-header mp-formats-header">
       <span class="section-arrow" id="formats-arrow">&#x25B6;</span>
-      <span class="text-disabled">{{formats_label}}</span>
+      <span>{{formats_label}}</span>
     </div>
-    <div id="formats-content" class="collapsed">
+    <div id="formats-content" class="section-content collapsed">
       <div class="mp-format-item">https://github.com/owner/repo</div>
       <div class="mp-format-item">github:owner/repo</div>
       <div class="mp-format-item">owner/repo</div>

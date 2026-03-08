@@ -59,6 +59,12 @@ class SelectionGroupsPanel(RmlPanel):
         if body:
             body.add_event_listener("click", self._on_body_click)
 
+        section = doc.get_element_by_id("groups-section")
+        arrow = doc.get_element_by_id("arrow-groups")
+        if section:
+            from . import rml_widgets as w
+            w.sync_section_state(section, not self._collapsed, header, arrow)
+
         self._update_labels()
 
     def on_update(self, doc):
@@ -91,11 +97,12 @@ class SelectionGroupsPanel(RmlPanel):
 
     def _on_toggle_section(self, event):
         self._collapsed = not self._collapsed
+        header = self.doc.get_element_by_id("hdr-groups")
         section = self.doc.get_element_by_id("groups-section")
         arrow = self.doc.get_element_by_id("arrow-groups")
         if section:
             from . import rml_widgets as w
-            w.animate_section_toggle(section, not self._collapsed, arrow)
+            w.animate_section_toggle(section, not self._collapsed, arrow, header_element=header)
 
     def _on_add_group(self, event):
         scene = lf.get_scene()

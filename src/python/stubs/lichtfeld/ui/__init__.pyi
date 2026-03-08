@@ -216,6 +216,9 @@ def unregister_panel(cls: object) -> None:
 def unregister_all_panels() -> None:
     """Unregister all Python panels"""
 
+def unregister_panels_for_module(module_prefix: str) -> None:
+    """Unregister all panels registered by a given module prefix"""
+
 def get_panel_names(space: str = 'FLOATING') -> list[str]:
     """Get registered panel names for a given space"""
 

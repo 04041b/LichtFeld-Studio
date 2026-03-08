@@ -188,6 +188,12 @@ class PluginMarketplacePanel(RmlPanel):
         formats_header = doc.get_element_by_id("formats-header")
         if formats_header:
             formats_header.add_event_listener("click", self._on_toggle_formats)
+            formats_content = doc.get_element_by_id("formats-content")
+            formats_arrow = doc.get_element_by_id("formats-arrow")
+            if formats_content:
+                from . import rml_widgets as w
+                w.sync_section_state(formats_content, self._formats_open,
+                                     formats_header, formats_arrow)
 
         grid_el = doc.get_element_by_id("card-grid")
         if grid_el:
@@ -454,11 +460,13 @@ class PluginMarketplacePanel(RmlPanel):
     def _on_toggle_formats(self, _ev):
         self._formats_open = not self._formats_open
         doc = self._doc
+        header = doc.get_element_by_id("formats-header")
         content = doc.get_element_by_id("formats-content")
         arrow = doc.get_element_by_id("formats-arrow")
         if content:
             from . import rml_widgets as w
-            w.animate_section_toggle(content, self._formats_open, arrow)
+            w.animate_section_toggle(content, self._formats_open, arrow,
+                                     header_element=header)
 
     def _on_install_from_url(self, handle, event, args):
         from .manager import PluginManager

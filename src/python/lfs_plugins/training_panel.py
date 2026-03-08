@@ -268,7 +268,6 @@ class TrainingPanel(RmlPanel):
         d = lf.dataset_params
 
         self._bind_labels(model)
-        self._bind_sections(model)
         self._bind_visibility(model, p, d)
         self._bind_disabled(model, p)
         self._bind_bool_props(model, p)
@@ -301,13 +300,6 @@ class TrainingPanel(RmlPanel):
             it = AppState.iteration.value
             return tr("training_panel.resume_training") if it > 0 else tr("training_panel.start_training")
         model.bind_func("btn_start", _btn_start)
-
-    def _bind_sections(self, model):
-        for sec in SECTIONS:
-            model.bind(f"sec_{sec}_collapsed",
-                       lambda n=sec: n in self._collapsed)
-            model.bind_func(f"sec_{sec}_arrow",
-                            lambda n=sec: "\u25B6" if n in self._collapsed else "\u25BC")
 
     def _bind_visibility(self, model, p, d):
         def _state():
@@ -601,6 +593,7 @@ class TrainingPanel(RmlPanel):
             doc.get_element_by_id("loss-tick-mid"),
             doc.get_element_by_id("loss-tick-min"),
         ]
+        self._sync_section_states()
 
     def on_update(self, doc):
         if not self._handle:
@@ -708,6 +701,7 @@ class TrainingPanel(RmlPanel):
     def on_unload(self, doc):
         doc.remove_data_model("training")
         self._handle = None
+        self._doc = None
 
     def _update_loss_graph(self):
         if not self._loss_graph_el:
@@ -1005,7 +999,25 @@ class TrainingPanel(RmlPanel):
         self._step_repeat_last = now
         self._apply_num_step(self._step_repeat_prop, self._step_repeat_dir)
 
+    def _get_section_elements(self, name):
+        if not self._doc:
+            return None, None, None
+        dom_name = name.replace("_", "-")
+        header = self._doc.get_element_by_id(f"hdr-{dom_name}")
+        arrow = self._doc.get_element_by_id(f"arrow-{dom_name}")
+        content = self._doc.get_element_by_id(f"sec-{dom_name}")
+        return header, arrow, content
+
+    def _sync_section_states(self):
+        from . import rml_widgets as w
+
+        for name in SECTIONS:
+            header, arrow, content = self._get_section_elements(name)
+            if content:
+                w.sync_section_state(content, name not in self._collapsed, header, arrow)
+
     def _on_toggle_section(self, handle, event, args):
+        del handle, event
         if not args:
             return
         name = str(args[0])
@@ -1015,14 +1027,10 @@ class TrainingPanel(RmlPanel):
         else:
             self._collapsed.add(name)
 
-        sec_id = "sec-" + name.replace("_", "-")
-        content = self._doc.get_element_by_id(sec_id) if self._doc else None
+        header, arrow, content = self._get_section_elements(name)
         if content:
             from . import rml_widgets as w
-            w.animate_section_toggle(content, expanding)
-
-        handle.dirty(f"sec_{name}_collapsed")
-        handle.dirty(f"sec_{name}_arrow")
+            w.animate_section_toggle(content, expanding, arrow, header_element=header)
 
     def _on_color_click(self, handle, event, args):
         if not args:
