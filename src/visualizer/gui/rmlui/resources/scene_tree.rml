@@ -47,6 +47,11 @@
                     <span data-if="row.use_unicode_icon"
                           data-attr-class="'node-icon ' + row.type_class">{{ row.unicode_icon }}</span>
 
+                    <img data-if="row.has_mask"
+                         class="row-icon mask-icon"
+                         data-class-mask-inverted="row.mask_inverted"
+                         src="../icon/scene/mask.png" />
+
                     <span class="expand-toggle"
                           data-if="row.has_children"
                           data-attr-data-target="row.children_target">{{ row.expand_glyph }}</span>

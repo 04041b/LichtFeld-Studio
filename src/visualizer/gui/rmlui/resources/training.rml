@@ -565,10 +565,8 @@
     </div>
   </div>
 
-  <div class="separator"></div>
-
   <!-- ── Status Section ────────────────────────────────── -->
-  <div>
+  <div class="section-gap">
     <span class="status-text status-info training-status-line">{{status_mode}}</span>
     <span class="status-text status-info training-status-line">{{status_iteration}}</span>
     <span class="status-text status-info training-status-line">{{status_gaussians}}</span>

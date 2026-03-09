@@ -5,11 +5,11 @@
 </head>
 <body template="docked-panel" data-model="selection_groups">
 
-  <div class="section-header is-expanded" id="hdr-groups">
-    <span class="section-arrow is-expanded" id="arrow-groups">&#x25B6;</span>
+  <div class="section-header" id="hdr-groups">
+    <span class="section-arrow" id="arrow-groups">&#x25B6;</span>
     <span id="title-groups">{{ groups_title }}</span>
   </div>
-  <div id="groups-section" class="section-content">
+  <div id="groups-section" class="section-content collapsed">
     <button class="btn btn--secondary btn--full" id="btn-add-group">{{ add_group_label }}</button>
     <div id="groups-list">
       <div class="group-row"

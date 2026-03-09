@@ -5,7 +5,7 @@
 
 body {
     font-family: Inter;
-    padding: 6dp;
+    padding: 0;
     bottom: 0;
 }
 
@@ -13,6 +13,7 @@ body {
     min-width: 0;
     height: 0;
     flex-grow: 1;
+    padding: 6dp;
     overflow-x: hidden;
     overflow-y: auto;
 }
@@ -71,7 +72,7 @@ select {
 }
 
 .training-subsection {
-    margin-top: 6dp;
+    margin-top: 0;
 }
 
 .training-subsection-title {
@@ -95,34 +96,9 @@ select {
 
 .training-subsection > .section-header {
     margin-top: 0;
-    padding: 6dp 0 4dp;
-    gap: 4dp;
-    font-size: 10dp;
-    border-width: 0;
-    border-top-width: 1dp;
-    border-radius: 0;
-    border-color: rgba(137, 180, 250, 32);
-    background-color: transparent;
-}
-
-.training-subsection > .section-header:hover {
-    background-color: transparent;
-    border-color: rgba(137, 180, 250, 56);
-}
-
-.training-subsection > .section-header.is-expanded {
-    background-color: transparent;
-    border-color: rgba(137, 180, 250, 56);
 }
 
 .training-panel-block > .training-subsection:first-child > .section-header {
-    padding-top: 0;
-    border-top-width: 0;
-}
-
-.training-subsection > .section-header .section-arrow {
-    width: 10dp;
-    font-size: 10dp;
 }
 
 .loss-graph-wrap {

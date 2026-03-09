@@ -275,34 +275,30 @@ progress fill {
 .section-header {
     display: flex;
     align-items: center;
-    gap: 5dp;
-    padding: 5dp 8dp;
-    margin-top: 3dp;
+    gap: 4dp;
+    padding: 5dp 6dp;
+    margin: 0 -6dp;
     font-weight: bold;
     color: #cdd6f4;
     cursor: pointer;
-    font-size: 11dp;
-    border-width: 1dp;
-    border-radius: 4dp;
-    border-color: rgba(137, 180, 250, 42);
-    background-color: rgba(137, 180, 250, 36);
-    transition: background-color 0.16s cubic-out, border-color 0.16s cubic-out;
+    font-size: 10dp;
+    border-width: 0;
+    border-top-width: 4dp;
+    border-radius: 0;
+    border-color: #1e1e2e;
+    background-color: transparent;
 }
 
 .section-header:hover {
-    background-color: rgba(137, 180, 250, 72);
-    border-color: rgba(137, 180, 250, 96);
 }
 
 .section-header.is-expanded {
-    background-color: rgba(137, 180, 250, 56);
-    border-color: rgba(137, 180, 250, 128);
 }
 
 .section-arrow {
     display: inline-block;
-    width: 12dp;
-    font-size: 11dp;
+    width: 10dp;
+    font-size: 10dp;
     color: #cdd6f4;
     text-align: center;
     transform: rotate(0deg);
@@ -321,10 +317,23 @@ progress fill {
 .section-content {
     overflow: hidden;
     opacity: 1;
+    margin: 0 -6dp;
+    padding: 0 6dp;
+    border-width: 0;
+    border-bottom-width: 4dp;
+    border-color: #1e1e2e;
 }
 
 .section-content.collapsed {
     display: none;
+}
+
+.section-gap {
+    border-width: 0;
+    border-top-width: 4dp;
+    border-color: #1e1e2e;
+    margin: 0 -6dp;
+    padding: 0 6dp;
 }
 
 /* ── Color Controls ─────────────────────────────────────── */

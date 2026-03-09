@@ -185,6 +185,7 @@ namespace lfs::vis::gui::rml_theme {
         const auto primary = colorToRml(p.primary);
         const auto primary_dim = colorToRml(p.primary_dim);
         const auto background = colorToRml(p.background);
+        const auto shell_bg = colorToRml(t.menu_background());
         const auto border = colorToRml(p.border);
         const auto primary_select = colorToRmlAlpha(p.primary, 0.18f);
         const auto primary_select_strong = colorToRmlAlpha(p.primary, 0.28f);
@@ -294,8 +295,11 @@ namespace lfs::vis::gui::rml_theme {
                        ".setting-label {{ color: {0}; }}\n"
                        ".prop-label {{ color: {0}; }}\n"
                        ".slider-value {{ color: {1}; }}\n"
-                       ".section-header {{ color: {0}; {6}; }}\n"
-                       ".section-header:hover {{ {7}; }}\n"
+                       ".section-header {{ color: {0}; border-color: {11}; }}\n"
+                       ".section-header:hover {{ color: {0}; border-color: {11}; }}\n"
+                       ".section-header.is-expanded {{ border-color: {11}; }}\n"
+                       ".section-gap {{ border-color: {11}; }}\n"
+                       ".section-content {{ border-color: {11}; }}\n"
                        ".section-arrow {{ color: {1}; }}\n"
                        ".separator {{ background-color: {5}; }}\n"
                        ".text-disabled {{ color: {1}; }}\n"
@@ -320,7 +324,7 @@ namespace lfs::vis::gui::rml_theme {
                        ".border-error {{ border-color: {10}; }}\n"
                        ".icon-btn.selected {{ background-color: {4}; }}\n",
                        text, text_dim, surface, surface_bright, primary, border,
-                       header_decor, header_hover_decor, rounding, prog_fill_decor, error) +
+                       header_decor, header_hover_decor, rounding, prog_fill_decor, error, shell_bg) +
                    std::format(
                        ".btn--primary {{ background-color: {0}; border-color: {0}; color: {6}; }}\n"
                        ".btn--primary:hover {{ background-color: {1}; border-color: {1}; }}\n"
@@ -404,13 +408,11 @@ namespace lfs::vis::gui::rml_theme {
                 ".context-menu {{ box-shadow: {}; }}\n"
                 "selectbox {{ box-shadow: {}; }}\n"
                 ".modal-dialog {{ box-shadow: {}{}; }}\n"
-                ".color-picker-popup {{ box-shadow: {}; }}\n"
                 ".confirm-dialog {{ box-shadow: {}{}; }}\n",
                 layeredShadow(t, 2), inset,
                 layeredShadow(t, 3),
                 layeredShadow(t, 1),
                 layeredShadow(t, 4), inset,
-                layeredShadow(t, 3),
                 layeredShadow(t, 4), inset);
         }();
     }

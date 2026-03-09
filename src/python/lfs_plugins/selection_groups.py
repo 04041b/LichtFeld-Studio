@@ -25,7 +25,7 @@ class SelectionGroupsPanel(RmlPanel):
     def __init__(self):
         self.doc = None
         self._handle = None
-        self._collapsed = False
+        self._collapsed = True
         self._prev_group_hash = None
         self._color_edit_group_id = None
         self._context_menu_group_id = None
@@ -238,10 +238,11 @@ class SelectionGroupsPanel(RmlPanel):
         self._picker_el.set_attribute("green", str(float(g)))
         self._picker_el.set_attribute("blue", str(float(b)))
 
-        mx = event.get_parameter("mouse_x", "0")
-        my = event.get_parameter("mouse_y", "0")
-        self._popup_el.set_property("left", f"{mx}px")
-        self._popup_el.set_property("top", f"{int(float(my)) + 2}px")
+        mx = int(float(event.get_parameter("mouse_x", "0")))
+        my = int(float(event.get_parameter("mouse_y", "0")))
+        left = max(0, mx - 210)
+        self._popup_el.set_property("left", f"{left}px")
+        self._popup_el.set_property("top", f"{my + 2}px")
         self._popup_el.set_class("visible", True)
 
     def _hide_picker(self):

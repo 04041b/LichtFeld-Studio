@@ -155,6 +155,7 @@ class ScenePanel(RmlPanel):
         self._last_scroll_top = -1.0
         self._last_view_h = -1.0
         self._last_ui_scale = 0.0
+        self._last_invert_masks = False
 
     def on_bind_model(self, ctx):
         model = ctx.create_data_model(SCENE_MODEL_NAME)
@@ -232,6 +233,11 @@ class ScenePanel(RmlPanel):
                              "models_header_text"):
                     self._handle.dirty(name)
             dirty |= self._rebuild_tree(force=True)
+
+        cur_invert = lf.ui.get_invert_masks()
+        if cur_invert != self._last_invert_masks:
+            self._last_invert_masks = cur_invert
+            dirty |= self._render_tree_window(force=True)
 
         current = set(lf.get_selected_node_names())
         if current != self._prev_selected:
@@ -538,6 +544,7 @@ class ScenePanel(RmlPanel):
 
     def _make_node_snapshot(self, node):
         node_type = _node_type(node)
+        has_mask = bool(node_type == "CAMERA" and getattr(node, "mask_path", ""))
         return {
             "name": node.name,
             "id": node.id,
@@ -549,6 +556,7 @@ class ScenePanel(RmlPanel):
             "training_enabled": bool(getattr(node, "training_enabled", True)),
             "label": self._format_node_label(node, node_type),
             "draggable": False,
+            "has_mask": has_mask,
         }
 
     def _capture_scene_snapshot(self, scene):
@@ -578,6 +586,7 @@ class ScenePanel(RmlPanel):
             "draggable": snapshot["draggable"],
             "training_enabled": snapshot["training_enabled"],
             "label": snapshot["label"],
+            "has_mask": snapshot["has_mask"],
         }
 
     def _append_snapshot_rows(self, node_id, depth, rows, filter_text_lower):
@@ -615,6 +624,8 @@ class ScenePanel(RmlPanel):
         use_type_icon = bool(type_icon_src)
         unicode_icon = NODE_TYPE_UNICODE.get(node_type, "")
         renaming = self._rename_node == row["name"]
+        has_mask = row["has_mask"]
+        mask_inverted = has_mask and lf.ui.get_invert_masks()
         return {
             "present": True,
             "name": row["name"],
@@ -640,6 +651,8 @@ class ScenePanel(RmlPanel):
             "renaming": renaming,
             "rename_value": self._rename_buffer if renaming else "",
             "drop_target": self._drop_target == row["name"],
+            "has_mask": has_mask,
+            "mask_inverted": mask_inverted,
         }
 
     def _make_placeholder_row(self, absolute_index):
@@ -668,6 +681,8 @@ class ScenePanel(RmlPanel):
             "renaming": False,
             "rename_value": "",
             "drop_target": False,
+            "has_mask": False,
+            "mask_inverted": False,
         }
 
     def _set_row_visibility_state(self, node_name, visible):

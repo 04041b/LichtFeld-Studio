@@ -1053,10 +1053,11 @@ class TrainingPanel(RmlPanel):
         else:
             self._color_edit_prop = prop_id
             if hasattr(self, '_popup_el') and self._popup_el and event:
-                mx = event.get_parameter("mouse_x", "0")
-                my = event.get_parameter("mouse_y", "0")
-                self._popup_el.set_property("left", f"{mx}px")
-                self._popup_el.set_property("top", f"{int(float(my)) + 2}px")
+                mx = int(float(event.get_parameter("mouse_x", "0")))
+                my = int(float(event.get_parameter("mouse_y", "0")))
+                left = max(0, mx - 210)
+                self._popup_el.set_property("left", f"{left}px")
+                self._popup_el.set_property("top", f"{my + 2}px")
                 self._popup_el.set_class("visible", True)
                 handle.dirty("picker_r")
                 handle.dirty("picker_g")

@@ -148,6 +148,17 @@ body {
     image-color: #a6adc8;
 }
 
+.row-icon.mask-icon {
+    width: 12dp;
+    height: 12dp;
+    margin-right: 2dp;
+    image-color: rgba(148, 226, 213, 200);
+}
+
+.row-icon.mask-icon.mask-inverted {
+    transform: rotate(180deg);
+}
+
 /* Visibility toggle */
 .row-icon.icon-vis-on {
     image-color: rgba(102, 230, 102, 255);

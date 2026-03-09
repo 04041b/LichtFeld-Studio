@@ -91,7 +91,7 @@ class TransformControlsPanel(RmlPanel):
         self._visible = False
         self._active_tool = ""
         self._selected = []
-        self._collapsed = False
+        self._collapsed = True
 
         self._trans = [0.0, 0.0, 0.0]
         self._euler = [0.0, 0.0, 0.0]
