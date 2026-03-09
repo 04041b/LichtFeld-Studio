@@ -13,8 +13,6 @@ _HOOK_POSITION = "append"
 
 _MODEL_NAME = "viewport_overlay_status"
 _MODEL_MARKER = "data-viewport-overlay-status-bound"
-_AUTO_DISMISS_SECONDS = 2.0
-
 _document_controller = None
 _hook_registered = False
 
@@ -184,18 +182,7 @@ class _OverlayDocumentController:
         if not hasattr(lf.ui, "get_import_state"):
             return {}
 
-        state = dict(lf.ui.get_import_state())
-        is_active = state.get("active", False)
-        show_completion = state.get("show_completion", False)
-        if (
-            show_completion
-            and not is_active
-            and state.get("success", False)
-            and state.get("seconds_since_completion", 0.0) > _AUTO_DISMISS_SECONDS
-        ):
-            lf.ui.dismiss_import()
-            return {}
-        return state
+        return dict(lf.ui.get_import_state())
 
     def _get_video_state(self):
         if not hasattr(lf.ui, "get_video_export_state"):
