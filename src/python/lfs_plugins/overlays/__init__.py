@@ -282,6 +282,10 @@ class _OverlayDocumentController:
 def _draw_empty_state_overlay(layout):
     if not lf.ui.is_scene_empty() or lf.ui.is_drag_hovering() or lf.ui.is_startup_visible():
         return
+    if hasattr(lf.ui, "get_import_state"):
+        state = dict(lf.ui.get_import_state())
+        if state.get("active", False) or state.get("show_completion", False):
+            return
 
     vp_x, vp_y = layout.get_viewport_pos()
     vp_w, vp_h = layout.get_viewport_size()
