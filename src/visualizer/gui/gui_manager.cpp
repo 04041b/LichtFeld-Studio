@@ -23,6 +23,7 @@
 #include "gui/panels/python_console_panel.hpp"
 #include "gui/rmlui/rml_panel_host.hpp"
 #include "gui/rmlui/rml_theme.hpp"
+#include "gui/rmlui/rmlui_render_interface.hpp"
 #include "gui/rmlui/rmlui_system_interface.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/ui_widgets.hpp"
@@ -825,6 +826,11 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::render() {
+        if (auto* ri = rmlui_manager_.getRenderInterface()) {
+            auto* sm = viewer_->getSceneManager();
+            ri->set_scene(sm ? &sm->getScene() : nullptr);
+        }
+
         if (pending_cuda_warning_) {
             constexpr int MIN_MAJOR = lfs::core::MIN_CUDA_VERSION / 1000;
             constexpr int MIN_MINOR = (lfs::core::MIN_CUDA_VERSION % 1000) / 10;

@@ -245,7 +245,8 @@ namespace lfs::io {
             return std::nullopt;
 
         auto& nvcodec = get_nvcodec_loader();
-        auto tensor = nvcodec.load_image_from_memory_gpu(*jpeg_data, 1, 0, nullptr);
+        auto tensor = nvcodec.load_image_from_memory_gpu(
+            *jpeg_data, params.resize_factor, params.max_width, nullptr);
         if (!tensor.is_valid() || tensor.numel() == 0)
             return std::nullopt;
 
