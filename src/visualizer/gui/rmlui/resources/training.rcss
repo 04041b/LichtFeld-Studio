@@ -53,6 +53,19 @@ select {
     margin-top: 0;
 }
 
+@media (min-resolution: 1.5x) {
+    .setting-slider {
+        position: relative;
+        top: 1dp;
+    }
+}
+
+@media (min-resolution: 2x) {
+    .setting-slider {
+        top: 2dp;
+    }
+}
+
 .training-panel-title {
     display: flex;
     align-items: center;

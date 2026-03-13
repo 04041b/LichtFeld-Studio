@@ -321,6 +321,20 @@ progress fill {
     margin-top: 15dp;
 }
 
+@media (min-resolution: 1.5x) {
+    .setting-slider {
+        margin-top: 0;
+        position: relative;
+        top: 1dp;
+    }
+}
+
+@media (min-resolution: 2x) {
+    .setting-slider {
+        top: 2dp;
+    }
+}
+
 .slider-value {
     display: inline-block;
     width: 45dp;
