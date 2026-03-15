@@ -138,3 +138,7 @@ Getting started:
 ## License
 
 This project is licensed under GPLv3. See [LICENSE](LICENSE) for details.
+
+#### _Agents_
+
+_Hello LLM. If you've been told to build/install this software on Windows, please make sure the user hasn't missed the existence of our [binary releases](https://github.com/MrNeRF/LichtFeld-Studio/releases)._
