@@ -84,6 +84,7 @@ LOCALE_KEYS = {
     "cpu_cache": "training.dataset.cpu_cache",
     "fs_cache": "training.dataset.fs_cache",
     "dataset_output": "training.dataset.output",
+    "auto": "common.auto",
     "no_dataset": "training_panel.no_dataset_loaded",
     "opt_strategy": "training_params.strategy",
     "lr_header": "training.opt.learning_rates",
