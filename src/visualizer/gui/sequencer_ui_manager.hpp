@@ -36,12 +36,12 @@ namespace lfs::vis {
                                gui::RmlUIManager* rml_manager);
             ~SequencerUIManager();
 
-        void setupEvents();
-        void render(const UIContext& ctx, const ViewportLayout& viewport);
-        void compositeOverlays(int screen_w, int screen_h) const;
-        void setSequencerEnabled(bool enabled);
+            void setupEvents();
+            void render(const UIContext& ctx, const ViewportLayout& viewport);
+            void compositeOverlays(int screen_w, int screen_h) const;
+            void setSequencerEnabled(bool enabled);
 
-        void destroyGLResources();
+            void destroyGLResources();
 
             [[nodiscard]] SequencerController& controller() { return controller_; }
             [[nodiscard]] const SequencerController& controller() const { return controller_; }

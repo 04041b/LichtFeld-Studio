@@ -71,7 +71,7 @@ namespace lfs::vis::gui::native_panels {
 
     bool SequencerPanel::poll(const PanelDrawContext& ctx) {
         const bool is_enabled = !ctx.ui_hidden && ctx.ui && ctx.ui->editor &&
-                               !ctx.ui->editor->isToolsDisabled() && layout_->isShowSequencer();
+                                !ctx.ui->editor->isToolsDisabled() && layout_->isShowSequencer();
         if (!is_enabled && seq_)
             seq_->setSequencerEnabled(false);
         return is_enabled;

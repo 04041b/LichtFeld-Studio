@@ -1299,7 +1299,7 @@ namespace lfs::vis::gui {
         }
 
         if (rm->renderPreviewFrame(sm, cam_rot, cam_pos, cam_focal_length_mm,
-                                  pip_fbo_, pip_texture_, PREVIEW_WIDTH, PREVIEW_HEIGHT)) {
+                                   pip_fbo_, pip_texture_, PREVIEW_WIDTH, PREVIEW_HEIGHT)) {
             pip_last_render_time_ = now;
             if (!is_playing) {
                 pip_last_keyframe_ = selected;
@@ -1359,13 +1359,13 @@ namespace lfs::vis::gui {
 
         const float playhead = controller_.playhead();
         const std::string title = (is_playing || !selected.has_value())
-                                     ? std::vformat(LOC(lichtfeld::Strings::Sequencer::PLAYBACK_TIME),
-                                                    std::make_format_args(playhead))
-                                     : [&selected]() {
-                                           const size_t kf_num = *selected + 1;
-                                           return std::vformat(LOC(lichtfeld::Strings::Sequencer::KEYFRAME_PREVIEW),
-                                                              std::make_format_args(kf_num));
-                                       }();
+                                      ? std::vformat(LOC(lichtfeld::Strings::Sequencer::PLAYBACK_TIME),
+                                                     std::make_format_args(playhead))
+                                      : [&selected]() {
+                                            const size_t kf_num = *selected + 1;
+                                            return std::vformat(LOC(lichtfeld::Strings::Sequencer::KEYFRAME_PREVIEW),
+                                                                std::make_format_args(kf_num));
+                                        }();
         dl->AddText({pos.x + PADDING, pos.y + PADDING}, text_color, title.c_str());
 
         const ImVec2 img_pos(pos.x + PADDING, pos.y + PADDING + TITLE_HEIGHT);
