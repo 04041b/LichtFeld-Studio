@@ -79,6 +79,17 @@ namespace lfs::vis::gui {
             overlay_->destroyGLResources();
     }
 
+    void SequencerUIManager::setSequencerEnabled(const bool enabled) {
+        if (enabled)
+            return;
+
+        if (ui_state_.show_pip_preview)
+            ui_state_.show_pip_preview = false;
+
+        pip_last_keyframe_ = std::nullopt;
+        pip_needs_update_ = true;
+    }
+
     void SequencerUIManager::setupEvents() {
         using namespace lfs::core::events;
 
@@ -133,11 +144,18 @@ namespace lfs::vis::gui {
     }
 
     void SequencerUIManager::render(const UIContext& ctx, const ViewportLayout& viewport) {
+        const auto* const gui = viewer_->getGuiManager();
+        const bool sequencer_enabled = gui && gui->panelLayout().isShowSequencer();
+        if (!sequencer_enabled) {
+            setSequencerEnabled(false);
+            return;
+        }
+
         if (ui_state_.show_camera_path) {
             renderCameraPath(viewport);
             renderKeyframeGizmo(ctx, viewport);
-            renderKeyframePreview(ctx);
         }
+        renderKeyframePreview(ctx);
         renderSequencerPanel(ctx, viewport);
         {
             const float dp = panel_->cachedDpRatio();
@@ -1224,11 +1242,6 @@ namespace lfs::vis::gui {
         const bool is_playing = !controller_.isStopped();
         const auto selected = controller_.selectedKeyframe();
 
-        if (!is_playing && !selected.has_value()) {
-            pip_last_keyframe_ = std::nullopt;
-            return;
-        }
-
         const auto now = std::chrono::steady_clock::now();
         if (is_playing) {
             const float elapsed = std::chrono::duration<float>(now - pip_last_render_time_).count();
@@ -1247,6 +1260,7 @@ namespace lfs::vis::gui {
         glm::mat3 cam_rot;
         glm::vec3 cam_pos;
         float cam_focal_length_mm;
+        auto& vp = ctx.viewer->getViewport();
 
         if (is_playing) {
             const auto state = controller_.currentCameraState();
@@ -1254,23 +1268,38 @@ namespace lfs::vis::gui {
             cam_pos = state.position;
             cam_focal_length_mm = state.focal_length_mm;
         } else {
-            if (pip_last_keyframe_ == selected && !pip_needs_update_)
-                return;
+            if (selected.has_value()) {
+                if (pip_last_keyframe_ == selected && !pip_needs_update_)
+                    return;
 
-            const auto& timeline = controller_.timeline();
-            if (*selected >= timeline.size())
-                return;
+                const auto& timeline = controller_.timeline();
+                if (*selected >= timeline.size())
+                    return;
 
-            const auto* const kf = timeline.getKeyframe(*selected);
-            if (!kf)
-                return;
+                const auto* const kf = timeline.getKeyframe(*selected);
+                if (!kf)
+                    return;
 
-            cam_rot = glm::mat3_cast(kf->rotation);
-            cam_pos = kf->position;
-            cam_focal_length_mm = kf->focal_length_mm;
+                cam_rot = glm::mat3_cast(kf->rotation);
+                cam_pos = kf->position;
+                cam_focal_length_mm = kf->focal_length_mm;
+            } else {
+                if (pip_last_keyframe_.has_value()) {
+                    pip_needs_update_ = true;
+                    pip_last_keyframe_ = std::nullopt;
+                }
+                if (!pip_needs_update_)
+                    return;
+
+                cam_rot = vp.camera.R;
+                cam_pos = vp.camera.t;
+                cam_focal_length_mm = rm ? rm->getFocalLengthMm()
+                                         : lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
+            }
         }
 
-        if (rm->renderPreviewFrame(sm, cam_rot, cam_pos, cam_focal_length_mm, pip_fbo_, pip_texture_, PREVIEW_WIDTH, PREVIEW_HEIGHT)) {
+        if (rm->renderPreviewFrame(sm, cam_rot, cam_pos, cam_focal_length_mm,
+                                  pip_fbo_, pip_texture_, PREVIEW_WIDTH, PREVIEW_HEIGHT)) {
             pip_last_render_time_ = now;
             if (!is_playing) {
                 pip_last_keyframe_ = selected;
@@ -1286,12 +1315,10 @@ namespace lfs::vis::gui {
         const bool is_playing = !controller_.isStopped();
         const auto selected = controller_.selectedKeyframe();
 
-        if (!is_playing && !selected.has_value())
-            return;
         if (!pip_initialized_ || pip_texture_ == 0)
             return;
 
-        if (!is_playing) {
+        if (!is_playing && selected.has_value()) {
             const auto& timeline = controller_.timeline();
             if (*selected >= timeline.size())
                 return;
@@ -1331,13 +1358,14 @@ namespace lfs::vis::gui {
         dl->AddRect(pos, p1, border_color, t.sizes.window_rounding, 0, 2.0f);
 
         const float playhead = controller_.playhead();
-        const size_t kf_num = *selected + 1;
-        const std::string title =
-            is_playing
-                ? std::vformat(LOC(lichtfeld::Strings::Sequencer::PLAYBACK_TIME),
-                               std::make_format_args(playhead))
-                : std::vformat(LOC(lichtfeld::Strings::Sequencer::KEYFRAME_PREVIEW),
-                               std::make_format_args(kf_num));
+        const std::string title = (is_playing || !selected.has_value())
+                                     ? std::vformat(LOC(lichtfeld::Strings::Sequencer::PLAYBACK_TIME),
+                                                    std::make_format_args(playhead))
+                                     : [&selected]() {
+                                           const size_t kf_num = *selected + 1;
+                                           return std::vformat(LOC(lichtfeld::Strings::Sequencer::KEYFRAME_PREVIEW),
+                                                              std::make_format_args(kf_num));
+                                       }();
         dl->AddText({pos.x + PADDING, pos.y + PADDING}, text_color, title.c_str());
 
         const ImVec2 img_pos(pos.x + PADDING, pos.y + PADDING + TITLE_HEIGHT);
