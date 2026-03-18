@@ -691,48 +691,50 @@ namespace lfs::vis {
             }
 
             // Node picking on release
-            if (is_node_rect_dragging_ && button == static_cast<int>(input::AppMouseButton::LEFT) && tool_context_) {
+            if (is_node_rect_dragging_ && button == static_cast<int>(input::AppMouseButton::LEFT)) {
                 is_node_rect_dragging_ = false;
-                auto* scene_manager = tool_context_->getSceneManager();
-                if (scene_manager) {
-                    constexpr float CLICK_THRESHOLD_PX = 5.0f;
-                    const float drag_dist = glm::length(node_rect_end_ - node_rect_start_);
+                if (tool_context_ && !isPointerOverBlockingUi(x, y)) {
+                    auto* scene_manager = tool_context_->getSceneManager();
+                    if (scene_manager) {
+                        constexpr float CLICK_THRESHOLD_PX = 5.0f;
+                        const float drag_dist = glm::length(node_rect_end_ - node_rect_start_);
 
-                    if (drag_dist < CLICK_THRESHOLD_PX) {
-                        // Point pick via ray-AABB intersection
-                        const auto [ray_origin, ray_dir] = computePickRay(x, y);
-                        const std::string picked = scene_manager->pickNodeByRay(ray_origin, ray_dir);
-                        if (!picked.empty()) {
-                            if (auto result = cap::selectNode(*scene_manager, picked); !result) {
-                                LOG_WARN("Node pick selection failed: {}", result.error());
+                        if (drag_dist < CLICK_THRESHOLD_PX) {
+                            // Point pick via ray-AABB intersection
+                            const auto [ray_origin, ray_dir] = computePickRay(x, y);
+                            const std::string picked = scene_manager->pickNodeByRay(ray_origin, ray_dir);
+                            if (!picked.empty()) {
+                                if (auto result = cap::selectNode(*scene_manager, picked); !result) {
+                                    LOG_WARN("Node pick selection failed: {}", result.error());
+                                }
+                            } else {
+                                (void)cap::clearNodeSelection(*scene_manager);
                             }
                         } else {
-                            (void)cap::clearNodeSelection(*scene_manager);
-                        }
-                    } else {
-                        // Rectangle selection — convert window coords to viewport-local
-                        glm::vec2 vp_offset(0.0f);
-                        if (auto* gm = services().guiOrNull())
-                            vp_offset = glm::vec2(gm->getViewportPos().x, gm->getViewportPos().y);
+                            // Rectangle selection — convert window coords to viewport-local
+                            glm::vec2 vp_offset(0.0f);
+                            if (auto* gm = services().guiOrNull())
+                                vp_offset = glm::vec2(gm->getViewportPos().x, gm->getViewportPos().y);
 
-                        const glm::vec2 rect_min(
-                            std::min(node_rect_start_.x, node_rect_end_.x) - vp_offset.x,
-                            std::min(node_rect_start_.y, node_rect_end_.y) - vp_offset.y);
-                        const glm::vec2 rect_max(
-                            std::max(node_rect_start_.x, node_rect_end_.x) - vp_offset.x,
-                            std::max(node_rect_start_.y, node_rect_end_.y) - vp_offset.y);
+                            const glm::vec2 rect_min(
+                                std::min(node_rect_start_.x, node_rect_end_.x) - vp_offset.x,
+                                std::min(node_rect_start_.y, node_rect_end_.y) - vp_offset.y);
+                            const glm::vec2 rect_max(
+                                std::max(node_rect_start_.x, node_rect_end_.x) - vp_offset.x,
+                                std::max(node_rect_start_.y, node_rect_end_.y) - vp_offset.y);
 
-                        const std::vector<std::string> picked_nodes = scene_manager->pickNodesInScreenRect(
-                            rect_min, rect_max,
-                            viewport_.getViewMatrix(),
-                            viewport_.getProjectionMatrix(),
-                            viewport_.windowSize);
+                            const std::vector<std::string> picked_nodes = scene_manager->pickNodesInScreenRect(
+                                rect_min, rect_max,
+                                viewport_.getViewMatrix(),
+                                viewport_.getProjectionMatrix(),
+                                viewport_.windowSize);
 
-                        if (picked_nodes.empty()) {
-                            (void)cap::clearNodeSelection(*scene_manager);
-                        } else {
-                            if (auto result = cap::selectNodes(*scene_manager, picked_nodes); !result) {
-                                LOG_WARN("Rectangle node selection failed: {}", result.error());
+                            if (picked_nodes.empty()) {
+                                (void)cap::clearNodeSelection(*scene_manager);
+                            } else {
+                                if (auto result = cap::selectNodes(*scene_manager, picked_nodes); !result) {
+                                    LOG_WARN("Rectangle node selection failed: {}", result.error());
+                                }
                             }
                         }
                     }

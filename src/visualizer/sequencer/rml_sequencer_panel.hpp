@@ -34,6 +34,7 @@ namespace lfs::vis {
         float screen_y = 0.0f;
         bool mouse_down[3] = {};
         bool mouse_clicked[3] = {};
+        bool mouse_released[3] = {};
         float mouse_wheel = 0.0f;
         bool key_shift = false;
         bool key_ctrl = false;

@@ -41,7 +41,6 @@ namespace lfs::vis::gui {
         constexpr size_t MIN_PATH_RENDER_SAMPLES = 128;
         constexpr size_t MAX_PATH_RENDER_SAMPLES = 4096;
         constexpr float PATH_SAMPLES_PER_VIEWPORT_PIXEL = 2.0f;
-        constexpr auto FRUSTUM_DOUBLE_CLICK_WINDOW = std::chrono::milliseconds(350);
 
         [[nodiscard]] std::string formatTimelineTime(const float seconds) {
             const int mins = static_cast<int>(seconds) / 60;
@@ -97,8 +96,11 @@ namespace lfs::vis::gui {
             return;
 
         controller_.selectKeyframe(keyframe_index);
+        if (auto* sm = viewer_->getSceneManager())
+            sm->clearSelection();
         viewport_keyframe_edit_snapshot_ = *keyframe;
         keyframe_gizmo_op_ = ImGuizmo::OPERATION(0);
+        edit_entered_mouse_down_ = true;
     }
 
     void SequencerUIManager::endViewportKeyframeEdit() {
@@ -225,6 +227,8 @@ namespace lfs::vis::gui {
         overlay_input.mouse_down[1] = sdl_buf.mouse_down[1];
         overlay_input.mouse_clicked[0] = sdl_buf.mouse_clicked[0];
         overlay_input.mouse_clicked[1] = sdl_buf.mouse_clicked[1];
+        overlay_input.mouse_released[0] = sdl_buf.mouse_released[0];
+        overlay_input.mouse_released[1] = sdl_buf.mouse_released[1];
         overlay_input.key_ctrl = (sdl_buf.key_mods & SDL_KMOD_CTRL) != 0;
         overlay_input.key_shift = (sdl_buf.key_mods & SDL_KMOD_SHIFT) != 0;
         overlay_input.key_alt = (sdl_buf.key_mods & SDL_KMOD_ALT) != 0;
@@ -244,7 +248,11 @@ namespace lfs::vis::gui {
         overlay_->processInput(overlay_input);
         handleOverlayActions();
 
-        if (overlay_->wantsInput())
+        const bool overlay_active = overlay_->wantsInput() ||
+                                    overlay_->isMouseOverEditOverlay(sdl_buf.mouse_x, sdl_buf.mouse_y);
+        if (edit_entered_mouse_down_ && !sdl_buf.mouse_down[0])
+            edit_entered_mouse_down_ = false;
+        if (overlay_active || edit_entered_mouse_down_)
             guiFocusState().want_capture_mouse = true;
 
         const bool actively_following =
@@ -721,24 +729,10 @@ namespace lfs::vis::gui {
         if (mouse_in_viewport && !ImGui::IsAnyItemHovered() &&
             !overlay_->wantsInput()) {
             if (hovered_keyframe.has_value() && input.mouse_clicked[0] && !ImGuizmo::IsOver()) {
-                const auto now = std::chrono::steady_clock::now();
                 const auto* const hovered = timeline.getKeyframe(*hovered_keyframe);
                 if (hovered && !hovered->is_loop_point) {
-                    if (last_frustum_clicked_ == *hovered_keyframe &&
-                        last_frustum_click_time_ != std::chrono::steady_clock::time_point{} &&
-                        (now - last_frustum_click_time_) < FRUSTUM_DOUBLE_CLICK_WINDOW) {
-                        beginViewportKeyframeEdit(*hovered_keyframe);
-                        last_frustum_clicked_ = std::nullopt;
-                        last_frustum_click_time_ = std::chrono::steady_clock::time_point{};
-                    } else {
-                        if (!viewport_keyframe_edit_snapshot_.has_value() ||
-                            viewport_keyframe_edit_snapshot_->id != hovered->id) {
-                            endViewportKeyframeEdit();
-                        }
-                        lfs::core::events::cmd::SequencerSelectKeyframe{.keyframe_index = *hovered_keyframe}.emit();
-                        last_frustum_click_time_ = now;
-                        last_frustum_clicked_ = *hovered_keyframe;
-                    }
+                    beginViewportKeyframeEdit(*hovered_keyframe);
+                    guiFocusState().want_capture_mouse = true;
                 }
             }
         }
