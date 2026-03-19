@@ -620,7 +620,9 @@ namespace lfs::io {
         std::vector<std::shared_ptr<Camera>> cameras;
         cameras.reserve(images.size());
 
+        RecursiveFileCache image_cache(images_path);
         MaskDirCache mask_cache(base_path);
+        bool used_recursive_image_lookup = false;
 
         // Accumulate camera positions for scene center
         std::vector<float> camera_positions;
@@ -629,7 +631,26 @@ namespace lfs::io {
         for (size_t i = 0; i < images.size(); ++i) {
             const ImageData& img = images[i];
             const std::filesystem::path image_rel_path = lfs::core::utf8_to_path(img.name);
-            const std::filesystem::path image_path = images_path / image_rel_path;
+            std::filesystem::path image_path = images_path / image_rel_path;
+
+            if (!safe_exists(image_path)) {
+                if (auto resolved_path = image_cache.find(image_rel_path);
+                    !resolved_path.empty()) {
+                    if (!used_recursive_image_lookup) {
+                        LOG_WARN("COLMAP images are not in the expected flat layout under '{}'; "
+                                 "falling back to recursive image lookup",
+                                 lfs::core::path_to_utf8(images_path));
+                        used_recursive_image_lookup = true;
+                    }
+                    image_path = std::move(resolved_path);
+                } else {
+                    return make_error(ErrorCode::PATH_NOT_FOUND,
+                                      std::format("Image '{}' was not found under '{}'",
+                                                  img.name,
+                                                  lfs::core::path_to_utf8(images_path)),
+                                      image_path);
+                }
+            }
 
             auto it = cam_map.find(img.camera_id);
             if (it == cam_map.end()) {

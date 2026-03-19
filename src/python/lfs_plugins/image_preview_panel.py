@@ -6,6 +6,7 @@ import time
 from math import gcd
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import lichtfeld as lf
 from .types import Panel
@@ -24,6 +25,11 @@ FILMSTRIP_WINDOW = 40
 THUMB_MAX_PX = 256
 
 _instance = None
+_RML_PATH_SAFE_CHARS = "/:._-~"
+
+
+def _encode_rml_path(path: Path | str) -> str:
+    return quote(str(path), safe=_RML_PATH_SAFE_CHARS)
 
 
 class ImagePreviewPanel(Panel):
@@ -279,7 +285,7 @@ class ImagePreviewPanel(Panel):
     def _make_preview_url(self, path: Path, cam_uid: int, thumb: int = 0) -> str:
         rf, mw, ud = self._last_training_params
         return (f"preview://cam={cam_uid}&thumb={thumb}"
-                f"&rf={rf}&mw={mw}&ud={1 if ud else 0}&path={path}")
+                f"&rf={rf}&mw={mw}&ud={1 if ud else 0}&path={_encode_rml_path(path)}")
 
     def _on_filmstrip_click(self, event):
         el = event.target()
@@ -489,7 +495,7 @@ class ImagePreviewPanel(Panel):
         if mask_img:
             if show_mask:
                 mask_path = self._mask_paths[self._current_index]
-                mask_img.set_property("decorator", f"image({mask_path})")
+                mask_img.set_property("decorator", f"image({_encode_rml_path(mask_path)})")
                 mask_img.set_attribute("class", "visible")
                 self._apply_zoom(mask_img, path)
             else:

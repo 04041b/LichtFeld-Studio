@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cassert>
 #include <charconv>
+#include <string>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -50,6 +51,38 @@ namespace lfs::vis::gui {
             return value;
         }
 
+        int hex_value(const char ch) {
+            if (ch >= '0' && ch <= '9')
+                return ch - '0';
+            if (ch >= 'a' && ch <= 'f')
+                return ch - 'a' + 10;
+            if (ch >= 'A' && ch <= 'F')
+                return ch - 'A' + 10;
+            return -1;
+        }
+
+        std::string percent_decode(std::string_view text) {
+            std::string decoded;
+            decoded.reserve(text.size());
+            for (size_t i = 0; i < text.size(); ++i) {
+                if (text[i] != '%' || i + 2 >= text.size()) {
+                    decoded.push_back(text[i]);
+                    continue;
+                }
+
+                const int hi = hex_value(text[i + 1]);
+                const int lo = hex_value(text[i + 2]);
+                if (hi < 0 || lo < 0) {
+                    decoded.push_back(text[i]);
+                    continue;
+                }
+
+                decoded.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+            }
+            return decoded;
+        }
+
         PreviewParams parse_preview_url(const Rml::String& source) {
             PreviewParams p;
             constexpr std::string_view PREFIX = "preview://";
@@ -59,7 +92,7 @@ namespace lfs::vis::gui {
 
             const auto path_pos = query.find("path=");
             if (path_pos != std::string::npos)
-                p.path = query.substr(path_pos + 5);
+                p.path = percent_decode(query.substr(path_pos + 5));
 
             const auto params_end = (path_pos != std::string::npos && path_pos > 0) ? path_pos - 1 : query.size();
             const auto params_str = query.substr(0, params_end);
@@ -108,9 +141,18 @@ namespace lfs::vis::gui {
         }
 
         int w = 0, h = 0, channels = 0;
+        std::string decoded_source;
+        std::string attempted_source = source;
         unsigned char* data = stbi_load(source.c_str(), &w, &h, &channels, 4);
+        if (!data && source.find('%') != Rml::String::npos) {
+            decoded_source = percent_decode(source);
+            if (decoded_source != source) {
+                attempted_source = decoded_source;
+                data = stbi_load(decoded_source.c_str(), &w, &h, &channels, 4);
+            }
+        }
         if (!data) {
-            LOG_WARN("RmlUI LoadTexture failed: {}", source);
+            LOG_WARN("RmlUI LoadTexture failed: {}", attempted_source);
             return 0;
         }
 
