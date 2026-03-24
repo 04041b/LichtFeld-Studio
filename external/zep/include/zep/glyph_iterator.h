@@ -1,8 +1,8 @@
 #pragma once
 
-#include <cstdint>
 #include "gap_buffer.h"
 #include "zep/mcommon/utf8/core.h"
+#include <cstdint>
 
 namespace Zep {
 
