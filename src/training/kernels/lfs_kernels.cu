@@ -2,8 +2,8 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "lfs_kernels.hpp"
 #include "core/tensor/internal/tensor_generic_ops.cuh"
+#include "lfs_kernels.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cub/cub.cuh>
@@ -30,8 +30,7 @@ namespace lfs::training::lfs_strategy {
         }
 
         struct positive_weight {
-            __host__ __device__
-            bool operator()(const float w) const {
+            __host__ __device__ bool operator()(const float w) const {
                 return w > 0.0f;
             }
         };
