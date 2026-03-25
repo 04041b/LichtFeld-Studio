@@ -33,8 +33,8 @@
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usdGeom/boundable.h>
-#include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdGeom/metrics.h>
+#include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdVol/particleField.h>
 #include <pxr/usd/usdVol/particleField3DGaussianSplat.h>
 #include <pxr/usd/usdVol/particleFieldOpacityAttributeAPI.h>
