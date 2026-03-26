@@ -19,7 +19,7 @@ SENSOR_HALF_HEIGHT_MM = 12.0
 
 BOOL_PROPS = [
     "show_coord_axes", "show_pivot", "show_grid", "show_camera_frustums",
-    "point_cloud_mode", "desaturate_unselected", "desaturate_cropping",
+    "point_cloud_mode", "desaturate_unselected", "desaturate_cropping", "hide_outside_depth_box",
     "equirectangular", "gut", "mip_filter",
     "mesh_wireframe", "mesh_backface_culling", "mesh_shadow_enabled",
     "apply_appearance_correction", "ppisp_vignette_enabled",
@@ -91,6 +91,7 @@ LOCALE_KEY = {
     "point_cloud_mode": "main_panel.point_cloud_mode",
     "desaturate_unselected": "main_panel.desaturate_unselected",
     "desaturate_cropping": "main_panel.desaturate_cropping",
+    "hide_outside_depth_box": "main_panel.hide_outside_depth_box",
     "equirectangular": "main_panel.equirectangular",
     "gut": "main_panel.gut_mode",
     "mip_filter": "main_panel.mip_filter",

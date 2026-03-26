@@ -898,16 +898,9 @@ namespace lfs::vis {
         const int mods = getModifierKeys();
         const input::Action scroll_action = bindings_.getActionForScroll(getCurrentToolMode(), mods);
         if (selection_tool_ && selection_tool_->isEnabled()) {
-            if (scroll_action == input::Action::DEPTH_ADJUST_NEAR && selection_tool_->isDepthFilterEnabled()) {
-                selection_tool_->adjustDepthNear((yoff > 0) ? 1.1f : 0.9f);
-                return;
-            }
-            if (scroll_action == input::Action::DEPTH_ADJUST_FAR && selection_tool_->isDepthFilterEnabled()) {
+            if (scroll_action == input::Action::DEPTH_ADJUST_FAR &&
+                selection_tool_->isDepthFilterEnabled()) {
                 selection_tool_->adjustDepthFar((yoff > 0) ? 1.1f : 0.9f);
-                return;
-            }
-            if (scroll_action == input::Action::DEPTH_ADJUST_SIDE && selection_tool_->isDepthFilterEnabled()) {
-                selection_tool_->adjustDepthWidth((yoff > 0) ? 1.1f : 0.9f);
                 return;
             }
         }
@@ -1711,6 +1704,10 @@ namespace lfs::vis {
     }
 
     void InputController::publishCameraMove() {
+        if (selection_tool_ && selection_tool_->isEnabled()) {
+            selection_tool_->syncDepthFilterToCamera();
+        }
+
         if (services().renderingOrNull()) {
             services().renderingOrNull()->markDirty(DirtyFlag::CAMERA);
         }
