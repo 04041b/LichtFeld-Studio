@@ -372,6 +372,14 @@ namespace lfs::training {
         std::atomic<bool> initialized_{false};
         std::atomic<bool> shutdown_complete_{false};
 
+        // Env-gated VRAM tracing used for benchmark/debug runs.
+        bool memory_breakdown_enabled_ = false;
+        bool memory_breakdown_logged_init_ = false;
+        bool memory_breakdown_logged_train_setup_ = false;
+        bool memory_breakdown_logged_first_batch_ = false;
+        bool memory_breakdown_logged_first_raster_ = false;
+        bool memory_breakdown_logged_first_step_ = false;
+
         // Current training state
         std::atomic<int> current_iteration_{0};
         std::atomic<float> current_loss_{0.0f};

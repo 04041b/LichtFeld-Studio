@@ -17,23 +17,121 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace lfs::training {
 
     namespace {
+        [[nodiscard]] bool mem_breakdown_enabled() {
+            static const bool enabled = [] {
+                const char* raw = std::getenv("LFS_MEM_BREAKDOWN");
+                if (!raw) {
+                    return false;
+                }
+                const std::string_view value(raw);
+                return !value.empty() &&
+                       value != "0" && value != "false" && value != "FALSE" &&
+                       value != "off" && value != "OFF" &&
+                       value != "no" && value != "NO";
+            }();
+            return enabled;
+        }
+
+        [[nodiscard]] double bytes_to_mib(const size_t bytes) {
+            return static_cast<double>(bytes) / (1024.0 * 1024.0);
+        }
+
+        [[nodiscard]] size_t tensor_reserved_bytes(const lfs::core::Tensor& tensor) {
+            if (!tensor.is_valid()) {
+                return 0;
+            }
+            if (tensor.capacity() == 0 || tensor.ndim() == 0) {
+                return tensor.bytes();
+            }
+            size_t row_elems = 1;
+            if (tensor.ndim() > 1) {
+                for (size_t dim = 1; dim < tensor.ndim(); ++dim) {
+                    row_elems *= tensor.shape()[dim];
+                }
+            }
+            return tensor.capacity() * row_elems * lfs::core::dtype_size(tensor.dtype());
+        }
+
         constexpr float LFS_EDGE_SCORE_WEIGHT = 0.25f;
         constexpr int LFS_EDGE_MIN_VIEW_SAMPLES = 10;
         constexpr int LFS_BOUNDS_RECOMPUTE_INTERVAL_REFINES = 5;
+        constexpr float LFS_RAW_OPACITY_PRUNE_THRESHOLD = -5.54126358f; // logit(1 / 255)
+        constexpr float LFS_LOG_MIN_SCALE_THRESHOLD = -23.0258509f;     // log(1e-10)
 
         [[nodiscard]] double compute_decay_gamma(const double start, const double end, const size_t steps) {
             if (steps == 0 || start <= 0.0 || end <= 0.0) {
                 return 1.0;
             }
             return std::pow(end / start, 1.0 / static_cast<double>(steps));
+        }
+
+        void reset_vector_buffer(
+            lfs::core::Tensor& tensor,
+            const size_t size,
+            const lfs::core::Device device,
+            const size_t reserve_capacity = 0) {
+            const size_t desired_capacity = reserve_capacity > 0 ? std::max(reserve_capacity, size) : size;
+            const bool needs_new_tensor = !tensor.is_valid() ||
+                                          tensor.ndim() != 1 ||
+                                          tensor.device() != device ||
+                                          tensor.dtype() != lfs::core::DataType::Float32;
+            const auto make_fresh = [&]() {
+                if (desired_capacity > size) {
+                    tensor = lfs::core::Tensor::zeros_direct(lfs::core::TensorShape({size}), desired_capacity, device);
+                } else {
+                    tensor = lfs::core::Tensor::zeros({size}, device);
+                }
+            };
+
+            if (needs_new_tensor) {
+                make_fresh();
+                return;
+            }
+
+            const size_t current_size = tensor.numel();
+            if (current_size == 0) {
+                if (size == 0) {
+                    if (desired_capacity > tensor.capacity()) {
+                        make_fresh();
+                    } else {
+                        tensor.zero_();
+                    }
+                } else if (tensor.capacity() >= desired_capacity) {
+                    tensor.append_zeros(size);
+                } else {
+                    make_fresh();
+                }
+                return;
+            }
+
+            if (current_size == size) {
+                if (desired_capacity > size && tensor.capacity() < desired_capacity) {
+                    tensor.reserve(desired_capacity);
+                }
+                tensor.zero_();
+                return;
+            }
+
+            if (current_size < size) {
+                if (tensor.capacity() < desired_capacity) {
+                    tensor.reserve(desired_capacity);
+                }
+                tensor.append_zeros(size - current_size);
+                tensor.zero_();
+                return;
+            }
+
+            make_fresh();
         }
 
         [[nodiscard]] bool has_zero_dimension(const lfs::core::TensorShape& shape) {
@@ -255,10 +353,19 @@ namespace lfs::training {
         sync_deleted_mask_from_free_mask(*_splat_data, _free_mask);
 
         const size_t n = static_cast<size_t>(_splat_data->size());
-        _refine_weight_max = Tensor::zeros({n}, _splat_data->means().device());
-        _vis_count = Tensor::zeros({n}, _splat_data->means().device());
+        const size_t tracking_capacity = _params->max_cap > 0 ? static_cast<size_t>(_params->max_cap) : 0;
+        reset_vector_buffer(_refine_weight_max, n, _splat_data->means().device(), tracking_capacity);
+        reset_vector_buffer(_vis_count, n, _splat_data->means().device(), tracking_capacity);
 
         compute_bounds();
+
+        if (mem_breakdown_enabled()) {
+            LOG_INFO("[MEM] lfs persistent refine_weight_max={:.2f} MiB, vis_count={:.2f} MiB, free_mask={:.2f} MiB, densification_info={:.2f} MiB",
+                     bytes_to_mib(tensor_reserved_bytes(_refine_weight_max)),
+                     bytes_to_mib(tensor_reserved_bytes(_vis_count)),
+                     bytes_to_mib(tensor_reserved_bytes(_free_mask)),
+                     bytes_to_mib(tensor_reserved_bytes(_splat_data->_densification_info)));
+        }
 
         LOG_INFO("LFS strategy initialized with {} Gaussians", n);
     }
@@ -365,27 +472,28 @@ namespace lfs::training {
         const float max_allowed = _bounds.max_extent * 100.0f;
         const size_t n = static_cast<size_t>(_splat_data->size());
 
-        auto opacities = _splat_data->get_opacity();
-        if (opacities.ndim() == 2 && opacities.shape()[1] == 1)
-            opacities = opacities.squeeze(-1);
-        auto scales = _splat_data->get_scaling();
+        auto raw_opacities = _splat_data->opacity_raw();
+        if (raw_opacities.ndim() == 2 && raw_opacities.shape()[1] == 1)
+            raw_opacities = raw_opacities.squeeze(-1);
+        const auto& log_scales = _splat_data->scaling_raw();
         const auto& means = _splat_data->means();
+        const float log_max_allowed = std::log(max_allowed);
 
-        assert(opacities.numel() == n);
-        assert(scales.shape()[0] == n && scales.shape()[1] == 3);
+        assert(raw_opacities.numel() == n);
+        assert(log_scales.shape()[0] == n && log_scales.shape()[1] == 3);
         assert(means.shape()[0] == n && means.shape()[1] == 3);
 
-        auto scale_min = scales.min(1);
-        auto scale_max = scales.max(1);
+        auto scale_min = log_scales.min(1);
+        auto scale_max = log_scales.max(1);
 
         auto center = Tensor::from_vector(
             {_bounds.center[0], _bounds.center[1], _bounds.center[2]},
             TensorShape({1, 3}), Device::CUDA);
         auto dist_from_center = (means - center).abs().max(1);
 
-        auto prune_mask = (opacities < (1.0f / 255.0f)) |
-                          (scale_min < 1e-10f) |
-                          (scale_max > max_allowed) |
+        auto prune_mask = (raw_opacities < LFS_RAW_OPACITY_PRUNE_THRESHOLD) |
+                          (scale_min < LFS_LOG_MIN_SCALE_THRESHOLD) |
+                          (scale_max > log_max_allowed) |
                           (dist_from_center > max_allowed);
 
         if (_free_mask.is_valid() && n > 0) {
@@ -421,9 +529,11 @@ namespace lfs::training {
         apply_decay(iter);
 
         const size_t new_n = static_cast<size_t>(_splat_data->size());
-        _refine_weight_max = Tensor::zeros({new_n}, _splat_data->means().device());
-        _vis_count = Tensor::zeros({new_n}, _splat_data->means().device());
-        _splat_data->_densification_info = Tensor::zeros({2, new_n}, _splat_data->means().device());
+        const size_t tracking_capacity = _params->max_cap > 0 ? static_cast<size_t>(_params->max_cap) : 0;
+        reset_vector_buffer(_refine_weight_max, new_n, _splat_data->means().device(), tracking_capacity);
+        reset_vector_buffer(_vis_count, new_n, _splat_data->means().device(), tracking_capacity);
+        ensure_densification_info_shape();
+        _splat_data->_densification_info.zero_();
     }
 
     void LFS::grow_and_split(int iter, int pruned_count) {
@@ -1099,8 +1209,11 @@ namespace lfs::training {
         sync_deleted_mask_from_free_mask(*_splat_data, _free_mask);
 
         const size_t n = static_cast<size_t>(_splat_data->size());
-        _refine_weight_max = lfs::core::Tensor::zeros({n}, _splat_data->means().device());
-        _vis_count = lfs::core::Tensor::zeros({n}, _splat_data->means().device());
+        const size_t tracking_capacity = (_params && _params->max_cap > 0)
+                                             ? static_cast<size_t>(_params->max_cap)
+                                             : 0;
+        reset_vector_buffer(_refine_weight_max, n, _splat_data->means().device(), tracking_capacity);
+        reset_vector_buffer(_vis_count, n, _splat_data->means().device(), tracking_capacity);
         ensure_densification_info_shape();
         _precomputed_edge_scores = lfs::core::Tensor();
         _edge_precompute_valid = false;
