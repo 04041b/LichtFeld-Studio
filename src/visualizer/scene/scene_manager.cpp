@@ -1638,6 +1638,19 @@ namespace lfs::vis {
         }
     }
 
+    void SceneManager::syncDatasetCameraFrustumsToRenderSettings() {
+        auto* rm = services().renderingOrNull();
+        if (!rm || scene_.getAllCameras().empty())
+            return;
+
+        auto settings = rm->getSettings();
+        if (settings.show_camera_frustums)
+            return;
+
+        settings.show_camera_frustums = true;
+        rm->updateSettings(settings);
+    }
+
     std::expected<void, std::string> SceneManager::applyLoadedDataset(
         const std::filesystem::path& path,
         const lfs::core::param::TrainingParameters& params,
@@ -1690,6 +1703,7 @@ namespace lfs::vis {
                 .emit();
 
             python::set_application_scene(&scene_);
+            syncDatasetCameraFrustumsToRenderSettings();
 
             if ((num_gaussians > 0 || num_points > 0) && services().trainerOrNull() && services().trainerOrNull()->getTrainer()) {
                 ui::PointCloudModeChanged{.enabled = true, .voxel_size = DEFAULT_VOXEL_SIZE}.emit();
@@ -1792,6 +1806,7 @@ namespace lfs::vis {
                 .emit();
 
             python::set_application_scene(&scene_);
+            syncDatasetCameraFrustumsToRenderSettings();
 
             state::DatasetLoadCompleted{
                 .path = path,
@@ -2036,6 +2051,7 @@ namespace lfs::vis {
                 .emit();
 
             python::set_application_scene(&scene_);
+            syncDatasetCameraFrustumsToRenderSettings();
 
             ui::PointCloudModeChanged{.enabled = false, .voxel_size = DEFAULT_VOXEL_SIZE}.emit();
             selectNode(MODEL_NAME);

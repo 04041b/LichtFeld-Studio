@@ -264,6 +264,7 @@ namespace lfs::vis {
     private:
         void resetToEmptyState(bool trainer_already_cleared = false);
         void setupEventHandlers();
+        void syncDatasetCameraFrustumsToRenderSettings();
         void syncCropToolRenderSettings(const core::SceneNode* node);
         void loadPPISPCompanion(const std::filesystem::path& ppisp_path);
         void handleCropActivePly(const lfs::geometry::BoundingBox& crop_box, bool inverse);
