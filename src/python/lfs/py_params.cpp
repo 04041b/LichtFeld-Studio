@@ -383,11 +383,11 @@ namespace lfs::python {
 
         add_string(
             "data_path", "Data Path", "", "Path to training data", true,
-            [](const DatasetConfig& c) { return c.data_path.string(); });
+            [](const DatasetConfig& c) { return lfs::core::path_to_utf8(c.data_path); });
 
         add_string(
             "output_path", "Output Path", "", "Path for output files", true,
-            [](const DatasetConfig& c) { return c.output_path.string(); });
+            [](const DatasetConfig& c) { return lfs::core::path_to_utf8(c.output_path); });
 
         add_string(
             "images", "Images Folder", "images", "Subfolder containing images", true,
@@ -1206,8 +1206,10 @@ namespace lfs::python {
                 "Background color as (r, g, b) tuple")
             .def_prop_rw(
                 "bg_image_path",
-                [](PyOptimizationParams& self) { return self.params().bg_image_path.string(); },
-                [](PyOptimizationParams&, const std::string& v) { modify_params([&v](auto& p) { p.bg_image_path = v; }); },
+                [](PyOptimizationParams& self) { return lfs::core::path_to_utf8(self.params().bg_image_path); },
+                [](PyOptimizationParams&, const std::string& v) {
+                    modify_params([&v](auto& p) { p.bg_image_path = lfs::core::utf8_to_path(v); });
+                },
                 "Path to background image")
             .def_prop_rw(
                 "random",
@@ -1292,10 +1294,10 @@ namespace lfs::python {
             .def("can_edit", &PyDatasetConfig::can_edit,
                  "Check if dataset params can be edited (before training starts)")
             .def_prop_ro(
-                "data_path", [](const PyDatasetConfig& self) { return self.params().data_path.string(); },
+                "data_path", [](const PyDatasetConfig& self) { return lfs::core::path_to_utf8(self.params().data_path); },
                 "Path to training data directory")
             .def_prop_ro(
-                "output_path", [](const PyDatasetConfig& self) { return self.params().output_path.string(); },
+                "output_path", [](const PyDatasetConfig& self) { return lfs::core::path_to_utf8(self.params().output_path); },
                 "Path for output files")
             .def_prop_ro(
                 "images", [](const PyDatasetConfig& self) { return self.params().images; },
