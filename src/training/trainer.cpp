@@ -1718,7 +1718,7 @@ namespace lfs::training {
 
         if (save_requested_.exchange(false)) {
             LOG_INFO("Saving checkpoint and PLY at iteration {}...", iter);
-            save_ply(params_.dataset.output_path, "", iter, /*join=*/false);
+            save_ply(params_.dataset.output_path, "", iter, /*join=*/false, /*save_checkpoint=*/false);
             auto result = save_checkpoint(iter);
             if (result) {
                 const auto checkpoint_path = lfs::training::checkpoint_output_path(params_.dataset.output_path);
@@ -2692,9 +2692,21 @@ namespace lfs::training {
                     LOG_INFO("{}", metrics.to_string());
                 }
 
-                // Save checkpoint (not PLY) at specified steps
+                const bool save_regular_phase_output = get_active_sparsify_steps() > 0 &&
+                                                       iter == get_sparsity_boundary_iteration();
+                if (save_regular_phase_output) {
+                    LOG_INFO("Saving regular-phase checkpoint and PLY at iteration {} before sparsification", iter);
+                    save_ply(params_.dataset.output_path, "", iter, /*join=*/false, /*save_checkpoint=*/false);
+                    if (auto result = save_checkpoint(iter); !result) {
+                        LOG_WARN("Failed to save regular-phase checkpoint at iteration {}: {}", iter, result.error());
+                    }
+                }
+
+                // Save checkpoint at specified steps unless the sparsity boundary save already handled it
                 for (size_t save_step : params_.optimization.save_steps) {
-                    if (iter == static_cast<int>(save_step) && iter != get_total_iterations()) {
+                    if (iter == static_cast<int>(save_step) &&
+                        iter != get_total_iterations() &&
+                        !save_regular_phase_output) {
                         auto result = save_checkpoint(iter);
                         if (!result) {
                             LOG_WARN("Failed to save checkpoint at iteration {}: {}", iter, result.error());
@@ -3015,7 +3027,9 @@ namespace lfs::training {
             // Final save if not already saved by stop request
             if (!stop_requested_.load() && !stop_token.stop_requested()) {
                 auto final_path = params_.dataset.output_path;
-                save_ply(final_path, params_.dataset.output_name, get_total_iterations(), /*join=*/true);
+                const bool rotate_checkpoint = get_active_sparsify_steps() == 0;
+                save_ply(final_path, params_.dataset.output_name, get_total_iterations(), /*join=*/true,
+                         /*save_checkpoint=*/rotate_checkpoint);
             }
 
             if (progress_) {
@@ -3061,7 +3075,11 @@ namespace lfs::training {
         }
     }
 
-    void Trainer::save_ply(const std::filesystem::path& save_path, const std::string& filename, const int iter_num, const bool join_threads) {
+    void Trainer::save_ply(const std::filesystem::path& save_path,
+                           const std::string& filename,
+                           const int iter_num,
+                           const bool join_threads,
+                           const bool save_checkpoint_file) {
 
         std::filesystem::path ply_output_path = filename.empty() ? save_path / ("splat_" + std::to_string(iter_num) + ".ply") : save_path / (filename + ".ply");
 
@@ -3089,11 +3107,12 @@ namespace lfs::training {
 
         PPISPControllerPool* controller_to_save = controller_pool_for_save(iter_num);
 
-        // Save checkpoint alongside PLY for training resumption
-        auto ckpt_result = lfs::training::save_checkpoint(save_path, iter_num, *strategy_, params_,
-                                                          bilateral_grid_.get(), ppisp_.get(), controller_to_save);
-        if (!ckpt_result) {
-            LOG_WARN("Failed to save checkpoint: {}", ckpt_result.error());
+        if (save_checkpoint_file) {
+            auto ckpt_result = lfs::training::save_checkpoint(save_path, iter_num, *strategy_, params_,
+                                                              bilateral_grid_.get(), ppisp_.get(), controller_to_save);
+            if (!ckpt_result) {
+                LOG_WARN("Failed to save checkpoint: {}", ckpt_result.error());
+            }
         }
 
         if (ppisp_) {
@@ -3194,7 +3213,11 @@ namespace lfs::training {
     }
 
     void Trainer::save_final_ply_and_checkpoint(const int iteration) {
-        save_ply(params_.dataset.output_path, params_.dataset.output_name, iteration, /*join=*/true);
+        save_ply(params_.dataset.output_path, params_.dataset.output_name, iteration, /*join=*/true,
+                 /*save_checkpoint=*/false);
+        if (auto result = save_checkpoint(iteration); !result) {
+            LOG_WARN("Failed to save checkpoint: {}", result.error());
+        }
     }
 
     std::expected<int, std::string> Trainer::load_checkpoint(const std::filesystem::path& checkpoint_path) {
