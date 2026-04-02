@@ -7,6 +7,7 @@
 #include "rendering/gl_state_guard.hpp"
 #include "scene/scene_manager.hpp"
 #include "theme/theme.hpp"
+#include "training/training_manager.hpp"
 #include <algorithm>
 #include <cassert>
 #include <glad/glad.h>
@@ -205,16 +206,29 @@ namespace lfs::vis {
                         }
                     }
 
-                    const lfs::rendering::CameraFrustumRenderRequest request{
+                    lfs::rendering::CameraFrustumRenderRequest request{
                         .viewport = viewport,
                         .scale = settings.camera_frustum_scale,
                         .train_color = settings.train_camera_color,
                         .eval_color = settings.eval_camera_color,
+                        .per_camera_colors = {},
                         .focused_index = focused_index,
                         .scene_transform = scene_transform,
                         .equirectangular_view = settings.equirectangular,
                         .disabled_uids = std::move(disabled_uids),
                         .emphasized_uids = std::move(emphasized_uids)};
+
+                    if (const auto* trainer_manager = ctx.scene_manager->getTrainerManager()) {
+                        if (const auto* trainer = trainer_manager->getTrainer()) {
+                            std::vector<std::array<float, 3>> loss_colors;
+                            if (trainer->fillCameraLossColors(cameras, loss_colors)) {
+                                request.per_camera_colors.reserve(loss_colors.size());
+                                for (const auto& color : loss_colors) {
+                                    request.per_camera_colors.emplace_back(color[0], color[1], color[2]);
+                                }
+                            }
+                        }
+                    }
 
                     if (auto frustum_result = engine.renderCameraFrustums(cameras, request);
                         !frustum_result) {

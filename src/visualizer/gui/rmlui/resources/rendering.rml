@@ -146,6 +146,16 @@
         <input type="checkbox" data-checked="mip_filter" />
       </label>
     </div>
+    <div class="setting-row setting-row--aligned">
+      <span class="setting-row__label-col">{{label_camera_metrics_mode}}</span>
+      <div class="setting-row__control-col setting-row__control-col--fill">
+        <select data-value="camera_metrics_mode">
+          <option value="OFF">Off</option>
+          <option value="PSNR">PSNR</option>
+          <option value="PSNR_SSIM">PSNR + SSIM</option>
+        </select>
+      </div>
+    </div>
   </div>
 
   <!-- Splat Simplify -->

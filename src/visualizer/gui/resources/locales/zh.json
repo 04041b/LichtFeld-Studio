@@ -439,6 +439,7 @@
     "equirectangular": "等距柱状投影",
     "gut_mode": "GUT（3DGUT）",
     "mip_filter": "Mip滤波器",
+    "camera_metrics": "相机指标",
     "appearance_correction": "PPISP Correction",
     "ppisp_mode": "Mode",
     "ppisp_mode_manual": "Manual",

@@ -439,6 +439,7 @@
     "equirectangular": "正距円筒図法",
     "gut_mode": "GUT (3DGUT)",
     "mip_filter": "ミップフィルター",
+    "camera_metrics": "カメラ指標",
     "appearance_correction": "PPISP Correction",
     "ppisp_mode": "Mode",
     "ppisp_mode_manual": "Manual",

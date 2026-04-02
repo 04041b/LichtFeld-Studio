@@ -439,6 +439,7 @@
     "equirectangular": "정거원통도법",
     "gut_mode": "GUT (3DGUT)",
     "mip_filter": "밉 필터",
+    "camera_metrics": "카메라 지표",
     "appearance_correction": "PPISP Correction",
     "ppisp_mode": "Mode",
     "ppisp_mode_manual": "Manual",

@@ -1289,6 +1289,35 @@ namespace lfs::vis::gui {
         rml_viewport_overlay_.setViewportBounds(
             viewport_layout_.pos, viewport_layout_.size,
             {panel_input.screen_x, panel_input.screen_y});
+        RmlViewportOverlay::GTMetricsOverlayState gt_metrics_overlay;
+        if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr) {
+            const auto settings = rendering->getSettings();
+            if (rendering->isGTComparisonActive() &&
+                settings.camera_metrics_mode != RenderSettings::CameraMetricsMode::Off) {
+                gt_metrics_overlay.visible = true;
+                gt_metrics_overlay.psnr_text = "--";
+                gt_metrics_overlay.show_ssim =
+                    settings.camera_metrics_mode == RenderSettings::CameraMetricsMode::PSNRSSIM;
+                gt_metrics_overlay.ssim_text = "--";
+
+                const auto content_bounds = rendering->getContentBounds(glm::ivec2(
+                    std::max(static_cast<int>(viewport_layout_.size.x), 0),
+                    std::max(static_cast<int>(viewport_layout_.size.y), 0)));
+                gt_metrics_overlay.x =
+                    content_bounds.x + content_bounds.width * settings.split_position + 18.0f;
+                gt_metrics_overlay.y = content_bounds.y + 18.0f;
+
+                const int current_camera_id = rendering->getCurrentCameraId();
+                if (const auto metrics = rendering->getLatestCameraMetrics();
+                    metrics && metrics->camera_id == current_camera_id) {
+                    gt_metrics_overlay.psnr_text = std::format("{:.2f}", metrics->psnr);
+                    if (gt_metrics_overlay.show_ssim && metrics->ssim.has_value()) {
+                        gt_metrics_overlay.ssim_text = std::format("{:.4f}", *metrics->ssim);
+                    }
+                }
+            }
+        }
+        rml_viewport_overlay_.setGTMetricsOverlay(std::move(gt_metrics_overlay));
         startup_overlay_.setInput(&panel_input);
         if (startup_overlay_.isVisible()) {
             auto& focus = guiFocusState();

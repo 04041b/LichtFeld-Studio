@@ -81,7 +81,7 @@ SCRUB_FIELD_DEFS = {
 }
 
 SELECT_PROPS = [
-    "grid_plane", "sh_degree", "mesh_shadow_resolution",
+    "grid_plane", "sh_degree", "camera_metrics_mode", "mesh_shadow_resolution",
 ]
 
 CHROM_FLOAT_PROPS = [
@@ -124,6 +124,7 @@ LOCALE_KEY = {
     "grid_opacity": "main_panel.grid_opacity",
     "focal_length_mm": "main_panel.focal_length",
     "render_scale": "main_panel.render_scale",
+    "camera_metrics_mode": "main_panel.camera_metrics",
     "sh_degree": "main_panel.sh_degree",
     "grid_plane": "main_panel.plane",
     "background_color": "main_panel.color",

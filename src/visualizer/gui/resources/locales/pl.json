@@ -439,6 +439,7 @@
     "equirectangular": "Równokątne",
     "gut_mode": "GUT (3DGUT)",
     "mip_filter": "Filtr Mip",
+    "camera_metrics": "Metryki kamery",
     "appearance_correction": "PPISP Correction",
     "ppisp_mode": "Mode",
     "ppisp_mode_manual": "Manual",

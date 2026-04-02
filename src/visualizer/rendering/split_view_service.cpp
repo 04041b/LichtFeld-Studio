@@ -13,10 +13,37 @@
 namespace lfs::vis {
 
     namespace {
+        [[nodiscard]] glm::mat4 currentSceneTransform(SceneManager* const scene_manager) {
+            if (!scene_manager) {
+                return glm::mat4(1.0f);
+            }
+
+            const auto visible_transforms = scene_manager->getScene().getVisibleNodeTransforms();
+            if (visible_transforms.empty()) {
+                return glm::mat4(1.0f);
+            }
+            return visible_transforms[0];
+        }
+
+        [[nodiscard]] bool equalVec2(const glm::vec2& a, const glm::vec2& b) {
+            return a.x == b.x && a.y == b.y;
+        }
+
+        [[nodiscard]] bool equalMat4(const glm::mat4& a, const glm::mat4& b) {
+            for (int col = 0; col < 4; ++col) {
+                for (int row = 0; row < 4; ++row) {
+                    if (a[col][row] != b[col][row]) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
         [[nodiscard]] std::optional<GTRenderCamera> buildGTRenderCamera(
-            SceneManager* const scene_manager,
             const lfs::core::Camera& cam,
-            const glm::ivec2 render_size) {
+            const glm::ivec2 render_size,
+            const glm::mat4& scene_transform) {
             if (render_size.x <= 0 || render_size.y <= 0) {
                 return std::nullopt;
             }
@@ -39,14 +66,6 @@ namespace lfs::vis {
             const glm::vec3 world_to_cam_T(T_data[0], T_data[1], T_data[2]);
             const glm::mat3 cam_to_world_R = glm::transpose(world_to_cam_R);
             const glm::vec3 cam_to_world_T = -cam_to_world_R * world_to_cam_T;
-
-            glm::mat4 scene_transform(1.0f);
-            if (scene_manager) {
-                auto visible_transforms = scene_manager->getScene().getVisibleNodeTransforms();
-                if (!visible_transforms.empty()) {
-                    scene_transform = visible_transforms[0];
-                }
-            }
 
             GTRenderCamera render_camera;
             render_camera.rotation = glm::mat3(scene_transform) * cam_to_world_R;
@@ -254,21 +273,22 @@ namespace lfs::vis {
             return;
         }
 
-        clearGTContext();
-
         auto* trainer_manager = scene_manager->getTrainerManager();
         if (!trainer_manager || !trainer_manager->hasTrainer()) {
+            clearGTContext();
             return;
         }
 
         const auto* trainer = trainer_manager->getTrainer();
         if (!trainer) {
+            clearGTContext();
             return;
         }
 
         const auto loader_owner = trainer->getActiveImageLoader();
         const auto cam = trainer_manager->getCamById(current_camera_id);
         if (!cam) {
+            clearGTContext();
             return;
         }
 
@@ -290,6 +310,7 @@ namespace lfs::vis {
             loader_owner.get(),
             gt_load_params_ptr);
         if (gt_info.texture_id == 0) {
+            clearGTContext();
             return;
         }
 
@@ -297,15 +318,30 @@ namespace lfs::vis {
         const glm::ivec2 aligned(
             ((dims.x + GPU_ALIGNMENT - 1) / GPU_ALIGNMENT) * GPU_ALIGNMENT,
             ((dims.y + GPU_ALIGNMENT - 1) / GPU_ALIGNMENT) * GPU_ALIGNMENT);
+        const glm::mat4 scene_transform = currentSceneTransform(scene_manager);
+
+        if (gt_context_ &&
+            gt_context_->camera_id == current_camera_id &&
+            gt_context_->gt_texture_id == gt_info.texture_id &&
+            gt_context_->dimensions == dims &&
+            gt_context_->gpu_aligned_dims == aligned &&
+            equalVec2(gt_context_->gt_texcoord_scale, gt_info.texcoord_scale) &&
+            gt_context_->gt_needs_flip == gt_info.needs_flip &&
+            equalMat4(gt_context_->scene_transform, scene_transform)) {
+            request_viewport_prerender = hasValidGTContext() && !has_viewport_output;
+            return;
+        }
 
         gt_context_ = GTComparisonContext{
             .gt_texture_id = gt_info.texture_id,
+            .camera_id = current_camera_id,
             .dimensions = dims,
             .gpu_aligned_dims = aligned,
             .render_texcoord_scale = glm::vec2(dims) / glm::vec2(aligned),
             .gt_texcoord_scale = gt_info.texcoord_scale,
             .gt_needs_flip = gt_info.needs_flip,
-            .render_camera = buildGTRenderCamera(scene_manager, *cam, dims)};
+            .scene_transform = scene_transform,
+            .render_camera = buildGTRenderCamera(*cam, dims, scene_transform)};
 
         request_viewport_prerender = hasValidGTContext() && !has_viewport_output;
     }

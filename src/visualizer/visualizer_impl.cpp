@@ -912,7 +912,6 @@ namespace lfs::vis {
 
         // Initialize rendering early so we can show a frame before font atlas build
         if (!rendering_manager_->isInitialized()) {
-            rendering_manager_->setInitialViewportSize(viewport_.windowSize);
             rendering_manager_->initialize();
         }
 

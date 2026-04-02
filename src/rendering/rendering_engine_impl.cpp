@@ -1380,6 +1380,7 @@ namespace lfs::rendering {
 
         return camera_frustum_renderer_.render(
             cameras, view, proj, request.scale, request.train_color, request.eval_color,
+            request.per_camera_colors,
             request.scene_transform, request.equirectangular_view,
             request.disabled_uids, request.emphasized_uids);
     }
