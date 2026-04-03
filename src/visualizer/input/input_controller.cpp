@@ -15,6 +15,7 @@
 #include "operator/operator_id.hpp"
 #include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "rendering/ppisp_overrides_utils.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
@@ -25,6 +26,7 @@
 #include "tools/unified_tool_registry.hpp"
 #include "training/training_manager.hpp"
 #include "visualizer/gui_capabilities.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <format>
@@ -221,8 +223,12 @@ namespace lfs::vis {
 
         dataset_load_completed_handler_id_ = state::DatasetLoadCompleted::when([this](const auto& e) {
             if (e.success) {
-                viewport_.camera.resetToHome();
-                publishCameraMove();
+                if (tool_context_ && handleFocusSelection(viewport_)) {
+                    viewport_.camera.saveHomePosition();
+                } else {
+                    viewport_.camera.resetToHome();
+                    publishCameraMove();
+                }
             }
         });
 
@@ -550,7 +556,7 @@ namespace lfs::vis {
                 focusSplitPanel(interaction->panel);
                 const glm::vec3 new_pivot = unprojectScreenPoint(x, y);
                 const float current_distance = glm::length(target_viewport.camera.getPivot() - target_viewport.camera.t);
-                const glm::vec3 forward = glm::normalize(target_viewport.camera.R * glm::vec3(0, 0, 1));
+                const glm::vec3 forward = lfs::rendering::cameraForward(target_viewport.camera.R);
 
                 glm::vec3 camera_offset(0.0f);
 
@@ -588,7 +594,7 @@ namespace lfs::vis {
 
                         // Shift camera opposite to desired screen shift
                         const float shift = -dx * current_distance / fx;
-                        const glm::vec3 right = glm::normalize(target_viewport.camera.R * glm::vec3(1, 0, 0));
+                        const glm::vec3 right = lfs::rendering::cameraRight(target_viewport.camera.R);
                         camera_offset = right * shift;
                     }
                 }
@@ -1362,9 +1368,9 @@ namespace lfs::vis {
         } else if (physical_key == movement_keys_.right) {
             keys_movement_[3] = pressed;
         } else if (physical_key == movement_keys_.down) {
-            keys_movement_[4] = pressed;
-        } else if (physical_key == movement_keys_.up) {
             keys_movement_[5] = pressed;
+        } else if (physical_key == movement_keys_.up) {
+            keys_movement_[4] = pressed;
         }
     }
 
@@ -1421,10 +1427,10 @@ namespace lfs::vis {
         if (keys_movement_[3] && (mk.right < 0 || !isKeyPressed(mk.right))) {
             keys_movement_[3] = false;
         }
-        if (keys_movement_[4] && (mk.down < 0 || !isKeyPressed(mk.down))) {
+        if (keys_movement_[4] && (mk.up < 0 || !isKeyPressed(mk.up))) {
             keys_movement_[4] = false;
         }
-        if (keys_movement_[5] && (mk.up < 0 || !isKeyPressed(mk.up))) {
+        if (keys_movement_[5] && (mk.down < 0 || !isKeyPressed(mk.down))) {
             keys_movement_[5] = false;
         }
 
@@ -1593,44 +1599,22 @@ namespace lfs::vis {
             return;
         }
 
-        // R_data is world_to_cam rotation stored row-major
-        // We need cam_to_world for the viewport
-        glm::mat3 world_to_cam_R;
-
-        // Load the matrix properly: R_data is row-major, GLM is column-major
-        for (int row = 0; row < 3; ++row) {
-            for (int col = 0; col < 3; ++col) {
-                // R_data[row * 3 + col] is element at [row][col] in row-major
-                // GLM[col][row] is element at [row][col] when thinking row-major
-                world_to_cam_R[col][row] = R_data[row * 3 + col];
-            }
-        }
-
-        glm::vec3 world_to_cam_T(T_data[0], T_data[1], T_data[2]);
-
-        // Convert to camera-to-world transform
-        glm::mat3 cam_to_world_R = glm::transpose(world_to_cam_R);
-        glm::vec3 cam_to_world_T = -cam_to_world_R * world_to_cam_T;
-
         // Apply scene transform (handles user rotation/translation of the scene)
         glm::mat4 scene_transform(1.0f);
         if (auto* scene_mgr = services().sceneOrNull()) {
-            auto visible_transforms = scene_mgr->getScene().getVisibleNodeTransforms();
-            if (!visible_transforms.empty()) {
-                scene_transform = visible_transforms[0];
+            if (const auto transform =
+                    scene_mgr->getScene().getCameraSceneTransformByUid(cam_data->uid())) {
+                scene_transform = lfs::rendering::dataWorldTransformToVisualizerWorld(*transform);
             }
         }
 
-        // Extract rotation part of scene transform
-        glm::mat3 scene_R(scene_transform);
-        glm::vec3 scene_T(scene_transform[3]);
+        const auto pose = lfs::rendering::visualizerCameraPoseFromDataWorldToCamera(
+            lfs::rendering::mat3FromRowMajor3x3(R_data),
+            glm::vec3(T_data[0], T_data[1], T_data[2]),
+            scene_transform);
 
-        // Apply scene transform to camera pose
-        glm::mat3 final_R = scene_R * cam_to_world_R;
-        glm::vec3 final_T = scene_R * cam_to_world_T + scene_T;
-
-        target_viewport.camera.R = final_R;
-        target_viewport.camera.t = final_T;
+        target_viewport.camera.R = pose.rotation;
+        target_viewport.camera.t = pose.translation;
 
         // Update pivot point to be in front of camera
         target_viewport.camera.updatePivotFromCamera();
@@ -1751,12 +1735,12 @@ namespace lfs::vis {
         }
     }
 
-    void InputController::handleFocusSelection(Viewport& target_viewport) {
+    bool InputController::handleFocusSelection(Viewport& target_viewport) {
         if (!tool_context_)
-            return;
+            return false;
         auto* const sm = tool_context_->getSceneManager();
         if (!sm)
-            return;
+            return false;
 
         const auto& scene = sm->getScene();
         const auto& selected = sm->getSelectedNodeNames();
@@ -1770,7 +1754,7 @@ namespace lfs::vis {
             if (!scene.getNodeBounds(node->id, local_min, local_max))
                 return;
 
-            const glm::mat4 world_xform = scene.getWorldTransform(node->id);
+            const glm::mat4 world_xform = scene_coords::nodeVisualizerWorldTransform(scene, node->id);
             for (int i = 0; i < 8; ++i) {
                 const glm::vec3 corner(
                     (i & 1) ? local_max.x : local_min.x,
@@ -1801,7 +1785,9 @@ namespace lfs::vis {
         if (total_min.x <= total_max.x) {
             target_viewport.camera.focusOnBounds(total_min, total_max);
             publishCameraMove(&target_viewport);
+            return true;
         }
+        return false;
     }
 
     // Helpers
@@ -2048,7 +2034,7 @@ namespace lfs::vis {
                                      : std::nullopt;
         const auto* const target_viewport = (interaction && interaction->valid()) ? interaction->viewport : &viewport_;
         if (!rendering || !interaction || !interaction->valid()) {
-            const glm::vec3 forward = glm::normalize(target_viewport->camera.R * glm::vec3(0, 0, 1));
+            const glm::vec3 forward = lfs::rendering::cameraForward(target_viewport->camera.R);
             return target_viewport->camera.t + forward * fallback_distance;
         }
 
@@ -2076,7 +2062,7 @@ namespace lfs::vis {
             return fallback_world;
         }
 
-        const glm::vec3 forward = glm::normalize(target_viewport->camera.R * glm::vec3(0, 0, 1));
+        const glm::vec3 forward = lfs::rendering::cameraForward(target_viewport->camera.R);
         return target_viewport->camera.t + forward * fallback_distance;
     }
 
@@ -2094,30 +2080,20 @@ namespace lfs::vis {
         const glm::vec3 camera_pos = target_viewport->getTranslation();
 
         if (!rendering || !interaction || !interaction->valid()) {
-            const glm::vec3 forward = glm::normalize(R * glm::vec3(0, 0, 1));
+            const glm::vec3 forward = lfs::rendering::cameraForward(R);
             return {camera_pos, forward};
         }
 
         const float local_x = static_cast<float>(x) - interaction->x;
         const float local_y = static_cast<float>(y) - interaction->y;
-        const float width = interaction->width;
-        const float height = interaction->height;
-
-        const float fov_y = glm::radians(rendering->getFovDegrees());
-        const float aspect = width / height;
-        const float fov_x = 2.0f * std::atan(std::tan(fov_y / 2.0f) * aspect);
-
-        const float fx = width / (2.0f * std::tan(fov_x / 2.0f));
-        const float fy = height / (2.0f * std::tan(fov_y / 2.0f));
-        const float cx = width / 2.0f;
-        const float cy = height / 2.0f;
-
-        const glm::vec3 cam_dir = glm::normalize(glm::vec3(
-            (local_x - cx) / fx,
-            (local_y - cy) / fy,
-            1.0f));
-
-        const glm::vec3 world_dir = glm::normalize(R * cam_dir);
+        const glm::vec3 world_dir = lfs::rendering::computePickRayDirection(
+            R,
+            glm::ivec2(
+                std::max(static_cast<int>(interaction->width), 1),
+                std::max(static_cast<int>(interaction->height), 1)),
+            local_x,
+            local_y,
+            rendering->getFocalLengthMm());
         return {camera_pos, world_dir};
     }
 

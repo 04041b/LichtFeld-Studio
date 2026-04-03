@@ -4,9 +4,11 @@
 #include "core/event_bridge/event_bridge.hpp"
 #include "core/event_bus.hpp"
 #include "core/events.hpp"
+#include "core/camera.hpp"
 #include "core/point_cloud.hpp"
 #include "core/services.hpp"
 #include "core/tensor.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "visualizer/rendering/passes/mesh_pass.hpp"
 #include "visualizer/rendering/passes/point_cloud_pass.hpp"
 #include "visualizer/rendering/passes/splat_raster_pass.hpp"
@@ -20,6 +22,7 @@
 #include "visualizer/scene/scene_manager.hpp"
 
 #include <filesystem>
+#include <glm/gtc/matrix_transform.hpp>
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -40,6 +43,39 @@ namespace lfs::vis {
                 Tensor::from_vector({1.0f, 0.0f, 0.0f, 0.0f}, {size_t{1}, size_t{4}}, Device::CPU),
                 Tensor::from_vector({8.0f}, {size_t{1}, size_t{1}}, Device::CPU),
                 1.0f);
+        }
+
+        std::shared_ptr<lfs::core::PointCloud> makeTestPointCloud() {
+            using lfs::core::Device;
+            using lfs::core::Tensor;
+
+            auto means = Tensor::from_vector(
+                {0.0f, 0.0f, 0.0f,
+                 1.0f, 0.0f, 0.0f},
+                {size_t{2}, size_t{3}},
+                Device::CPU);
+            auto colors = Tensor::from_vector(
+                {1.0f, 0.0f, 0.0f,
+                 0.0f, 1.0f, 0.0f},
+                {size_t{2}, size_t{3}},
+                Device::CPU);
+            return std::make_shared<lfs::core::PointCloud>(std::move(means), std::move(colors));
+        }
+
+        void expectVisualizerTranslationFromData(const glm::mat4& transform, const glm::vec3& data_translation) {
+            const glm::vec3 expected =
+                lfs::rendering::visualizerWorldPointFromDataWorld(data_translation);
+            EXPECT_FLOAT_EQ(transform[3][0], expected.x);
+            EXPECT_FLOAT_EQ(transform[3][1], expected.y);
+            EXPECT_FLOAT_EQ(transform[3][2], expected.z);
+        }
+
+        void expectMat3Near(const glm::mat3& actual, const glm::mat3& expected, const float epsilon = 1e-5f) {
+            for (int col = 0; col < 3; ++col) {
+                for (int row = 0; row < 3; ++row) {
+                    EXPECT_NEAR(actual[col][row], expected[col][row], epsilon);
+                }
+            }
         }
     } // namespace
 
@@ -163,6 +199,105 @@ namespace lfs::vis {
         EXPECT_EQ(service.focusedPanel(), SplitViewPanelId::Left);
     }
 
+    TEST(SplitViewServiceTest, GtRenderCameraUsesVisualizerCameraAxesAndNormalizedSceneRotation) {
+        using lfs::core::Camera;
+        using lfs::core::CameraModelType;
+        using lfs::core::Device;
+        using lfs::core::Tensor;
+
+        Camera camera(
+            Tensor::from_vector(
+                {1.0f, 0.0f, 0.0f,
+                 0.0f, 1.0f, 0.0f,
+                 0.0f, 0.0f, 1.0f},
+                {size_t{3}, size_t{3}},
+                Device::CPU),
+            Tensor::from_vector({0.0f, 0.0f, 0.0f}, {size_t{3}}, Device::CPU),
+            500.0f,
+            600.0f,
+            320.0f,
+            240.0f,
+            Tensor(),
+            Tensor(),
+            CameraModelType::PINHOLE,
+            "test.png",
+            {},
+            {},
+            640,
+            480,
+            7);
+
+        glm::mat4 scene_transform(1.0f);
+        scene_transform = glm::translate(scene_transform, glm::vec3(1.0f, 2.0f, 3.0f));
+        scene_transform = glm::scale(scene_transform, glm::vec3(2.0f, 3.0f, 4.0f));
+
+        const auto render_camera =
+            detail::buildGTRenderCamera(camera, {1280, 960}, scene_transform);
+        ASSERT_TRUE(render_camera.has_value());
+
+        expectMat3Near(
+            render_camera->rotation,
+            lfs::rendering::DATA_TO_VISUALIZER_CAMERA_AXES);
+        EXPECT_EQ(render_camera->translation, glm::vec3(1.0f, 2.0f, 3.0f));
+        ASSERT_TRUE(render_camera->intrinsics.has_value());
+        EXPECT_FLOAT_EQ(render_camera->intrinsics->focal_x, 1000.0f);
+        EXPECT_FLOAT_EQ(render_camera->intrinsics->focal_y, 1200.0f);
+        EXPECT_FLOAT_EQ(render_camera->intrinsics->center_x, 640.0f);
+        EXPECT_FLOAT_EQ(render_camera->intrinsics->center_y, 480.0f);
+        EXPECT_FALSE(render_camera->equirectangular);
+    }
+
+    TEST(SplitViewServiceTest, SharedCameraPoseHelperNormalizesSceneRotationAndAppliesVisualizerAxes) {
+        const glm::mat3 world_to_camera = glm::mat3(1.0f);
+        const glm::vec3 world_to_camera_translation(0.0f, 0.0f, 0.0f);
+
+        glm::mat4 scene_transform(1.0f);
+        scene_transform = glm::translate(scene_transform, glm::vec3(1.0f, 2.0f, 3.0f));
+        scene_transform = glm::scale(scene_transform, glm::vec3(2.0f, 3.0f, 4.0f));
+
+        const auto pose = lfs::rendering::visualizerCameraPoseFromDataWorldToCamera(
+            world_to_camera,
+            world_to_camera_translation,
+            scene_transform);
+
+        expectMat3Near(pose.rotation, lfs::rendering::DATA_TO_VISUALIZER_CAMERA_AXES);
+        EXPECT_EQ(pose.translation, glm::vec3(1.0f, 2.0f, 3.0f));
+    }
+
+    TEST(SplitViewServiceTest, GtComparisonPlanPreservesGtTextureOrigin) {
+        Viewport viewport(640, 480);
+        RenderSettings settings;
+        settings.split_view_mode = SplitViewMode::GTComparison;
+        settings.split_position = 0.4f;
+
+        FrameContext ctx{
+            .viewport = viewport,
+            .settings = settings,
+            .render_size = {640, 480},
+            .current_camera_id = 7,
+        };
+
+        FrameResources res;
+        res.gt_context = GTComparisonContext{
+            .gt_texture_id = 11,
+            .camera_id = 7,
+            .dimensions = {320, 240},
+            .gpu_aligned_dims = {320, 256},
+            .render_texcoord_scale = {1.0f, 240.0f / 256.0f},
+            .gt_texcoord_scale = {1.0f, 1.0f},
+            .gt_texture_origin = lfs::rendering::TextureOrigin::TopLeft,
+        };
+        res.cached_gpu_frame = lfs::rendering::GpuFrame{
+            .color = {.id = 22, .size = {320, 240}},
+        };
+
+        const auto plan = buildSplitViewCompositionPlan(ctx, res);
+        ASSERT_TRUE(plan.has_value());
+        ASSERT_TRUE(plan->panels[0].panel.presentation.flip_y.has_value());
+        EXPECT_TRUE(*plan->panels[0].panel.presentation.flip_y);
+        EXPECT_FALSE(plan->panels[1].panel.presentation.flip_y.has_value());
+    }
+
     TEST_F(SceneManagerRenderStateTest, DatasetReadyStateKeepsVisiblePointCloudWhenTrainingModelIsEmpty) {
         SceneManager manager;
         manager.changeContentType(SceneManager::ContentType::Dataset);
@@ -200,6 +335,41 @@ namespace lfs::vis {
         EXPECT_EQ(state.combined_model->size(), 0u);
         ASSERT_NE(state.point_cloud, nullptr);
         EXPECT_EQ(state.point_cloud->size(), 1);
+        EXPECT_EQ(state.point_cloud_transform,
+                  lfs::rendering::dataWorldTransformToVisualizerWorld(glm::mat4(1.0f)));
+    }
+
+    TEST_F(SceneManagerRenderStateTest, PointCloudTransformIsTrackedSeparatelyFromModelTransforms) {
+        SceneManager manager;
+        auto& scene = manager.getScene();
+
+        scene.addPointCloud("PointCloud", makeTestPointCloud());
+        scene.setNodeTransform(
+            "PointCloud",
+            glm::translate(glm::mat4(1.0f), glm::vec3(3.0f, -2.0f, 5.0f)));
+
+        const auto state = manager.buildRenderState();
+        ASSERT_NE(state.point_cloud, nullptr);
+        EXPECT_TRUE(state.model_transforms.empty());
+        expectVisualizerTranslationFromData(state.point_cloud_transform, {3.0f, -2.0f, 5.0f});
+    }
+
+    TEST_F(SceneManagerRenderStateTest, VisiblePointCloudDoesNotPolluteModelTransformArray) {
+        SceneManager manager;
+        auto& scene = manager.getScene();
+
+        scene.addPointCloud("PointCloud", makeTestPointCloud());
+        scene.setNodeTransform(
+            "PointCloud",
+            glm::translate(glm::mat4(1.0f), glm::vec3(9.0f, 8.0f, 7.0f)));
+        scene.addSplat("Model", makeTestSplat(0.0f));
+        scene.setNodeTransform(
+            "Model",
+            glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f)));
+
+        const auto state = manager.buildRenderState();
+        ASSERT_EQ(state.model_transforms.size(), 1u);
+        expectVisualizerTranslationFromData(state.model_transforms[0], {1.0f, 2.0f, 3.0f});
     }
 
     TEST_F(SceneManagerRenderStateTest, PlyComparisonBuildsFullFrameWipeFromCombinedSceneMasks) {

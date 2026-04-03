@@ -65,6 +65,7 @@
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui_capabilities.hpp"
 #include "visualizer/operator/operator_registry.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/training/training_manager.hpp"
 #include "visualizer/window/window_manager.hpp"
@@ -107,6 +108,16 @@ namespace {
     using lfs::training::SelectionKind;
     using lfs::training::TrainingPhase;
     using lfs::training::TrainingSnapshot;
+
+    void warn_deprecated_python_api(const std::string_view old_name, const std::string_view replacement) {
+        const std::string message = std::format(
+            "lichtfeld.{}() is deprecated; use lichtfeld.{}() instead",
+            old_name,
+            replacement);
+        if (PyErr_WarnEx(PyExc_DeprecationWarning, message.c_str(), 2) < 0) {
+            throw nb::python_error();
+        }
+    }
 
     CommandCenter* get_command_center_opt() {
         return lfs::event::command_center();
@@ -954,14 +965,26 @@ NB_MODULE(lichtfeld, m) {
         "Get center of current selection (local space)");
 
     m.def(
+        "get_selection_visualizer_world_center", []() -> std::optional<std::vector<float>> {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm || !sm->hasSelectedNode())
+                return std::nullopt;
+            const auto c = sm->getSelectionVisualizerWorldCenter();
+            return std::vector<float>{c.x, c.y, c.z};
+        },
+        "Get center of current selection in visualizer-world space");
+
+    m.def(
         "get_selection_world_center", []() -> std::optional<std::vector<float>> {
+            warn_deprecated_python_api("get_selection_world_center", "get_selection_visualizer_world_center");
             auto* sm = lfs::python::get_scene_manager();
             if (!sm || !sm->hasSelectedNode())
                 return std::nullopt;
             const auto c = sm->getSelectionWorldCenter();
             return std::vector<float>{c.x, c.y, c.z};
         },
-        "Get center of current selection (world space)");
+        "Deprecated: get center of current selection in legacy data-world space; use "
+        "get_selection_visualizer_world_center()");
 
     m.def(
         "has_scene", []() -> bool {
@@ -1023,6 +1046,20 @@ NB_MODULE(lichtfeld, m) {
         nb::arg("name"), "Get node transform matrix (16 floats, column-major)");
 
     m.def(
+        "get_node_visualizer_world_transform", [](const std::string& name) -> std::optional<std::vector<float>> {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm)
+                return std::nullopt;
+
+            const auto transform = lfs::vis::scene_coords::nodeVisualizerWorldTransform(sm->getScene(), name);
+            if (!transform)
+                return std::nullopt;
+
+            return std::vector<float>(&(*transform)[0][0], &(*transform)[0][0] + 16);
+        },
+        nb::arg("name"), "Get node visualizer-world transform matrix (16 floats, column-major)");
+
+    m.def(
         "set_node_transform", [](const std::string& name, const std::vector<float>& mat) {
             auto* sm = lfs::python::get_scene_manager();
             if (!sm || mat.size() != 16)
@@ -1035,6 +1072,30 @@ NB_MODULE(lichtfeld, m) {
             }
         },
         nb::arg("name"), nb::arg("matrix"), "Set node transform matrix (16 floats, column-major)");
+
+    m.def(
+        "set_node_visualizer_world_transform", [](const std::string& name, const std::vector<float>& mat) {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm || mat.size() != 16)
+                return;
+
+            glm::mat4 visualizer_world_transform;
+            std::memcpy(&visualizer_world_transform[0][0], mat.data(), 16 * sizeof(float));
+
+            const auto local_transform =
+                lfs::vis::scene_coords::nodeLocalTransformFromVisualizerWorld(sm->getScene(), name, visualizer_world_transform);
+            if (!local_transform)
+                return;
+
+            if (auto result = lfs::vis::cap::setTransformMatrix(
+                    *sm, {name}, *local_transform, "python.set_node_visualizer_world_transform");
+                !result) {
+                LOG_WARN("set_node_visualizer_world_transform fell back to direct update for '{}': {}", name, result.error());
+                sm->setNodeTransform(name, *local_transform);
+            }
+        },
+        nb::arg("name"), nb::arg("matrix"),
+        "Set node visualizer-world transform matrix (16 floats, column-major)");
 
     m.def(
         "capture_selection_transforms", []() -> nb::dict {

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "coordinate_conventions.hpp"
 #include "render_constants.hpp"
 #include <glm/glm.hpp>
 #include <optional>
@@ -11,6 +12,16 @@
 namespace lfs::rendering {
 
     // Renderer-facing frame contract for the refactor.
+    // Rotation/translation are visualizer-space camera-to-world transforms.
+
+    enum class TextureOrigin {
+        BottomLeft,
+        TopLeft,
+    };
+
+    [[nodiscard]] inline bool presentationFlipYFromTextureOrigin(const TextureOrigin origin) {
+        return origin == TextureOrigin::TopLeft;
+    }
 
     struct FrameView {
         glm::mat3 rotation{1.0f};
@@ -23,6 +34,10 @@ namespace lfs::rendering {
         bool orthographic = false;
         float ortho_scale = DEFAULT_ORTHO_SCALE;
         glm::vec3 background_color{0.0f, 0.0f, 0.0f};
+
+        [[nodiscard]] glm::mat4 getViewMatrix() const {
+            return makeViewMatrix(rotation, translation);
+        }
     };
 
     struct TextureHandle {
@@ -38,6 +53,8 @@ namespace lfs::rendering {
     struct GpuFrame {
         TextureHandle color;
         TextureHandle depth;
+        // Presentation orientation for the screen quad. Geometry/camera conventions live elsewhere.
+        bool flip_y = false;
         bool depth_is_ndc = false;
         float near_plane = DEFAULT_NEAR_PLANE;
         float far_plane = DEFAULT_FAR_PLANE;

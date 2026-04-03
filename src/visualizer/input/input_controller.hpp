@@ -123,7 +123,7 @@ namespace lfs::vis {
         };
 
         void handleGoToCamView(const lfs::core::events::cmd::GoToCamView& event);
-        void handleFocusSelection(Viewport& target_viewport);
+        bool handleFocusSelection(Viewport& target_viewport);
 
         // WASD processing with proper frame timing
         void processWASDMovement();
@@ -198,7 +198,7 @@ namespace lfs::vis {
         bool key_r_pressed_ = false;
         bool key_ctrl_pressed_ = false;
         bool key_alt_pressed_ = false;
-        bool keys_movement_[6] = {false, false, false, false, false, false}; // fwd, left, back, right, down, up
+        bool keys_movement_[6] = {false, false, false, false, false, false}; // fwd, left, back, right, up, down
 
         // Cached movement key bindings (refreshed when bindings change)
         struct MovementKeys {

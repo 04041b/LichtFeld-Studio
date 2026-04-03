@@ -26,6 +26,7 @@
 #include "mcp/shared_scene_tools.hpp"
 #include "python/python_runtime.hpp"
 #include "python/runner.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "rendering/gs_rasterizer_tensor.hpp"
 #include "sequencer/keyframe.hpp"
 #include "visualizer/gui/html_viewer_export.hpp"
@@ -33,6 +34,7 @@
 #include "visualizer/gui_capabilities.hpp"
 #include "visualizer/ipc/view_context.hpp"
 #include "visualizer/operation/undo_entry.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer/operation/undo_history.hpp"
 #include "visualizer/operator/operator_properties.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
@@ -418,7 +420,7 @@ namespace lfs::app {
 
         json transform_info_json(const core::Scene& scene, const core::SceneNode& node) {
             const glm::mat4 local = scene.getNodeTransform(node.name);
-            const glm::mat4 world = scene.getWorldTransform(node.id);
+            const glm::mat4 world = vis::scene_coords::nodeVisualizerWorldTransform(scene, node.id);
             const auto local_components = decompose_transform(local);
             const auto world_components = decompose_transform(world);
 
@@ -607,7 +609,7 @@ namespace lfs::app {
                 {"rotation", vec3_to_json(components.rotation)},
                 {"scale", vec3_to_json(components.scale)},
                 {"local_matrix", mat4_to_json(scene.getNodeTransform(node->name))},
-                {"world_matrix", mat4_to_json(scene.getWorldTransform(cropbox_id))},
+                {"world_matrix", mat4_to_json(vis::scene_coords::nodeVisualizerWorldTransform(scene, cropbox_id))},
             };
 
             if (node->parent_id != core::NULL_NODE) {
@@ -653,6 +655,11 @@ namespace lfs::app {
                 json::array({info.rotation[3], info.rotation[4], info.rotation[5]}),
                 json::array({info.rotation[6], info.rotation[7], info.rotation[8]}),
             });
+            const glm::mat3 rotation_matrix(
+                glm::vec3(info.rotation[0], info.rotation[3], info.rotation[6]),
+                glm::vec3(info.rotation[1], info.rotation[4], info.rotation[7]),
+                glm::vec3(info.rotation[2], info.rotation[5], info.rotation[8]));
+            const glm::vec3 forward = rendering::cameraForward(rotation_matrix);
 
             return json{
                 {"success", true},
@@ -661,7 +668,7 @@ namespace lfs::app {
                                {"target", json::array({info.pivot[0], info.pivot[1], info.pivot[2]})},
                                {"pivot", json::array({info.pivot[0], info.pivot[1], info.pivot[2]})},
                                {"up", json::array({info.rotation[1], info.rotation[4], info.rotation[7]})},
-                               {"forward", json::array({info.rotation[2], info.rotation[5], info.rotation[8]})},
+                               {"forward", json::array({forward.x, forward.y, forward.z})},
                                {"rotation_matrix", rotation},
                                {"width", info.width},
                                {"height", info.height},
@@ -1342,7 +1349,7 @@ namespace lfs::app {
                 {"rotation", vec3_to_json(components.rotation)},
                 {"scale", vec3_to_json(components.scale)},
                 {"local_matrix", mat4_to_json(scene.getNodeTransform(node->name))},
-                {"world_matrix", mat4_to_json(scene.getWorldTransform(ellipsoid_id))},
+                {"world_matrix", mat4_to_json(vis::scene_coords::nodeVisualizerWorldTransform(scene, ellipsoid_id))},
             };
 
             if (node->parent_id != core::NULL_NODE) {
@@ -1491,7 +1498,7 @@ namespace lfs::app {
             for (const auto& name : node_names) {
                 const auto* const node = scene.getNode(name);
                 if (node && node->type == core::NodeType::SPLAT && node->model) {
-                    splats.emplace_back(node->model.get(), scene.getWorldTransform(node->id));
+                    splats.emplace_back(node->model.get(), vis::scene_coords::nodeDataWorldTransform(scene, node->id));
                 }
             }
 
@@ -3107,7 +3114,7 @@ namespace lfs::app {
                 .tool_name = "transform.set",
                 .operator_id = vis::op::BuiltinOp::TransformSet,
                 .category = "transform",
-                .description = "Set absolute local transform components for a node or the current shared node selection",
+                .description = "Set absolute visualizer-world transform components for a node or the current shared node selection",
                 .prepare = prepare_transform_set_operator,
                 .on_success = transform_operator_result,
             });
@@ -3118,7 +3125,7 @@ namespace lfs::app {
                 .tool_name = "transform.translate",
                 .operator_id = vis::op::BuiltinOp::TransformTranslate,
                 .category = "transform",
-                .description = "Translate a node or the current shared node selection",
+                .description = "Translate a node or the current shared node selection in visualizer-world coordinates",
                 .required = {"value"},
                 .prepare = prepare_transform_operator,
                 .on_success = transform_operator_result,
@@ -3130,7 +3137,7 @@ namespace lfs::app {
                 .tool_name = "transform.rotate",
                 .operator_id = vis::op::BuiltinOp::TransformRotate,
                 .category = "transform",
-                .description = "Rotate a node or the current shared node selection by XYZ Euler deltas in radians",
+                .description = "Rotate a node or the current shared node selection by visualizer-world XYZ Euler deltas in radians",
                 .required = {"value"},
                 .prepare = prepare_transform_operator,
                 .on_success = transform_operator_result,
@@ -3142,7 +3149,7 @@ namespace lfs::app {
                 .tool_name = "transform.scale",
                 .operator_id = vis::op::BuiltinOp::TransformScale,
                 .category = "transform",
-                .description = "Scale a node or the current shared node selection by XYZ factors",
+                .description = "Scale a node or the current shared node selection by visualizer-world XYZ factors",
                 .required = {"value"},
                 .prepare = prepare_transform_operator,
                 .on_success = transform_operator_result,

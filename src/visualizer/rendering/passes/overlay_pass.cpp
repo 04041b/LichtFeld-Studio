@@ -67,7 +67,7 @@ namespace lfs::vis {
             }
 
             if (settings.show_crop_box && ctx.scene_manager) {
-                const auto visible_cropboxes = ctx.scene_manager->getScene().getVisibleCropBoxes();
+                const auto& visible_cropboxes = ctx.scene_state.cropboxes;
                 const core::NodeId selected_cropbox_id = ctx.scene_manager->getSelectedNodeCropBoxId();
 
                 for (const auto& cb : visible_cropboxes) {
@@ -101,7 +101,7 @@ namespace lfs::vis {
             }
 
             if (settings.show_ellipsoid && ctx.scene_manager) {
-                const auto visible_ellipsoids = ctx.scene_manager->getScene().getVisibleEllipsoids();
+                const auto& visible_ellipsoids = ctx.scene_state.ellipsoids;
                 const core::NodeId selected_ellipsoid_id = ctx.scene_manager->getSelectedNodeEllipsoidId();
 
                 for (const auto& el : visible_ellipsoids) {
@@ -187,12 +187,6 @@ namespace lfs::vis {
                         }
                     }
 
-                    glm::mat4 scene_transform(1.0f);
-                    auto visible_transforms = ctx.scene_manager->getScene().getVisibleNodeTransforms();
-                    if (!visible_transforms.empty()) {
-                        scene_transform = visible_transforms[0];
-                    }
-
                     LOG_TRACE("Rendering {} camera frustums with scale {}, focused index: {} (ID: {})",
                               cameras.size(), settings.camera_frustum_scale, focused_index, ctx.hovered_camera_id);
 
@@ -213,7 +207,7 @@ namespace lfs::vis {
                         .eval_color = settings.eval_camera_color,
                         .per_camera_colors = {},
                         .focused_index = focused_index,
-                        .scene_transform = scene_transform,
+                        .scene_transforms = ctx.scene_state.camera_scene_transforms,
                         .equirectangular_view = settings.equirectangular,
                         .disabled_uids = std::move(disabled_uids),
                         .emphasized_uids = std::move(emphasized_uids)};
@@ -248,6 +242,7 @@ namespace lfs::vis {
                     LOG_WARN("Grid render failed: {}", result.error());
                 }
             }
+
         };
 
         if (ctx.view_panels.size() > 1 && ctx.render_size.x > 1 && ctx.render_size.y > 0) {

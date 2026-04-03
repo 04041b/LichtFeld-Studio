@@ -5,8 +5,10 @@
 #include "split_view_composition.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "gui/string_keys.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "scene/scene_manager.hpp"
 #include "viewport_request_builder.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include <cassert>
 #include <format>
 
@@ -140,7 +142,8 @@ namespace lfs::vis {
                                  {.start_position = 0.0f,
                                   .end_position = ctx.settings.split_position,
                                   .texcoord_scale = res.gt_context->gt_texcoord_scale,
-                                  .flip_y = res.gt_context->gt_needs_flip}}},
+                                  .flip_y = lfs::rendering::presentationFlipYFromTextureOrigin(
+                                      res.gt_context->gt_texture_origin)}}},
                     SplitViewPanelPlan{
                         .label = LOC(lichtfeld::Strings::StatusBar::RENDERED),
                         .panel =
@@ -203,7 +206,8 @@ namespace lfs::vis {
                                            ctx.viewport,
                                            ctx.render_size,
                                            *visible_nodes[left_idx]->model,
-                                           scene.getWorldTransform(visible_nodes[left_idx]->id),
+                                           scene_coords::nodeVisualizerWorldTransform(
+                                               scene, visible_nodes[left_idx]->id),
                                            false,
                                            std::nullopt),
                              .presentation =
@@ -227,7 +231,8 @@ namespace lfs::vis {
                                            ctx.viewport,
                                            ctx.render_size,
                                            *visible_nodes[right_idx]->model,
-                                           scene.getWorldTransform(visible_nodes[right_idx]->id),
+                                           scene_coords::nodeVisualizerWorldTransform(
+                                               scene, visible_nodes[right_idx]->id),
                                            false,
                                            std::nullopt),
                              .presentation =
