@@ -15,7 +15,7 @@ namespace lfs::vis {
 
     namespace {
         [[nodiscard]] glm::mat4 currentSceneTransform(SceneManager* const scene_manager,
-                                                     const int camera_uid) {
+                                                      const int camera_uid) {
             if (!scene_manager) {
                 return glm::mat4(1.0f);
             }

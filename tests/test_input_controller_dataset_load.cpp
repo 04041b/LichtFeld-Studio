@@ -55,8 +55,12 @@ namespace lfs::vis {
         scene_manager.getScene().addPointCloud(
             "points",
             makePointCloud({
-                0.0f, 0.0f, 0.0f,
-                0.0f, 2.0f, 4.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                2.0f,
+                4.0f,
             }));
 
         ToolContext tool_context(nullptr, &scene_manager, &viewport, nullptr);

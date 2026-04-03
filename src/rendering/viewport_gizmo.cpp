@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "viewport_gizmo.hpp"
-#include "rendering/coordinate_conventions.hpp"
 #include "core/executable_path.hpp"
 #include "core/logger.hpp"
 #include "gl_state_guard.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "shader_paths.hpp"
 #include "text_renderer.hpp"
 #include <SDL3/SDL.h>

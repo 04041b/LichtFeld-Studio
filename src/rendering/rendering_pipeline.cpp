@@ -6,10 +6,10 @@
 #include "core/camera.hpp"
 #include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
-#include "rendering/coordinate_conventions.hpp"
 #include "gl_state_guard.hpp"
 #include "gs_rasterizer_tensor.hpp"
 #include "image_layout.hpp"
+#include "rendering/coordinate_conventions.hpp"
 
 #include <cstring>
 #include <print>

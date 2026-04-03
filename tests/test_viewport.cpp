@@ -1,11 +1,11 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "internal/viewport.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
-#include "rendering/rendering_pipeline.hpp"
+#include "internal/viewport.hpp"
 #include "rendering/rendering.hpp"
+#include "rendering/rendering_pipeline.hpp"
 
 #include <gtest/gtest.h>
 
@@ -18,22 +18,26 @@ namespace {
 
         auto means = Tensor::from_vector({mean.x, mean.y, mean.z}, {size_t{1}, size_t{3}}, Device::CUDA).to(DataType::Float32);
         auto sh0 = Tensor::from_vector(
-            {0.0f, 0.0f, 0.0f},
-            {size_t{1}, size_t{1}, size_t{3}},
-            Device::CUDA).to(DataType::Float32);
+                       {0.0f, 0.0f, 0.0f},
+                       {size_t{1}, size_t{1}, size_t{3}},
+                       Device::CUDA)
+                       .to(DataType::Float32);
         auto shN = Tensor::zeros({size_t{1}, size_t{0}, size_t{3}}, Device::CUDA, DataType::Float32);
         auto scaling = Tensor::from_vector(
-            {-2.0f, -2.0f, -2.0f},
-            {size_t{1}, size_t{3}},
-            Device::CUDA).to(DataType::Float32);
+                           {-2.0f, -2.0f, -2.0f},
+                           {size_t{1}, size_t{3}},
+                           Device::CUDA)
+                           .to(DataType::Float32);
         auto rotation = Tensor::from_vector(
-            {1.0f, 0.0f, 0.0f, 0.0f},
-            {size_t{1}, size_t{4}},
-            Device::CUDA).to(DataType::Float32);
+                            {1.0f, 0.0f, 0.0f, 0.0f},
+                            {size_t{1}, size_t{4}},
+                            Device::CUDA)
+                            .to(DataType::Float32);
         auto opacity = Tensor::from_vector(
-            {8.0f},
-            {size_t{1}},
-            Device::CUDA).to(DataType::Float32);
+                           {8.0f},
+                           {size_t{1}},
+                           Device::CUDA)
+                           .to(DataType::Float32);
 
         return std::make_unique<lfs::core::SplatData>(
             0,

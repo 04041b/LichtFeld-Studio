@@ -242,7 +242,6 @@ namespace lfs::vis {
                     LOG_WARN("Grid render failed: {}", result.error());
                 }
             }
-
         };
 
         if (ctx.view_panels.size() > 1 && ctx.render_size.x > 1 && ctx.render_size.y > 0) {

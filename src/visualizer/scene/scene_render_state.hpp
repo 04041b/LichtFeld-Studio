@@ -20,7 +20,7 @@ namespace lfs::vis {
         const lfs::core::SplatData* combined_model = nullptr;
         const lfs::core::PointCloud* point_cloud = nullptr; // For pre-training point cloud rendering
         glm::mat4 point_cloud_transform{1.0f};
-        std::vector<core::Scene::VisibleMesh> meshes;       // Visible mesh nodes with transforms
+        std::vector<core::Scene::VisibleMesh> meshes; // Visible mesh nodes with transforms
         std::vector<glm::mat4> model_transforms;
         std::vector<glm::mat4> camera_scene_transforms;
         std::shared_ptr<lfs::core::Tensor> transform_indices; // Per-Gaussian index into model_transforms
