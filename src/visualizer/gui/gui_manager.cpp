@@ -967,7 +967,8 @@ namespace lfs::vis::gui {
         const bool block_underlay_input = modal_overlay_open || context_menu_open;
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
-            auto* editor = panels::PythonConsoleState::getInstance().getEditor();
+            auto* console_state = panels::PythonConsoleState::tryGetInstance();
+            auto* editor = console_state ? console_state->getEditor() : nullptr;
             const bool editor_owns_escape =
                 editor && (editor->isFocused() || editor->hasActiveCompletion());
             if (!editor_owns_escape) {
@@ -1843,8 +1844,12 @@ namespace lfs::vis::gui {
             if (input.mouse_clicked[0] || input.mouse_clicked[1]) {
                 ImGui::ClearActiveID();
                 focus.want_capture_keyboard = false;
-                if (auto* editor = panels::PythonConsoleState::getInstance().getEditor()) {
-                    editor->unfocus();
+                auto* console_state = panels::PythonConsoleState::tryGetInstance();
+                if (console_state != nullptr) {
+                    auto* editor = console_state->getEditor();
+                    if (editor != nullptr) {
+                        editor->unfocus();
+                    }
                 }
             }
         }

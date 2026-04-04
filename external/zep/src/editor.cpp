@@ -654,10 +654,10 @@ namespace Zep {
     void ZepEditor::SetGlobalMode(const std::string& currentMode) {
         auto itrMode = m_mapGlobalModes.find(currentMode);
         if (itrMode != m_mapGlobalModes.end()) {
-            ZepWindow* pWindow = nullptr;
-            if (m_pCurrentMode) {
-                pWindow = m_pCurrentMode->GetCurrentWindow();
-            }
+            // Global mode switches can happen before the first window is created or after a
+            // teardown path has cleared the previous mode's current window. Preserve the active
+            // editor window when one exists, but do not assume the old mode is still bound.
+            ZepWindow* pWindow = GetActiveWindow();
 
             m_pCurrentMode = itrMode->second.get();
 
