@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/rmlui/rml_theme.hpp"
-#include "core/path_utils.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "internal/resource_paths.hpp"
 #include "theme/theme.hpp"
 
