@@ -10,10 +10,10 @@
 #include <SDL3/SDL.h>
 #include <cstring>
 #include <glad/glad.h>
-#include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <iostream>
 #include <string>
+#include <imgui.h>
 
 namespace lfs::vis {
 
