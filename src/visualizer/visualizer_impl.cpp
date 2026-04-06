@@ -1405,6 +1405,8 @@ namespace lfs::vis {
             return;
         }
 
+        const auto preserved_camera = viewport_.camera;
+
         const auto& init_path = data_loader_->getParameters().init_path;
         if (auto* const param_mgr = services().paramsOrNull(); param_mgr && param_mgr->ensureLoaded()) {
             auto params = param_mgr->createForDataset(path, {});
@@ -1416,9 +1418,28 @@ namespace lfs::vis {
             data_loader_->setParameters(params);
         }
 
+        const auto restore_camera = [this, &preserved_camera]() {
+            viewport_.camera = preserved_camera;
+            if (selection_tool_ && selection_tool_->isEnabled()) {
+                selection_tool_->syncDepthFilterToCamera(viewport_);
+            }
+            if (rendering_manager_) {
+                rendering_manager_->markDirty(DirtyFlag::CAMERA);
+            }
+            ui::CameraMove{
+                .rotation = viewport_.getRotationMatrix(),
+                .translation = viewport_.getTranslation()}
+                .emit();
+            wakeMainLoop();
+        };
+
         if (const auto result = data_loader_->loadDataset(path); !result) {
             LOG_ERROR("Reset reload failed: {}", result.error());
+            restore_camera();
+            return;
         }
+
+        restore_camera();
     }
 
     void VisualizerImpl::handleLoadFileCommand([[maybe_unused]] const lfs::core::events::cmd::LoadFile& cmd) {
