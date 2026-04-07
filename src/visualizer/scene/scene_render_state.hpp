@@ -18,7 +18,7 @@ namespace lfs::vis {
     // Snapshot of scene state for rendering
     struct SceneRenderState {
         const lfs::core::SplatData* combined_model = nullptr;
-        const lfs::core::PointCloud* point_cloud = nullptr; // For pre-training point cloud rendering
+        const lfs::core::PointCloud* point_cloud = nullptr;             // For pre-training point cloud rendering
         std::shared_ptr<const lfs::core::PointCloud> owned_point_cloud; // Keeps merged point clouds alive
         glm::mat4 point_cloud_transform{1.0f};
         std::vector<core::Scene::VisibleMesh> meshes; // Visible mesh nodes with transforms

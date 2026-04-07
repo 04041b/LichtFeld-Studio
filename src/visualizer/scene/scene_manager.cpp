@@ -152,10 +152,10 @@ namespace lfs::vis {
 
                 for (size_t i = 0; i < point_count; ++i) {
                     const glm::vec4 world_pos = world_transform * glm::vec4(
-                        means_acc(i, 0),
-                        means_acc(i, 1),
-                        means_acc(i, 2),
-                        1.0f);
+                                                                      means_acc(i, 0),
+                                                                      means_acc(i, 1),
+                                                                      means_acc(i, 2),
+                                                                      1.0f);
                     merged_means.push_back(world_pos.x);
                     merged_means.push_back(world_pos.y);
                     merged_means.push_back(world_pos.z);
@@ -392,7 +392,6 @@ namespace lfs::vis {
         state::SelectionChanged::when([](const auto& event) {
             python::update_selection(event.has_selection, event.count);
         });
-
     }
 
     void SceneManager::changeContentType(const ContentType& type) {
