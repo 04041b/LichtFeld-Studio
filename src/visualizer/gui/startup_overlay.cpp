@@ -111,7 +111,8 @@ namespace lfs::vis::gui {
         updateLocalizedText();
 
         link_listener_ = new LinkClickListener();
-        for (const char* id : {"link-discord", "link-x", "link-donate"}) {
+        for (const char* id : {"link-discord", "link-x", "link-donate", "link-core11",
+                               "link-volinga"}) {
             auto* el = document_->GetElementById(id);
             if (el)
                 el->AddEventListener(Rml::EventId::Click, link_listener_);
@@ -254,6 +255,20 @@ namespace lfs::vis::gui {
             if (w > 0 && h > 0) {
                 core11->SetProperty("width", std::format("{:.0f}dp", w * 0.5f));
                 core11->SetProperty("height", std::format("{:.0f}dp", h * 0.5f));
+            }
+        }
+
+        const auto volinga_path = lfs::vis::getAssetPath(
+            is_light ? "volinga-logo-dark.png" : "volinga-logo.png");
+        auto* volinga = document_->GetElementById("volinga-logo");
+        if (volinga) {
+            volinga->SetAttribute("src", volinga_path.string());
+            auto [w, h, c] = lfs::core::get_image_info(volinga_path);
+            if (w > 0 && h > 0) {
+                constexpr float TARGET_HEIGHT_DP = 24.0f;
+                const float scale = TARGET_HEIGHT_DP / static_cast<float>(h);
+                volinga->SetProperty("width", std::format("{:.0f}dp", w * scale));
+                volinga->SetProperty("height", std::format("{:.0f}dp", h * scale));
             }
         }
 

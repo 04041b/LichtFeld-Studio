@@ -27,8 +27,18 @@ body {
     margin-top: 20dp;
 }
 
-#core11-logo {
+#sponsor-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 24dp;
     margin-top: 10dp;
+}
+
+.sponsor-link {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
 }
 
 #social-row {
