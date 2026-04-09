@@ -386,8 +386,15 @@ class HistogramPanel(Panel):
             if self._metric_id == "opacity":
                 return self._float_tensor(model.get_opacity()).reshape([-1])
 
-            if self._metric_id == "distance":
-                return self._extract_distance_values(scene, model)
+            if self._metric_id in {"position_x", "position_y", "position_z", "distance"}:
+                world_means = self._extract_world_space_means(scene, model)
+                if self._metric_id == "position_x":
+                    return world_means[:, 0]
+                if self._metric_id == "position_y":
+                    return world_means[:, 1]
+                if self._metric_id == "position_z":
+                    return world_means[:, 2]
+                return self._distance_from_positions(scene, world_means)
 
             scaling = self._float_tensor(model.get_scaling()).reshape([-1, 3])
             if self._metric_id == "scale_x":
@@ -398,19 +405,23 @@ class HistogramPanel(Panel):
                 return scaling[:, 2]
             if self._metric_id == "scale_max":
                 return scaling.max(1).reshape([-1])
+            if self._metric_id == "volume":
+                return scaling.prod(1).reshape([-1]) * (4.0 * math.pi / 3.0)
+            if self._metric_id == "anisotropy":
+                scale_min = scaling.min(1).reshape([-1])
+                scale_max = scaling.max(1).reshape([-1])
+                return scale_max / (scale_min + 1e-12)
             return None
         except Exception:
             return None
 
-    def _extract_distance_values(self, scene, model) -> lf.Tensor:
+    def _extract_world_space_means(self, scene, model) -> lf.Tensor:
         means = self._float_tensor(model.get_means()).reshape([-1, 3])
         if means.numel == 0:
-            return lf.Tensor.zeros([0], dtype="float32", device=self._device_string(means))
+            return lf.Tensor.zeros([0, 3], dtype="float32", device=self._device_string(means))
 
         world_means = self._world_space_means(scene, means)
-        if world_means is None:
-            world_means = means
-        return self._distance_from_positions(scene, world_means)
+        return means if world_means is None else world_means
 
     def _world_space_means(self, scene, means: lf.Tensor) -> lf.Tensor | None:
         nodes = self._visible_splat_nodes(scene)
@@ -553,6 +564,16 @@ class HistogramPanel(Panel):
     def _histogram_bounds(self, values: lf.Tensor) -> tuple[float, float]:
         if self._metric_id == "opacity":
             return 0.0, 1.0
+        if self._metric_id == "anisotropy":
+            lo = 1.0
+            hi = values.max_scalar()
+            if not math.isfinite(hi):
+                return lo, lo + 1.0
+            if hi < lo:
+                hi = lo
+            if math.isclose(hi, lo, rel_tol=1e-6, abs_tol=1e-9):
+                return lo, lo + 1e-3
+            return lo, hi
 
         lo = values.min_scalar()
         hi = values.max_scalar()

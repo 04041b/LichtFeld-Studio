@@ -1180,6 +1180,18 @@
         "label": "Opacity",
         "description": "Activated Gaussian opacity in [0, 1]."
       },
+      "position_x": {
+        "label": "Position X",
+        "description": "Gaussian world-space center on the X axis."
+      },
+      "position_y": {
+        "label": "Position Y",
+        "description": "Gaussian world-space center on the Y axis."
+      },
+      "position_z": {
+        "label": "Position Z",
+        "description": "Gaussian world-space center on the Z axis."
+      },
       "scale_x": {
         "label": "Scale X",
         "description": "Activated Gaussian scale on the X axis."
@@ -1195,6 +1207,14 @@
       "scale_max": {
         "label": "Scale Max",
         "description": "Largest activated scale component per Gaussian."
+      },
+      "volume": {
+        "label": "Volume",
+        "description": "Ellipsoid volume derived from activated Gaussian scales."
+      },
+      "anisotropy": {
+        "label": "Anisotropy",
+        "description": "Ratio of largest to smallest activated scale. 1 is sphere-like; larger values are spikier."
       },
       "distance": {
         "label": "Distance",

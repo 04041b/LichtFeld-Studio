@@ -43,6 +43,27 @@ METRICS = (
         "Activated Gaussian opacity in [0, 1].",
     ),
     HistogramMetric(
+        "position_x",
+        "histogram.metric.position_x.label",
+        "Position X",
+        "histogram.metric.position_x.description",
+        "Gaussian world-space center on the X axis.",
+    ),
+    HistogramMetric(
+        "position_y",
+        "histogram.metric.position_y.label",
+        "Position Y",
+        "histogram.metric.position_y.description",
+        "Gaussian world-space center on the Y axis.",
+    ),
+    HistogramMetric(
+        "position_z",
+        "histogram.metric.position_z.label",
+        "Position Z",
+        "histogram.metric.position_z.description",
+        "Gaussian world-space center on the Z axis.",
+    ),
+    HistogramMetric(
         "scale_x",
         "histogram.metric.scale_x.label",
         "Scale X",
@@ -69,6 +90,20 @@ METRICS = (
         "Scale Max",
         "histogram.metric.scale_max.description",
         "Largest activated scale component per Gaussian.",
+    ),
+    HistogramMetric(
+        "volume",
+        "histogram.metric.volume.label",
+        "Volume",
+        "histogram.metric.volume.description",
+        "Ellipsoid volume derived from activated Gaussian scales.",
+    ),
+    HistogramMetric(
+        "anisotropy",
+        "histogram.metric.anisotropy.label",
+        "Anisotropy",
+        "histogram.metric.anisotropy.description",
+        "Ratio of largest to smallest activated scale. 1 is sphere-like; larger values are spikier.",
     ),
     HistogramMetric(
         "distance",
