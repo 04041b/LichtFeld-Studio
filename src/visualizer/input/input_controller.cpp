@@ -681,6 +681,14 @@ namespace lfs::vis {
 
                             op::operators().invoke(op::BuiltinOp::BrushStroke, &props);
                         }
+                    } else if (align_tool_ && align_tool_->isEnabled()) {
+                        op::OperatorProperties props;
+                        props.set("x", x);
+                        props.set("y", y);
+                        const auto result = op::operators().invoke(op::BuiltinOp::AlignPickPoint, &props);
+                        if (result.status != op::OperatorResult::CANCELLED) {
+                            return;
+                        }
                     }
                 }
                 break;
