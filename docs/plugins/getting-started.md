@@ -1255,25 +1255,25 @@ Register callbacks for training lifecycle events.
 import lichtfeld as lf
 
 @lf.on_training_start
-def on_start():
+def on_start(_hook):
     lf.log.info("Training started")
 
 @lf.on_iteration_start
-def on_iter():
+def on_iter(_hook):
     pass
 
 @lf.on_pre_optimizer_step
-def on_pre_opt():
+def on_pre_opt(_hook):
     pass
 
 @lf.on_post_step
-def on_post():
+def on_post(_hook):
     ctx = lf.context()
     if ctx.iteration % 1000 == 0:
         lf.log.info(f"Iteration {ctx.iteration}, loss: {ctx.loss:.6f}")
 
 @lf.on_training_end
-def on_end():
+def on_end(_hook):
     lf.log.info(f"Training finished: {lf.finish_reason()}")
 ```
 
@@ -1310,7 +1310,6 @@ lf.save_checkpoint()
 
 ```python
 import lichtfeld as lf
-from lfs_plugins.ui.state import AppState
 
 class AutoSavePlugin:
     """Automatically save checkpoints every N iterations."""
@@ -1319,7 +1318,7 @@ class AutoSavePlugin:
         self.interval = interval
         self.last_save = 0
 
-    def on_post_step(self):
+    def on_post_step(self, _hook):
         ctx = lf.context()
         if ctx.iteration - self.last_save >= self.interval:
             lf.save_checkpoint()
