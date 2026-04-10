@@ -145,6 +145,7 @@ namespace lfs::rendering {
         GaussianSceneState scene;
         GaussianFilterState filters;
         GaussianOverlayState overlay;
+        bool transparent_background = false;
     };
 
     struct HoveredGaussianQueryRequest {
@@ -187,6 +188,7 @@ namespace lfs::rendering {
         PointCloudRenderState render;
         PointCloudSceneState scene;
         PointCloudFilterState filters;
+        bool transparent_background = false;
     };
 
     struct FramePanelMetadata {
@@ -210,6 +212,7 @@ namespace lfs::rendering {
         float near_plane = DEFAULT_NEAR_PLANE;
         float far_plane = DEFAULT_FAR_PLANE;
         bool orthographic = false;
+        bool color_has_alpha = false;
 
         [[nodiscard]] const std::shared_ptr<lfs::core::Tensor>& primaryDepth() const {
             return depth_panels[0].depth;
@@ -367,6 +370,7 @@ namespace lfs::rendering {
         bool dim_non_emphasized = false;
         float flash_intensity = 0.0f;
         glm::vec3 background_color{0.0f};
+        bool transparent_background = false;
     };
 
     struct CameraFrustumRenderRequest {

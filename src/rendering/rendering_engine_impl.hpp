@@ -206,6 +206,7 @@ namespace lfs::rendering {
         float last_presented_near_plane_ = 0.0f;
         float last_presented_far_plane_ = 0.0f;
         bool last_presented_orthographic_ = false;
+        bool last_presented_color_has_alpha_ = false;
         bool has_present_upload_cache_ = false;
         unsigned long long* hovered_depth_id_device_ = nullptr;
         unsigned long long* hovered_depth_id_host_ = nullptr;

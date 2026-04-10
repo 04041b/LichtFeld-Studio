@@ -6,6 +6,7 @@
 #include "core/logger.hpp"
 #include "core/tensor.hpp"
 #include "gl_state_guard.hpp"
+#include "image_layout.hpp"
 
 #ifdef CUDA_GL_INTEROP_ENABLED
 #include "cuda_gl_interop.hpp"
@@ -105,6 +106,7 @@ namespace lfs::rendering {
             getTexcoordScale(),
             getTexcoordScale(),
             getDepthTextureID(),
+            false,
             false);
     }
 
@@ -123,7 +125,8 @@ namespace lfs::rendering {
                                                    const glm::vec2 color_texcoord_scale,
                                                    const glm::vec2 depth_texcoord_scale,
                                                    const GLuint depth_texture,
-                                                   const bool flip_y) const {
+                                                   const bool flip_y,
+                                                   const bool enable_alpha_blending) const {
         LOG_TIMER_TRACE("ScreenQuadRenderer::renderTexture");
 
         GLStateGuard state_guard;
@@ -176,6 +179,14 @@ namespace lfs::rendering {
             LOG_TRACE("Uniform 'depth_is_ndc' not set: {}", result.error());
         }
 
+        if (enable_alpha_blending) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glBlendEquation(GL_FUNC_ADD);
+        } else {
+            glDisable(GL_BLEND);
+        }
+
         if (depth_params.has_depth) {
             glEnable(GL_DEPTH_TEST);
             glDepthMask(GL_TRUE);
@@ -189,14 +200,14 @@ namespace lfs::rendering {
         return {};
     }
 
-    Result<void> ScreenQuadRenderer::uploadData(const unsigned char* image, int width_, int height_) {
+    Result<void> ScreenQuadRenderer::uploadData(const unsigned char* image, int width_, int height_, const int channels) {
         if (!framebuffer) {
             LOG_ERROR("Framebuffer not initialized");
             return std::unexpected("Framebuffer not initialized");
         }
 
         LOG_TRACE("Uploading image data: {}x{}", width_, height_);
-        framebuffer->uploadImage(image, width_, height_);
+        framebuffer->uploadImage(image, width_, height_, channels);
         return {};
     }
 
@@ -214,7 +225,9 @@ namespace lfs::rendering {
             cpu_image = (cpu_image.clamp(0.0f, 1.0f) * 255.0f).to(lfs::core::DataType::UInt8);
         }
         cpu_image = cpu_image.cpu().contiguous();
-        return uploadData(cpu_image.ptr<unsigned char>(), width, height);
+        const auto layout = detectImageLayout(cpu_image);
+        const int channels = layout == ImageLayout::Unknown ? 3 : imageChannels(cpu_image, layout);
+        return uploadData(cpu_image.ptr<unsigned char>(), width, height, channels);
     }
 
     bool ScreenQuadRenderer::isInteropEnabled() const {

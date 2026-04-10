@@ -13,6 +13,7 @@
 #include <glm/glm.hpp>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace lfs::vis {
 
@@ -29,6 +30,14 @@ namespace lfs::vis {
         Left = 0,
         Right = 1
     };
+
+    enum class EnvironmentBackgroundMode {
+        SolidColor = 0,
+        Equirectangular = 1,
+    };
+
+    inline constexpr std::string_view kDefaultEnvironmentMapPath =
+        "environments/kloofendal_48d_partly_cloudy_puresky_1k.hdr";
 
     [[nodiscard]] inline bool splitViewEnabled(const SplitViewMode mode) {
         return mode != SplitViewMode::Disabled;
@@ -172,6 +181,10 @@ namespace lfs::vis {
 
         // Background
         glm::vec3 background_color = glm::vec3(0.0f, 0.0f, 0.0f);
+        EnvironmentBackgroundMode environment_mode = EnvironmentBackgroundMode::SolidColor;
+        std::string environment_map_path = std::string(kDefaultEnvironmentMapPath);
+        float environment_exposure = 0.0f;
+        float environment_rotation_degrees = 0.0f;
 
         // Coordinate axes
         bool show_coord_axes = false;
@@ -236,6 +249,17 @@ namespace lfs::vis {
         glm::vec3 depth_filter_max = glm::vec3(50.0f, 10000.0f, 100.0f);
         lfs::geometry::EuclideanTransform depth_filter_transform;
     };
+
+    [[nodiscard]] inline bool environmentBackgroundEnabled(const RenderSettings& settings) {
+        return settings.environment_mode == EnvironmentBackgroundMode::Equirectangular &&
+               !settings.environment_map_path.empty();
+    }
+
+    [[nodiscard]] inline bool environmentBackgroundUsesTransparentViewerCompositing(
+        const RenderSettings& settings) {
+        return environmentBackgroundEnabled(settings) &&
+               !splitViewEnabled(settings.split_view_mode);
+    }
 
     struct SplitViewInfo {
         bool enabled = false;

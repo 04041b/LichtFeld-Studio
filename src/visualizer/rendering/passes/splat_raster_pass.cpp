@@ -116,16 +116,17 @@ namespace lfs::vis {
                 if (!gpu_frame) {
                     render_error = gpu_frame.error();
                 } else {
-                    viewport_frame = lfs::rendering::GaussianGpuFrameResult{
-                        .frame = *gpu_frame,
-                        .metadata =
+                        viewport_frame = lfs::rendering::GaussianGpuFrameResult{
+                            .frame = *gpu_frame,
+                            .metadata =
                             {.depth_panel_count = 1,
                              .valid = true,
                              .depth_is_ndc = gpu_frame->depth_is_ndc,
                              .external_depth_texture = gpu_frame->depth.valid() ? gpu_frame->depth.id : 0,
                              .near_plane = gpu_frame->near_plane,
                              .far_plane = gpu_frame->far_plane,
-                             .orthographic = gpu_frame->orthographic}};
+                             .orthographic = gpu_frame->orthographic,
+                             .color_has_alpha = gpu_frame->color_has_alpha}};
                 }
             }
         } else if (settings.apply_appearance_correction) {

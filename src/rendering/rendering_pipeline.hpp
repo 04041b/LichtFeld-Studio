@@ -92,6 +92,7 @@ namespace lfs::rendering {
             bool orthographic = false;
             float ortho_scale = DEFAULT_ORTHO_SCALE;
             PointCloudCropParams point_cloud_crop_params;
+            bool transparent_background = false;
 
             [[nodiscard]] glm::mat4 getViewMatrix() const {
                 return makeViewMatrix(view_rotation, view_translation);
@@ -119,6 +120,7 @@ namespace lfs::rendering {
             float near_plane = DEFAULT_NEAR_PLANE;
             float far_plane = DEFAULT_FAR_PLANE;
             bool orthographic = false;
+            bool color_has_alpha = false;
         };
 
         struct DualImageRenderResult {

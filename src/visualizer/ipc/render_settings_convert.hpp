@@ -9,7 +9,7 @@
 namespace lfs::vis {
 
     // Bump this after updating proxy conversions when RenderSettings layout changes.
-    inline constexpr size_t kRenderSettingsExpectedSize = 368;
+    inline constexpr size_t kRenderSettingsExpectedSize = 416;
     static_assert(sizeof(RenderSettings) == kRenderSettingsExpectedSize,
                   "RenderSettings layout changed — update proxy conversions in render_settings_convert.hpp, "
                   "then bump kRenderSettingsExpectedSize.");
@@ -40,6 +40,10 @@ namespace lfs::vis {
         p.ppisp_mode = static_cast<int>(s.ppisp_mode);
         p.ppisp = s.ppisp_overrides;
         p.background_color = detail::to_array(s.background_color);
+        p.environment_mode = static_cast<int>(s.environment_mode);
+        p.environment_map_path = s.environment_map_path;
+        p.environment_exposure = s.environment_exposure;
+        p.environment_rotation_degrees = s.environment_rotation_degrees;
         p.show_coord_axes = s.show_coord_axes;
         p.axes_size = s.axes_size;
         p.axes_visibility = s.axes_visibility;
@@ -102,6 +106,10 @@ namespace lfs::vis {
         s.ppisp_mode = static_cast<RenderSettings::PPISPMode>(p.ppisp_mode);
         s.ppisp_overrides = p.ppisp;
         s.background_color = detail::to_vec3(p.background_color);
+        s.environment_mode = static_cast<EnvironmentBackgroundMode>(p.environment_mode);
+        s.environment_map_path = p.environment_map_path;
+        s.environment_exposure = p.environment_exposure;
+        s.environment_rotation_degrees = p.environment_rotation_degrees;
         s.show_coord_axes = p.show_coord_axes;
         s.axes_size = p.axes_size;
         s.axes_visibility = p.axes_visibility;

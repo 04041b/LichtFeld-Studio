@@ -158,8 +158,33 @@ namespace lfs::python {
             group.properties.push_back(std::move(meta));
         };
 
+        auto add_string = [&](std::string Proxy::*member, const std::string& id, const std::string& name,
+                              const std::string& desc, const std::string& default_val) {
+            PropertyMeta meta;
+            meta.id = id;
+            meta.name = name;
+            meta.description = desc;
+            meta.type = PropType::String;
+            meta.default_string = default_val;
+            meta.getter = [member](const PropertyObjectRef& ref) -> std::any {
+                return static_cast<const Proxy*>(ref.ptr)->*member;
+            };
+            meta.setter = [member](PropertyObjectRef& ref, const std::any& val) {
+                static_cast<Proxy*>(ref.ptr)->*member = std::any_cast<std::string>(val);
+            };
+            group.properties.push_back(std::move(meta));
+        };
+
         // Background
         add_color3(&Proxy::background_color, "background_color", "Color", "Viewport background color", {0.0, 0.0, 0.0});
+        add_int_enum(&Proxy::environment_mode, "environment_mode", "Environment", "Viewport background mode",
+                     {{"Solid Color", "SOLID_COLOR", 0}, {"Equirectangular HDRI", "EQUIRECTANGULAR", 1}}, 0);
+        add_string(&Proxy::environment_map_path, "environment_map_path", "Preset",
+                   "Relative asset path or absolute HDRI path for the environment background",
+                   std::string(vis::kDefaultEnvironmentMapPath));
+        add_float(&Proxy::environment_exposure, "environment_exposure", "Exposure", "Environment exposure in EV", 0.0, -6.0, 6.0);
+        add_float(&Proxy::environment_rotation_degrees, "environment_rotation_degrees", "Rotation",
+                  "Environment yaw rotation in degrees", 0.0, -180.0, 180.0);
 
         // Coordinate Axes
         add_bool(&Proxy::show_coord_axes, "show_coord_axes", "Show Coordinate Axes",
@@ -305,6 +330,7 @@ namespace lfs::python {
     void PyRenderSettings::set(const std::string& name, nb::object value) {
         prop_.setattr(name, value);
         vis::update_render_settings(settings_);
+        request_redraw();
     }
 
     void PyRenderSettings::prop_setattr(const std::string& name, nb::object value) {

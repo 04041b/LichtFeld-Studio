@@ -224,6 +224,8 @@ namespace lfs::rendering {
                 return "gut";
             if (a.equirectangular != b.equirectangular)
                 return "equirectangular";
+            if (a.transparent_background != b.transparent_background)
+                return "transparent_background";
             if (a.frame_view.focal_length_mm != b.frame_view.focal_length_mm)
                 return "frame_view.focal_length_mm";
             if (!equalIntrinsics(a.frame_view.intrinsics_override, b.frame_view.intrinsics_override))
@@ -306,7 +308,8 @@ namespace lfs::rendering {
                 .dim_non_emphasized = request.overlay.emphasis.dim_non_emphasized,
                 .emphasis_flash_intensity = request.overlay.emphasis.flash_intensity,
                 .orthographic = request.frame_view.orthographic,
-                .ortho_scale = request.frame_view.ortho_scale};
+                .ortho_scale = request.frame_view.ortho_scale,
+                .transparent_background = request.transparent_background};
         }
 
         [[nodiscard]] RenderingPipeline::RasterRequest makeHoveredGaussianQueryPipelineRequest(
@@ -406,7 +409,8 @@ namespace lfs::rendering {
                 .emphasized_node_mask = {},
                 .orthographic = request.frame_view.orthographic,
                 .ortho_scale = request.frame_view.ortho_scale,
-                .point_cloud_crop_params = makePointCloudCropParams(request)};
+                .point_cloud_crop_params = makePointCloudCropParams(request),
+                .transparent_background = request.transparent_background};
         }
 
     } // namespace
@@ -666,7 +670,8 @@ namespace lfs::rendering {
             .depth_texcoord_scale = result.depth_texcoord_scale,
             .near_plane = result.near_plane,
             .far_plane = result.far_plane,
-            .orthographic = result.orthographic};
+            .orthographic = result.orthographic,
+            .color_has_alpha = result.color_has_alpha};
     }
 
     Result<GpuFrame> RenderingEngineImpl::uploadRenderResultToGpuFrame(
@@ -699,6 +704,7 @@ namespace lfs::rendering {
                       .texcoord_scale = depth_texcoord_scale},
             .flip_y = false,
             .depth_is_ndc = result.depth_is_ndc,
+            .color_has_alpha = result.color_has_alpha,
             .near_plane = result.near_plane,
             .far_plane = result.far_plane,
             .orthographic = result.orthographic};
@@ -1037,6 +1043,7 @@ namespace lfs::rendering {
                       .texcoord_scale = depth_texcoord_scale},
             .flip_y = false,
             .depth_is_ndc = metadata.depth_is_ndc,
+            .color_has_alpha = metadata.color_has_alpha,
             .near_plane = metadata.near_plane,
             .far_plane = metadata.far_plane,
             .orthographic = metadata.orthographic};
@@ -1085,6 +1092,9 @@ namespace lfs::rendering {
             gpu_frame_readback_size_ == frame.color.size) {
             Tensor image_hwc;
             if (auto read_result = gpu_frame_readback_interop_->readToTensor(image_hwc, width, height); read_result) {
+                if (image_hwc.ndim() == 3 && image_hwc.size(2) == 4) {
+                    image_hwc = image_hwc.slice(2, 0, 3).contiguous();
+                }
                 return std::make_shared<Tensor>(image_hwc.permute({2, 0, 1}).contiguous());
             }
 
@@ -1141,6 +1151,7 @@ namespace lfs::rendering {
         last_presented_near_plane_ = 0.0f;
         last_presented_far_plane_ = 0.0f;
         last_presented_orthographic_ = false;
+        last_presented_color_has_alpha_ = false;
         has_present_upload_cache_ = false;
     }
 
@@ -1178,7 +1189,8 @@ namespace lfs::rendering {
             frame.color.texcoord_scale,
             frame.depth.texcoord_scale,
             frame.depth.valid() ? frame.depth.id : 0,
-            frame.flip_y);
+            frame.flip_y,
+            frame.color_has_alpha);
     }
 
     Result<void> RenderingEngineImpl::ensureRenderResultUploaded(
@@ -1197,6 +1209,7 @@ namespace lfs::rendering {
         const bool same_near = (last_presented_near_plane_ == metadata.near_plane);
         const bool same_far = (last_presented_far_plane_ == metadata.far_plane);
         const bool same_projection = (last_presented_orthographic_ == metadata.orthographic);
+        const bool same_alpha = (last_presented_color_has_alpha_ == metadata.color_has_alpha);
 
         const bool needs_upload = !has_present_upload_cache_ ||
                                   !same_image_ptr ||
@@ -1205,7 +1218,8 @@ namespace lfs::rendering {
                                   !same_depth_mode ||
                                   !same_near ||
                                   !same_far ||
-                                  !same_projection;
+                                  !same_projection ||
+                                  !same_alpha;
 
         if (!needs_upload) {
             LOG_TRACE("Skipping screen upload (unchanged frame payload)");
@@ -1221,6 +1235,7 @@ namespace lfs::rendering {
         internal_result.near_plane = metadata.near_plane;
         internal_result.far_plane = metadata.far_plane;
         internal_result.orthographic = metadata.orthographic;
+        internal_result.color_has_alpha = metadata.color_has_alpha;
 
         if (auto upload_result = RenderingPipeline::uploadToScreen(internal_result, *screen_renderer_, viewport_size);
             !upload_result) {
@@ -1235,6 +1250,7 @@ namespace lfs::rendering {
         last_presented_near_plane_ = metadata.near_plane;
         last_presented_far_plane_ = metadata.far_plane;
         last_presented_orthographic_ = metadata.orthographic;
+        last_presented_color_has_alpha_ = metadata.color_has_alpha;
         has_present_upload_cache_ = true;
         return {};
     }

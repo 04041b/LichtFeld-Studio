@@ -121,7 +121,8 @@ namespace lfs::rendering {
                                             const std::vector<glm::mat4>& model_transforms,
                                             const std::shared_ptr<lfs::core::Tensor>& transform_indices,
                                             const bool equirectangular,
-                                            const PointCloudCropParams& crop_params) {
+                                            const PointCloudCropParams& crop_params,
+                                            const bool transparent_background) {
         if (splat_data.size() == 0)
             return {};
 
@@ -129,7 +130,8 @@ namespace lfs::rendering {
         const auto colors = extractRGBFromSH(splat_data.sh0_raw());
 
         return renderInternal(positions, colors, view, projection, voxel_size, background_color,
-                              model_transforms, transform_indices, equirectangular, crop_params);
+                              model_transforms, transform_indices, equirectangular, crop_params,
+                              transparent_background);
     }
 
     Result<void> PointCloudRenderer::render(const lfs::core::PointCloud& point_cloud,
@@ -140,7 +142,8 @@ namespace lfs::rendering {
                                             const std::vector<glm::mat4>& model_transforms,
                                             const std::shared_ptr<lfs::core::Tensor>& transform_indices,
                                             const bool equirectangular,
-                                            const PointCloudCropParams& crop_params) {
+                                            const PointCloudCropParams& crop_params,
+                                            const bool transparent_background) {
         if (point_cloud.size() == 0)
             return {};
 
@@ -151,7 +154,8 @@ namespace lfs::rendering {
         }
 
         return renderInternal(positions, colors, view, projection, voxel_size, background_color,
-                              model_transforms, transform_indices, equirectangular, crop_params);
+                              model_transforms, transform_indices, equirectangular, crop_params,
+                              transparent_background);
     }
 
     Result<void> PointCloudRenderer::renderInternal(const Tensor& positions,
@@ -163,7 +167,8 @@ namespace lfs::rendering {
                                                     const std::vector<glm::mat4>& model_transforms,
                                                     const std::shared_ptr<lfs::core::Tensor>& transform_indices,
                                                     const bool equirectangular,
-                                                    const PointCloudCropParams& crop_params) {
+                                                    const PointCloudCropParams& crop_params,
+                                                    const bool transparent_background) {
         if (!initialized_) {
             return std::unexpected("Renderer not initialized");
         }
@@ -233,7 +238,8 @@ namespace lfs::rendering {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LESS);
         glDepthMask(GL_TRUE);
-        glClearColor(background_color.r, background_color.g, background_color.b, 1.0f);
+        glClearColor(background_color.r, background_color.g, background_color.b,
+                     transparent_background ? 0.0f : 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         ShaderScope s(shader_);

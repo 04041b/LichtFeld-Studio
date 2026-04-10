@@ -60,7 +60,7 @@ BOOL_PROPS = [
 
 SLIDER_PROPS = [
     "axes_size", "grid_opacity", "camera_frustum_scale", "voxel_size",
-    "focal_length_mm", "render_scale",
+    "focal_length_mm", "render_scale", "environment_exposure", "environment_rotation_degrees",
     "mesh_wireframe_width", "mesh_light_intensity", "mesh_ambient",
     "ppisp_exposure", "ppisp_vignette_strength", "ppisp_gamma_multiplier",
     "ppisp_gamma_red", "ppisp_gamma_green", "ppisp_gamma_blue",
@@ -74,6 +74,8 @@ SCRUB_FIELD_DEFS = {
     "voxel_size": ScrubFieldSpec(0.001, 0.1, 0.001, "%.3f"),
     "focal_length_mm": ScrubFieldSpec(10.0, 200.0, 0.1, "%.1f"),
     "render_scale": ScrubFieldSpec(0.25, 1.0, 0.01, "%.2f"),
+    "environment_exposure": ScrubFieldSpec(-6.0, 6.0, 0.01, "%.2f"),
+    "environment_rotation_degrees": ScrubFieldSpec(-180.0, 180.0, 0.1, "%.1f"),
     "mesh_wireframe_width": ScrubFieldSpec(0.5, 5.0, 0.01, "%.2f"),
     "mesh_light_intensity": ScrubFieldSpec(0.0, 5.0, 0.01, "%.2f"),
     "mesh_ambient": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
@@ -97,6 +99,13 @@ SCRUB_FIELD_DEFS = {
 SELECT_PROPS = [
     "grid_plane", "sh_degree", "camera_metrics_mode", "mesh_shadow_resolution",
 ]
+
+ENVIRONMENT_PRESET_PATHS = (
+    "environments/kloofendal_48d_partly_cloudy_puresky_1k.hdr",
+    "environments/alps_field_1k.hdr",
+    "environments/studio_small_03_1k.hdr",
+)
+DEFAULT_ENVIRONMENT_PRESET_INDEX = 0
 
 CHROM_FLOAT_PROPS = [
     "ppisp_color_red_x", "ppisp_color_red_y",
@@ -233,6 +242,7 @@ class RenderingPanel(Panel):
         self._simplify_progress_value = "0"
         self._simplify_progress_stage = ""
         self._simplify_error_text = ""
+        self._last_environment_state = None
         self._escape_revert = w.EscapeRevertController()
         self._scrub_fields = ScrubFieldController(
             SCRUB_FIELD_DEFS,
@@ -293,11 +303,23 @@ class RenderingPanel(Panel):
                        lambda p=prop_id: str(getattr(s(), p, "")),
                        lambda v, p=prop_id: setattr(s(), p, v) if s() else None)
 
+        model.bind("environment_mode",
+                   lambda: str(getattr(s(), "environment_mode", "")),
+                   lambda v: self._set_environment_mode(v))
+        model.bind("environment_map_preset",
+                   self._get_environment_map_preset,
+                   self._set_environment_map_preset)
+
         model.bind("ppisp_mode",
                     lambda: str(getattr(s(), "ppisp_mode", "")),
                     lambda v: self._set_ppisp_mode(v))
 
-        all_props = BOOL_PROPS + SLIDER_PROPS + SELECT_PROPS + ["ppisp_mode"] + COLOR_PROPS
+        model.bind_func("environment_enabled",
+                        lambda: s() is not None and getattr(s(), "environment_mode", "") == "EQUIRECTANGULAR")
+
+        all_props = BOOL_PROPS + SLIDER_PROPS + SELECT_PROPS + [
+            "environment_mode", "environment_map_path", "ppisp_mode"
+        ] + COLOR_PROPS
         for prop_id in all_props:
             model.bind_func(f"label_{prop_id}", lambda p=prop_id: _prop_label(p))
 
@@ -446,6 +468,7 @@ class RenderingPanel(Panel):
             return False
 
         dirty = False
+        dirty |= self._sync_environment_state()
         for prop_id in COLOR_PROPS:
             val = getattr(s, prop_id)
             key = (prop_id, int(val[0] * 255), int(val[1] * 255), int(val[2] * 255))
@@ -460,6 +483,59 @@ class RenderingPanel(Panel):
         dirty |= self._sync_simplify_task_state(force=False)
         dirty |= self._scrub_fields.sync_all()
         return dirty
+
+    def _environment_state_snapshot(self):
+        settings = lf.get_render_settings()
+        if not settings:
+            return None
+        return (
+            str(getattr(settings, "environment_mode", "")),
+            str(getattr(settings, "environment_map_path", "")),
+        )
+
+    def _dirty_environment_bindings(self):
+        if not self._handle:
+            return
+        self._handle.dirty_all()
+
+    def _sync_environment_state(self):
+        state = self._environment_state_snapshot()
+        if state == self._last_environment_state:
+            return False
+        self._last_environment_state = state
+        self._dirty_environment_bindings()
+        return True
+
+    def _set_environment_mode(self, value):
+        settings = lf.get_render_settings()
+        if not settings:
+            return
+        settings.environment_mode = value
+        self._sync_environment_state()
+
+    def _get_environment_map_preset(self):
+        settings = lf.get_render_settings()
+        if not settings:
+            return str(DEFAULT_ENVIRONMENT_PRESET_INDEX)
+        current_path = str(getattr(settings, "environment_map_path", ""))
+        try:
+            return str(ENVIRONMENT_PRESET_PATHS.index(current_path))
+        except ValueError:
+            return str(DEFAULT_ENVIRONMENT_PRESET_INDEX)
+
+    def _set_environment_map_preset(self, value):
+        settings = lf.get_render_settings()
+        if not settings:
+            return
+        try:
+            preset_index = int(value)
+        except (TypeError, ValueError):
+            return
+        if preset_index < 0 or preset_index >= len(ENVIRONMENT_PRESET_PATHS):
+            return
+        preset_path = ENVIRONMENT_PRESET_PATHS[preset_index]
+        settings.environment_map_path = preset_path
+        self._sync_environment_state()
 
     def on_scene_changed(self, doc):
         if self._handle:

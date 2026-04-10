@@ -105,10 +105,6 @@ namespace lfs::vis {
             viewport_pos = glm::ivec2(static_cast<int>(context.viewport_region->x), gl_y);
         }
 
-        glClearColor(context.settings.background_color.r, context.settings.background_color.g,
-                     context.settings.background_color.b, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
         const bool count_frame = context.frame_dirty != 0;
         if (count_frame) {
             dependencies_.framerate_controller.beginFrame();

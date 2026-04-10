@@ -152,7 +152,8 @@ namespace lfs::vis {
                       .focused_gaussian_id = ((ctx.cursor_preview.selection_mode == SelectionPreviewMode::Rings) &&
                                               overlay_visible)
                                                  ? ctx.cursor_preview.focused_gaussian_id
-                                                 : -1}}};
+                                                 : -1}},
+            .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(ctx.settings)};
 
         applyGaussianCropBox(request.filters, ctx);
         applyGaussianEllipsoid(request.filters, ctx);
@@ -237,7 +238,8 @@ namespace lfs::vis {
             .scene =
                 {.model_transforms = &model_transforms,
                  .transform_indices = ctx.scene_state.transform_indices},
-            .filters = {}};
+            .filters = {},
+            .transparent_background = environmentBackgroundUsesTransparentViewerCompositing(ctx.settings)};
 
         applyPointCloudCropBox(request.filters, ctx);
         return request;

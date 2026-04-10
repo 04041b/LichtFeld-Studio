@@ -152,6 +152,7 @@ namespace lfs::vis {
         float near_plane = lfs::rendering::DEFAULT_NEAR_PLANE;
         float far_plane = lfs::rendering::DEFAULT_FAR_PLANE;
         bool orthographic = false;
+        bool color_has_alpha = false;
 
         [[nodiscard]] const std::shared_ptr<lfs::core::Tensor>& primaryDepth() const {
             return depth_panels[0].depth;
@@ -166,6 +167,7 @@ namespace lfs::vis {
             .near_plane = result.near_plane,
             .far_plane = result.far_plane,
             .orthographic = result.orthographic,
+            .color_has_alpha = result.color_has_alpha,
         };
         for (size_t i = 0; i < result.depth_panel_count && i < metadata.depth_panels.size(); ++i) {
             metadata.depth_panels[i] = {
@@ -178,13 +180,14 @@ namespace lfs::vis {
     }
 
     // Pass execution order (defined in RenderingManager constructor):
-    //   [pre] SplatRasterPass — GT comparison pre-render (before loop, at GT dimensions)
-    //   [0]   SplitViewPass   — Side-by-side views (blocks scene raster passes if active)
-    //   [1]   SplatRasterPass — Render splats to offscreen FBO
-    //   [2]   PointCloudPass  — Pre-training point cloud (mutually exclusive with splats)
-    //   [3]   PresentPass     — Present cached GPU frame
-    //   [4]   MeshPass        — Render meshes, composite with splats
-    //   [5]   OverlayPass     — Grid, crop boxes, frustums, pivot, axes
+    //   [pre] SplatRasterPass  — GT comparison pre-render (before loop, at GT dimensions)
+    //   [0]   EnvironmentPass  — Clear scene target and render background
+    //   [1]   SplitViewPass    — Side-by-side views (blocks scene raster passes if active)
+    //   [2]   SplatRasterPass  — Render splats to offscreen FBO
+    //   [3]   PointCloudPass   — Pre-training point cloud (mutually exclusive with splats)
+    //   [4]   PresentPass      — Present cached GPU frame over the environment
+    //   [5]   MeshPass         — Render meshes, composite with splats
+    //   [6]   OverlayPass      — Grid, crop boxes, frustums, pivot, axes
     //
     // Inter-pass coordination flags:
     //   split_view_executed — Set by SplitViewPass. Skips SplatRaster/PointCloud/Mesh.

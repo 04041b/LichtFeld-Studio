@@ -73,6 +73,11 @@ namespace lfs::vis {
         bool hide_outside_depth_box = false;
         bool crop_filter_for_selection = false;
         std::array<float, 3> background_color{0.0f, 0.0f, 0.0f};
+        int environment_mode = 0;
+        std::string environment_map_path{
+            std::string(kDefaultEnvironmentMapPath)};
+        float environment_exposure = 0.0f;
+        float environment_rotation_degrees = 0.0f;
         bool show_coord_axes = false;
         float axes_size = 2.0f;
         std::array<bool, 3> axes_visibility = {true, true, true};

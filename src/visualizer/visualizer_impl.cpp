@@ -632,6 +632,7 @@ namespace lfs::vis {
                 auto s = rendering_manager_->getSettings();
                 vis::apply_proxy(s, proxy);
                 rendering_manager_->updateSettings(s);
+                wakeMainLoop();
             });
         callback_cleanup_.add([] { vis::set_render_settings_callbacks(nullptr, nullptr); });
     }

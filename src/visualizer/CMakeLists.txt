@@ -43,6 +43,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         rendering/viewport_appearance_correction.cpp
         rendering/viewport_request_builder.cpp
         rendering/framerate_controller.cpp
+        rendering/passes/environment_pass.cpp
         rendering/passes/overlay_pass.cpp
         rendering/passes/splat_raster_pass.cpp
         rendering/passes/mesh_pass.cpp
@@ -347,6 +348,16 @@ file(GLOB SEQUENCER_ICON_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gu
 foreach (ICON_FILE ${SEQUENCER_ICON_FILES})
     get_filename_component(ICON_NAME ${ICON_FILE} NAME)
     configure_file(${ICON_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/icon/sequencer/${ICON_NAME}" COPYONLY)
+endforeach ()
+
+# Copy bundled environment maps
+file(MAKE_DIRECTORY "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/environments")
+file(GLOB ENVIRONMENT_ASSET_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gui/assets/environments/*")
+foreach (ENVIRONMENT_ASSET_FILE ${ENVIRONMENT_ASSET_FILES})
+    if (EXISTS ${ENVIRONMENT_ASSET_FILE} AND NOT IS_DIRECTORY ${ENVIRONMENT_ASSET_FILE})
+        get_filename_component(ENVIRONMENT_ASSET_NAME ${ENVIRONMENT_ASSET_FILE} NAME)
+        configure_file(${ENVIRONMENT_ASSET_FILE} "${VISUALIZER_BUILD_RESOURCE_DIR}/assets/environments/${ENVIRONMENT_ASSET_NAME}" COPYONLY)
+    endif ()
 endforeach ()
 
 # Copy RmlUI resources (re-copy on every build so edits are picked up)

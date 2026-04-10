@@ -25,9 +25,6 @@ namespace lfs::vis {
             return;
 
         glViewport(ctx.viewport_pos.x, ctx.viewport_pos.y, ctx.render_size.x, ctx.render_size.y);
-        glClearColor(ctx.settings.background_color.r, ctx.settings.background_color.g,
-                     ctx.settings.background_color.b, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         auto present_result = engine.presentGpuFrame(*res.cached_gpu_frame,
                                                      ctx.viewport_pos,

@@ -29,6 +29,39 @@
       </div>
     </div>
     <div class="setting-row setting-row--aligned">
+      <span class="setting-row__label-col">{{label_environment_mode}}</span>
+      <div class="setting-row__control-col setting-row__control-col--fill">
+        <select data-value="environment_mode">
+          <option value="SOLID_COLOR">Solid Color</option>
+          <option value="EQUIRECTANGULAR">Equirectangular HDRI</option>
+        </select>
+      </div>
+    </div>
+      <div class="setting-row setting-row--aligned">
+        <span class="setting-row__label-col">{{label_environment_map_path}}</span>
+        <div class="setting-row__control-col setting-row__control-col--fill">
+          <select data-value="environment_map_preset">
+            <option value="0">Kloofendal Pure Sky</option>
+            <option value="1">Alps Field</option>
+            <option value="2">Studio Small 03</option>
+          </select>
+        </div>
+      </div>
+      <div class="setting-row setting-row--aligned">
+        <span class="setting-row__label-col">{{label_environment_exposure}}</span>
+        <div class="setting-row__control-col setting-row__control-col--slider">
+          <input type="range" class="setting-slider" data-value="environment_exposure" min="-6" max="6" step="0.01" />
+          <span class="slider-value">{{environment_exposure | format_float(2)}}</span>
+        </div>
+      </div>
+      <div class="setting-row setting-row--aligned">
+        <span class="setting-row__label-col">{{label_environment_rotation_degrees}}</span>
+        <div class="setting-row__control-col setting-row__control-col--slider">
+          <input type="range" class="setting-slider" data-value="environment_rotation_degrees" min="-180" max="180" step="0.1" />
+          <span class="slider-value">{{environment_rotation_degrees | format_float(1)}}&deg;</span>
+        </div>
+      </div>
+    <div class="setting-row setting-row--aligned">
       <span class="setting-row__label-col">{{label_voxel_size}}</span>
       <div class="setting-row__control-col setting-row__control-col--slider">
         <input type="range" class="setting-slider" data-value="voxel_size" min="0.001" max="0.1" step="0.001" />

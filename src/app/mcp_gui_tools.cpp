@@ -717,6 +717,10 @@ namespace lfs::app {
                                                {"crf_shoulder", settings.ppisp.crf_shoulder},
                                            }},
                                  {"background_color", json::array({settings.background_color[0], settings.background_color[1], settings.background_color[2]})},
+                                 {"environment_mode", settings.environment_mode},
+                                 {"environment_map_path", settings.environment_map_path},
+                                 {"environment_exposure", settings.environment_exposure},
+                                 {"environment_rotation_degrees", settings.environment_rotation_degrees},
                                  {"show_coord_axes", settings.show_coord_axes},
                                  {"axes_size", settings.axes_size},
                                  {"axes_visibility", json::array({settings.axes_visibility[0], settings.axes_visibility[1], settings.axes_visibility[2]})},
@@ -784,6 +788,13 @@ namespace lfs::app {
                 }
             };
 
+            const auto set_string = [&args, &touched](const char* key, std::string& field) {
+                if (args.contains(key)) {
+                    field = args[key].get<std::string>();
+                    touched = true;
+                }
+            };
+
             const auto set_vec3 = [&args, &touched](const char* key,
                                                     std::array<float, 3>& field) -> std::expected<void, std::string> {
                 if (!args.contains(key))
@@ -826,6 +837,10 @@ namespace lfs::app {
             set_bool("crop_filter_for_selection", settings.crop_filter_for_selection);
             set_bool("apply_appearance_correction", settings.apply_appearance_correction);
             set_int("ppisp_mode", settings.ppisp_mode);
+            set_int("environment_mode", settings.environment_mode);
+            set_string("environment_map_path", settings.environment_map_path);
+            set_float("environment_exposure", settings.environment_exposure);
+            set_float("environment_rotation_degrees", settings.environment_rotation_degrees);
             set_bool("show_coord_axes", settings.show_coord_axes);
             set_float("axes_size", settings.axes_size);
             set_bool("show_grid", settings.show_grid);
@@ -2233,6 +2248,10 @@ namespace lfs::app {
                         {"focal_length_mm", json{{"type", "number"}}},
                         {"render_scale", json{{"type", "number"}}},
                         {"background_color", json{{"type", "array"}, {"items", json{{"type", "number"}}}}},
+                        {"environment_mode", json{{"type", "integer"}}},
+                        {"environment_map_path", json{{"type", "string"}}},
+                        {"environment_exposure", json{{"type", "number"}}},
+                        {"environment_rotation_degrees", json{{"type", "number"}}},
                         {"antialiasing", json{{"type", "boolean"}}},
                         {"show_grid", json{{"type", "boolean"}}},
                         {"show_camera_frustums", json{{"type", "boolean"}}},

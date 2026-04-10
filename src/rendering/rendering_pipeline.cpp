@@ -24,7 +24,8 @@ namespace lfs::rendering {
                                                        const glm::ivec2 alloc_size,
                                                        const glm::ivec2 render_size,
                                                        const float far_plane,
-                                                       const bool orthographic) {
+                                                       const bool orthographic,
+                                                       const bool color_has_alpha) {
             return {
                 .color = {.id = color_texture,
                           .size = alloc_size,
@@ -34,6 +35,7 @@ namespace lfs::rendering {
                 .depth = {.id = depth_texture, .size = alloc_size, .texcoord_scale = {alloc_size.x > 0 ? static_cast<float>(render_size.x) / static_cast<float>(alloc_size.x) : 1.0f, alloc_size.y > 0 ? static_cast<float>(render_size.y) / static_cast<float>(alloc_size.y) : 1.0f}},
                 .flip_y = false,
                 .depth_is_ndc = true,
+                .color_has_alpha = color_has_alpha,
                 .near_plane = DEFAULT_NEAR_PLANE,
                 .far_plane = far_plane,
                 .orthographic = orthographic};
@@ -263,6 +265,7 @@ namespace lfs::rendering {
                 .orthographic = requests[0].orthographic,
                 .ortho_scale = requests[0].ortho_scale,
                 .mip_filter = requests[0].mip_filter,
+                .transparent_background = requests[0].transparent_background,
                 .view_states =
                     std::array<DualRasterizeTensorViewState, 2>{
                         DualRasterizeTensorViewState{
@@ -293,7 +296,8 @@ namespace lfs::rendering {
                     .depth = std::move(render_output.depths[i]),
                     .valid = true,
                     .far_plane = requests[i].far_plane,
-                    .orthographic = requests[i].orthographic};
+                    .orthographic = requests[i].orthographic,
+                    .color_has_alpha = requests[i].transparent_background};
             }
 
             return result;
@@ -459,13 +463,15 @@ namespace lfs::rendering {
                                               : GutCameraModel::PINHOLE;
                 auto render_output = gut_rasterize_tensor(
                     cam, model, background_, effective_sh_degree, request.scaling_modifier, camera_model,
-                    model_transforms_tensor.get(), transform_indices_ptr, request.node_visibility_mask);
+                    model_transforms_tensor.get(), transform_indices_ptr, request.node_visibility_mask,
+                    request.transparent_background);
                 return ImageRenderResult{
                     .image = std::move(render_output.image),
                     .depth = std::move(render_output.depth),
                     .valid = true,
                     .far_plane = request.far_plane,
-                    .orthographic = request.orthographic};
+                    .orthographic = request.orthographic,
+                    .color_has_alpha = request.transparent_background};
             }
 
             // Use libtorch-free tensor-based rasterizer
@@ -495,12 +501,14 @@ namespace lfs::rendering {
                                                    request.emphasis_flash_intensity,
                                                    request.orthographic,
                                                    request.ortho_scale,
-                                                   request.mip_filter);
+                                                   request.mip_filter,
+                                                   request.transparent_background);
             result.image = std::move(image);
             result.depth = std::move(depth);
             result.valid = true;
             result.orthographic = request.orthographic;
             result.far_plane = request.far_plane;
+            result.color_has_alpha = request.transparent_background;
 
             LOG_TRACE("Rasterization completed successfully");
             return result;
@@ -538,7 +546,8 @@ namespace lfs::rendering {
             if (auto result = point_cloud_renderer_->render(model, view, projection,
                                                             request.voxel_size, request.background_color,
                                                             request.model_transforms, request.transform_indices,
-                                                            request.equirectangular, request.point_cloud_crop_params);
+                                                            request.equirectangular, request.point_cloud_crop_params,
+                                                            request.transparent_background);
                 !result) {
                 LOG_ERROR("Point cloud rendering failed: {}", result.error());
                 return std::unexpected(std::format("Point cloud rendering failed: {}", result.error()));
@@ -581,7 +590,8 @@ namespace lfs::rendering {
             if (auto result = point_cloud_renderer_->render(model, view, projection,
                                                             request.voxel_size, request.background_color,
                                                             request.model_transforms, request.transform_indices,
-                                                            request.equirectangular, request.point_cloud_crop_params);
+                                                            request.equirectangular, request.point_cloud_crop_params,
+                                                            request.transparent_background);
                 !result) {
                 LOG_ERROR("Point cloud GPU-frame render failed: {}", result.error());
                 return std::unexpected(std::format("Point cloud GPU-frame render failed: {}", result.error()));
@@ -594,7 +604,8 @@ namespace lfs::rendering {
             {persistent_fbo_width_, persistent_fbo_height_},
             request.viewport_size,
             request.far_plane,
-            request.orthographic);
+            request.orthographic,
+            request.transparent_background);
     }
 
     Result<GpuFrame> RenderingPipeline::renderRawPointCloudGpuFrame(
@@ -623,7 +634,8 @@ namespace lfs::rendering {
             LOG_TIMER_TRACE("point_cloud_renderer_->render(PointCloud)");
             if (auto result = point_cloud_renderer_->render(point_cloud, view, projection,
                                                             request.voxel_size, request.background_color,
-                                                            {}, nullptr, request.equirectangular, request.point_cloud_crop_params);
+                                                            {}, nullptr, request.equirectangular, request.point_cloud_crop_params,
+                                                            request.transparent_background);
                 !result) {
                 LOG_ERROR("Raw point cloud rendering failed: {}", result.error());
                 return std::unexpected(std::format("Raw point cloud rendering failed: {}", result.error()));
@@ -636,7 +648,8 @@ namespace lfs::rendering {
             {persistent_fbo_width_, persistent_fbo_height_},
             request.viewport_size,
             request.far_plane,
-            request.orthographic);
+            request.orthographic,
+            request.transparent_background);
     }
 
     Result<void> RenderingPipeline::ensurePointCloudRendererInitialized() {
@@ -700,6 +713,7 @@ namespace lfs::rendering {
                 if (auto read_result = fbo_interop_texture_->readToTensor(image_hwc, width, height); read_result) {
                     result.image = image_hwc.permute({2, 0, 1}).contiguous();
                     result.valid = true;
+                    result.color_has_alpha = request.transparent_background;
                     result.external_depth_texture = persistent_render_target_->depthTexture();
                     result.depth_texcoord_scale = {
                         persistent_fbo_width_ > 0 ? static_cast<float>(width) / static_cast<float>(persistent_fbo_width_) : 1.0f,
@@ -722,15 +736,16 @@ namespace lfs::rendering {
 
             const int current_pbo = pbo_index_;
             const int next_pbo = 1 - pbo_index_;
+            const int channels = request.transparent_background ? 4 : 3;
 
-            std::vector<float> pixels(width * height * 3);
+            std::vector<float> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(channels));
             {
                 glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_[current_pbo]);
-                glReadPixels(0, 0, width, height, GL_RGB, GL_FLOAT, nullptr);
+                glReadPixels(0, 0, width, height, channels == 4 ? GL_RGBA : GL_RGB, GL_FLOAT, nullptr);
 
                 void* mapped_data = glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
                 if (mapped_data) {
-                    std::memcpy(pixels.data(), mapped_data, width * height * 3 * sizeof(float));
+                    std::memcpy(pixels.data(), mapped_data, pixels.size() * sizeof(float));
                     glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
                 } else {
                     LOG_ERROR("Failed to map PBO for readback");
@@ -743,7 +758,9 @@ namespace lfs::rendering {
 
             pbo_index_ = next_pbo;
 
-            const auto image_cpu = Tensor::from_vector(pixels, {static_cast<size_t>(height), static_cast<size_t>(width), 3},
+            const auto image_cpu = Tensor::from_vector(
+                pixels,
+                {static_cast<size_t>(height), static_cast<size_t>(width), static_cast<size_t>(channels)},
                                                        lfs::core::Device::CPU);
             {
                 LOG_TIMER_TRACE("permute and cuda upload");
@@ -755,6 +772,7 @@ namespace lfs::rendering {
                 persistent_fbo_height_ > 0 ? static_cast<float>(height) / static_cast<float>(persistent_fbo_height_) : 1.0f};
             result.depth_is_ndc = true;
             result.valid = true;
+            result.color_has_alpha = request.transparent_background;
         }
 
         result.orthographic = request.orthographic;
@@ -848,8 +866,10 @@ namespace lfs::rendering {
         Tensor image_hwc = (cpu_layout == ImageLayout::HWC)
                                ? result.image
                                : result.image.permute({1, 2, 0}).contiguous();
-        if (image_hwc.size(2) == 4) {
-            image_hwc = image_hwc.slice(2, 0, 3).contiguous();
+        const size_t channels = image_hwc.size(2);
+        if (channels != 3 && channels != 4) {
+            LOG_ERROR("CPU upload requires 3 or 4 channels, got {}", channels);
+            return std::unexpected("CPU upload requires 3 or 4 channels");
         }
         if (image_hwc.dtype() != lfs::core::DataType::UInt8) {
             image_hwc = (image_hwc.clamp(0.0f, 1.0f) * 255.0f).to(lfs::core::DataType::UInt8);
@@ -865,7 +885,8 @@ namespace lfs::rendering {
         }
 
         if (auto upload_result = renderer.uploadData(image.ptr<unsigned char>(),
-                                                     viewport_size.x, viewport_size.y);
+                                                     viewport_size.x, viewport_size.y,
+                                                     static_cast<int>(channels));
             !upload_result) {
             return upload_result;
         }
@@ -1012,7 +1033,7 @@ namespace lfs::rendering {
             cleanupPBO();
         }
 
-        const size_t buffer_size = static_cast<size_t>(alloc_width) * alloc_height * 3 * sizeof(float);
+        const size_t buffer_size = static_cast<size_t>(alloc_width) * alloc_height * 4 * sizeof(float);
 
         glGenBuffers(2, pbo_);
         for (int i = 0; i < 2; i++) {

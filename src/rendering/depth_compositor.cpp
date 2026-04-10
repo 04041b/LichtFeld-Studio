@@ -99,6 +99,8 @@ namespace lfs::rendering {
 
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_ALWAYS);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
         glBindVertexArray(vao_.get());
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -126,6 +128,8 @@ namespace lfs::rendering {
 
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_ALWAYS);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
         glBindVertexArray(vao_.get());
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
