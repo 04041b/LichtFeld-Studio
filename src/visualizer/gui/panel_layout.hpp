@@ -117,7 +117,7 @@ namespace lfs::vis::gui {
         float computeBottomDockWidth(bool show_main_panel, bool ui_hidden,
                                      const ScreenState& screen) const;
         float computeBottomDockReservedHeight(bool show_main_panel, bool ui_hidden,
-                                             const ScreenState& screen) const;
+                                              const ScreenState& screen) const;
 
         float right_panel_width_ = 340.0f;
         float scene_panel_ratio_ = 0.4f;
