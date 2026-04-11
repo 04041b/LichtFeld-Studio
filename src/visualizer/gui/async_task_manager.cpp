@@ -13,8 +13,8 @@
 #include "gui/panel_registry.hpp"
 #include "gui/utils/native_file_dialog.hpp"
 #include "gui/video_export_utils.hpp"
-#include "io/exporter.hpp"
 #include "internal/resource_paths.hpp"
+#include "io/exporter.hpp"
 #include "rendering/environment_renderer.hpp"
 #include "rendering/framebuffer.hpp"
 #include "rendering/image_layout.hpp"
@@ -1358,8 +1358,8 @@ namespace lfs::vis::gui {
                     }
                     if (!err.empty()) {
                         lfs::core::events::state::VideoExportFailed{
-                        .error = std::move(err)}
-                        .emit();
+                            .error = std::move(err)}
+                            .emit();
                     }
                 }
                 cleanup_environment_state();
