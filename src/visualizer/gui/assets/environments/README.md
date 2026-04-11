@@ -14,8 +14,6 @@ Included files
   Source: https://polyhaven.com/a/kloofendal_48d_partly_cloudy_puresky
 - `alps_field_1k.hdr`
   Source: https://polyhaven.com/a/alps_field
-- `studio_small_03_1k.hdr`
-  Source: https://polyhaven.com/a/studio_small_03
 
 Notes
 - Original downloads are 1K `.hdr` equirectangular panoramas from Poly Haven.

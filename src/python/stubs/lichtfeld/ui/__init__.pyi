@@ -1877,6 +1877,11 @@ def open_image_dialog(start_dir: str = '') -> str:
     Open a file dialog to select an image file. Returns empty string if cancelled.
     """
 
+def open_environment_map_dialog(start_dir: str = '') -> str:
+    """
+    Open a file dialog to select an environment map (.hdr, .exr). Returns empty string if cancelled.
+    """
+
 def open_folder_dialog(title: str = 'Select Folder', start_dir: str = '') -> str:
     """
     Open a folder selection dialog. Returns empty string if cancelled. title is accepted for compatibility and currently ignored.

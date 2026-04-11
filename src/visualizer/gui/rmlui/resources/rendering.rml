@@ -39,12 +39,16 @@
     </div>
       <div class="setting-row setting-row--aligned">
         <span class="setting-row__label-col">{{label_environment_map_path}}</span>
-        <div class="setting-row__control-col setting-row__control-col--fill">
-          <select data-value="environment_map_preset">
-            <option value="0">Kloofendal Pure Sky</option>
-            <option value="1">Alps Field</option>
-            <option value="2">Studio Small 03</option>
-          </select>
+        <div class="setting-row__control-col setting-row__control-col--fill rendering-environment-map-shell">
+          <div class="rendering-environment-map-picker">
+            <select id="environment-map-preset" data-value="environment_map_preset">
+              <option value="0">Kloofendal Pure Sky</option>
+              <option value="1">Alps Field</option>
+              <option value="__custom__" data-if="environment_map_has_custom_option">{{environment_map_last_custom_display_name}}</option>
+            </select>
+            <button class="btn btn--secondary" data-event-click="browse_environment_map()">{{label_environment_map_browse}}</button>
+          </div>
+          <span class="text-muted rendering-environment-map-path" data-if="environment_map_is_custom">{{environment_map_display_name}}</span>
         </div>
       </div>
       <div class="setting-row setting-row--aligned">

@@ -35,6 +35,17 @@ class _BindingContextStub:
         return self._model
 
 
+class _HandleStub:
+    def __init__(self):
+        self.dirty_fields = []
+
+    def dirty(self, name):
+        self.dirty_fields.append(name)
+
+    def dirty_all(self):
+        self.dirty_fields.append("__all__")
+
+
 def _install_lf_stub(monkeypatch):
     panel_space = SimpleNamespace(
         SIDE_PANEL="SIDE_PANEL",
@@ -151,6 +162,37 @@ def test_rendering_panel_binds_theme_vignette_controls(rendering_panel_module):
     assert set_calls["intensity"] == [0.4]
 
 
+def test_rendering_panel_custom_environment_map_appears_in_dropdown(rendering_panel_module):
+    module = rendering_panel_module
+    settings = SimpleNamespace(
+        environment_mode="EQUIRECTANGULAR",
+        environment_map_path="/tmp/custom_hdri_name.hdr",
+        prop_info=lambda prop_id: {"name": prop_id},
+    )
+    module.lf.get_render_settings = lambda: settings
+
+    panel = module.RenderingPanel()
+    panel._handle = _HandleStub()
+
+    assert panel._sync_environment_state() is True
+    assert panel._handle.dirty_fields == ["__all__"]
+    assert panel._get_environment_map_preset() == module.CUSTOM_ENVIRONMENT_PRESET_VALUE
+    assert panel._environment_map_is_custom() is True
+    assert panel._environment_map_display_name() == "custom_hdri_name.hdr"
+    assert panel._environment_map_has_custom_option() is True
+    assert panel._environment_map_last_custom_display_name() == "custom_hdri_name.hdr"
+    panel._set_environment_map_preset(module.CUSTOM_ENVIRONMENT_PRESET_VALUE)
+    assert settings.environment_map_path == "/tmp/custom_hdri_name.hdr"
+    settings.environment_map_path = module.ENVIRONMENT_PRESET_PATHS[1]
+    assert panel._sync_environment_state() is True
+    assert panel._get_environment_map_preset() == "1"
+    assert panel._environment_map_is_custom() is False
+    assert panel._environment_map_has_custom_option() is True
+    assert panel._environment_map_last_custom_display_name() == "custom_hdri_name.hdr"
+    panel._set_environment_map_preset(module.CUSTOM_ENVIRONMENT_PRESET_VALUE)
+    assert settings.environment_map_path == "/tmp/custom_hdri_name.hdr"
+
+
 def test_rendering_rml_exposes_simplify_tooltips_and_locale_labels():
     project_root = Path(__file__).parent.parent.parent
     rendering_rml = project_root / "src" / "visualizer" / "gui" / "rmlui" / "resources" / "rendering.rml"
@@ -164,6 +206,8 @@ def test_rendering_rml_exposes_simplify_tooltips_and_locale_labels():
     assert 'data-tooltip="tooltip.simplify_output"' in content
     assert 'data-tooltip="tooltip.simplify_apply"' in content
     assert 'data-tooltip="tooltip.simplify_cancel"' in content
+    assert 'option value="__custom__" data-if="environment_map_has_custom_option"' in content
+    assert "{{environment_map_last_custom_display_name}}" in content
     assert "{{label_simplify_source}}" in content
     assert "{{label_simplify_select_source}}" in content
     assert "{{label_simplify_target}}" in content
