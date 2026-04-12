@@ -84,7 +84,7 @@
 }
 
 #image-container.picker-active {
-    cursor: pointer;
+    cursor: pipette;
 }
 
 #image-viewport {

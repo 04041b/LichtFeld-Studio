@@ -22,6 +22,7 @@ namespace lfs::vis::gui {
         Arrow,
         TextInput,
         Hand,
+        Pipette,
         ResizeEW,
         ResizeNS,
         ResizeNWSE,

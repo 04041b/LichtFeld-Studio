@@ -158,6 +158,8 @@ namespace lfs::vis::gui {
             return RmlCursorRequest::TextInput;
         if (cursor_name == "pointer")
             return RmlCursorRequest::Hand;
+        if (cursor_name == "pipette")
+            return RmlCursorRequest::Pipette;
         if (cursor_name == "resize-horizontal" || cursor_name == "e-resize" ||
             cursor_name == "w-resize" || cursor_name == "ew-resize")
             return RmlCursorRequest::ResizeEW;
