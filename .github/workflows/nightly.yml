@@ -7,7 +7,7 @@ name: Nightly Build
 on:
   schedule:
     - cron: '0 1 * * *'  # 2 AM CET (1 AM UTC)
-  workflow_dispatch:      # Manual trigger
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -15,6 +15,7 @@ jobs:
     runs-on: windows-2022
     outputs:
       artifact_name: ${{ steps.package.outputs.artifact_name }}
+      nightly_version: ${{ steps.package.outputs.nightly_version }}
       package_name: ${{ steps.package.outputs.package_name }}
       short_sha: ${{ steps.package.outputs.short_sha }}
       full_sha: ${{ steps.package.outputs.full_sha }}
@@ -165,14 +166,31 @@ jobs:
         shell: pwsh
         run: |
           $date = Get-Date -AsUTC -Format "yyyy-MM-dd"
+          $dateStamp = Get-Date -AsUTC -Format "yyyyMMdd"
           $builtAt = Get-Date -AsUTC -Format "yyyy-MM-ddTHH:mm:ssZ"
           $shortSha = (git rev-parse --short HEAD).Trim()
           $fullSha = (git rev-parse HEAD).Trim()
-          $packageName = "LichtFeld-Studio-windows-nightly-$date-$shortSha.zip"
-          $artifactName = "windows-portable-$date-$shortSha"
+          $targetVersionFile = ".github/nightly-target-version.txt"
+          if (-not (Test-Path $targetVersionFile)) {
+            throw "Missing $targetVersionFile."
+          }
+          $nightlyTargetVersion = Get-Content $targetVersionFile |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and -not $_.StartsWith("#") } |
+            Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($nightlyTargetVersion) -or $nightlyTargetVersion -eq "SET_ME") {
+            throw "Set the target version in $targetVersionFile, for example 0.6 or 0.5.2."
+          }
+          if ($nightlyTargetVersion -notmatch '^[0-9]+(\.[0-9]+){1,2}$') {
+            throw "Invalid nightly target version '$nightlyTargetVersion' in $targetVersionFile."
+          }
+          $nightlyVersion = "$nightlyTargetVersion.dev$dateStamp+$shortSha"
+          $packageName = "LichtFeld-Studio-windows-v$nightlyVersion.zip"
+          $artifactName = "windows-portable-v$($nightlyVersion -replace '\+', '-')"
           cmake --install build --prefix dist
           Compress-Archive -Path dist\* -DestinationPath $packageName
           "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+          "nightly_version=$nightlyVersion" >> $env:GITHUB_OUTPUT
           "package_name=$packageName" >> $env:GITHUB_OUTPUT
           "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
           "full_sha=$fullSha" >> $env:GITHUB_OUTPUT
@@ -209,6 +227,7 @@ jobs:
           body: |
             Automated nightly build from `${{ needs.build-windows.outputs.full_sha }}`
 
+            **Nightly version:** `v${{ needs.build-windows.outputs.nightly_version }}`
             **Built:** ${{ needs.build-windows.outputs.built_at }}
             **Branch:** ${{ github.event.repository.default_branch }}
             **Assets retained:** latest 7 builds
@@ -225,7 +244,7 @@ jobs:
           mapfile -t old_assets < <(
             printf '%s' "$release_json" | jq -r '
               [.assets[]
-               | select(.name | test("^LichtFeld-Studio-windows-nightly-.*\\.zip$"))
+               | select(.name | test("^LichtFeld-Studio-windows-v[0-9]+\\.[0-9]+\\.dev[0-9]{8}\\+[0-9a-f]+\\.zip$"))
                | {id, name, created_at}]
               | sort_by(.created_at)
               | reverse
@@ -301,6 +320,7 @@ jobs:
       - name: Publish summary
         env:
           FILE_NAME: ${{ needs.build-windows.outputs.package_name }}
+          NIGHTLY_VERSION: ${{ needs.build-windows.outputs.nightly_version }}
           FULL_SHA: ${{ needs.build-windows.outputs.full_sha }}
           BUILT_AT: ${{ needs.build-windows.outputs.built_at }}
           R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
@@ -310,9 +330,10 @@ jobs:
             echo "### Nightly R2 Upload"
             echo
             echo "- Uploaded \`${FILE_NAME}\` to Cloudflare R2."
+            echo "- Nightly version: \`v${NIGHTLY_VERSION}\`"
             echo "- Commit: \`${FULL_SHA}\`"
             echo "- Built at: \`${BUILT_AT}\`"
-            echo "- Stable object key: \`windows/nightly/latest.zip\`"
+            echo "- Latest object key: \`windows/nightly/latest.zip\`"
             echo "- Versioned object key: \`windows/nightly/${FILE_NAME}\`"
             if [ -n "${R2_PUBLIC_BASE_URL:-}" ]; then
               base_url="${R2_PUBLIC_BASE_URL%/}"
