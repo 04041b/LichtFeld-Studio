@@ -1379,17 +1379,18 @@ namespace lfs::vis {
             return;
         }
 
-        std::string html = std::format(
-            "<span class=\"timeline-tooltip-line title\">Time {}</span>",
-            formatTime(hover->exact_time));
+        std::string html = "<span class=\"timeline-tooltip-line title\">Time ";
+        html += formatTime(hover->exact_time);
+        html += "</span>";
         if (hover->over_thumbnail) {
-            html += std::format(
-                "<span class=\"timeline-tooltip-line\">Sample {}</span>",
-                formatTime(hover->sample_time));
-            html += std::format(
-                "<span class=\"timeline-tooltip-line\">Covers {} - {}</span>",
-                formatTime(hover->interval_start_time),
-                formatTime(hover->interval_end_time));
+            html += "<span class=\"timeline-tooltip-line\">Sample ";
+            html += formatTime(hover->sample_time);
+            html += "</span>";
+            html += "<span class=\"timeline-tooltip-line\">Covers ";
+            html += formatTime(hover->interval_start_time);
+            html += " - ";
+            html += formatTime(hover->interval_end_time);
+            html += "</span>";
         }
 
         const float dp = cached_dp_ratio_;
@@ -1408,8 +1409,12 @@ namespace lfs::vis {
         top = std::clamp(top, 8.0f * dp, std::max(8.0f * dp, cached_total_height_ - approx_height - 8.0f * dp));
 
         el_timeline_tooltip_->SetInnerRML(html);
-        el_timeline_tooltip_->SetProperty("left", std::format("{:.1f}px", left));
-        el_timeline_tooltip_->SetProperty("top", std::format("{:.1f}px", top));
+        char left_buffer[32];
+        char top_buffer[32];
+        std::snprintf(left_buffer, sizeof(left_buffer), "%.1fpx", left);
+        std::snprintf(top_buffer, sizeof(top_buffer), "%.1fpx", top);
+        el_timeline_tooltip_->SetProperty("left", left_buffer);
+        el_timeline_tooltip_->SetProperty("top", top_buffer);
         el_timeline_tooltip_->SetProperty("display", "block");
     }
 
