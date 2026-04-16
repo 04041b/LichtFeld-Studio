@@ -183,14 +183,6 @@ set_source_files_properties(
         PROPERTIES COMPILE_DEFINITIONS "RMLUI_GL3_CUSTOM_LOADER=<glad/glad.h>"
 )
 
-if(MSVC)
-    # MSVC 14.44 on Windows Debug ICEs on this TU under /std:c++latest.
-    set_source_files_properties(
-            ${CMAKE_CURRENT_SOURCE_DIR}/sequencer/rml_sequencer_panel.cpp
-            PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Debug>:/std:c++20;/bigobj>"
-    )
-endif()
-
 # Set include directories
 target_include_directories(lfs_visualizer
         PUBLIC
