@@ -86,7 +86,28 @@ namespace lfs::vis {
             return std::format("{}s", secs);
         }
 
-        [[nodiscard]] uint64_t selectedKeyframeSignature(const std::set<sequencer::KeyframeId>& selected_keyframes) {
+        [[nodiscard]] bool hasSelectedKeyframe(const std::vector<sequencer::KeyframeId>& selected_keyframes,
+                                               const sequencer::KeyframeId id) {
+            return std::find(selected_keyframes.begin(), selected_keyframes.end(), id) !=
+                   selected_keyframes.end();
+        }
+
+        void addSelectedKeyframe(std::vector<sequencer::KeyframeId>& selected_keyframes,
+                                 const sequencer::KeyframeId id) {
+            if (!hasSelectedKeyframe(selected_keyframes, id))
+                selected_keyframes.push_back(id);
+        }
+
+        void removeSelectedKeyframe(std::vector<sequencer::KeyframeId>& selected_keyframes,
+                                    const sequencer::KeyframeId id) {
+            if (const auto it = std::find(selected_keyframes.begin(), selected_keyframes.end(), id);
+                it != selected_keyframes.end()) {
+                selected_keyframes.erase(it);
+            }
+        }
+
+        [[nodiscard]] uint64_t selectedKeyframeSignature(std::vector<sequencer::KeyframeId> selected_keyframes) {
+            std::sort(selected_keyframes.begin(), selected_keyframes.end());
             uint64_t signature = 1469598103934665603ull;
             for (const auto id : selected_keyframes) {
                 signature ^= id;
@@ -718,12 +739,9 @@ namespace lfs::vis {
         const auto& keyframes = timeline.keyframes();
         const size_t count = keyframes.size();
 
-        for (auto it = selected_keyframes_.begin(); it != selected_keyframes_.end();) {
-            if (!timeline.findKeyframeIndex(*it).has_value())
-                it = selected_keyframes_.erase(it);
-            else
-                ++it;
-        }
+        std::erase_if(selected_keyframes_, [&timeline](const sequencer::KeyframeId id) {
+            return !timeline.findKeyframeIndex(id).has_value();
+        });
 
         const float timeline_width = timelineWidth();
         const uint64_t timeline_revision = controller_.timelineRevision();
@@ -781,7 +799,7 @@ namespace lfs::vis {
             auto* el = keyframe_elements_[i];
             const float x = timeToX(keyframes[i].time, 0.0f, timeline_width);
             const bool selected = controller_.selectedKeyframe() == i ||
-                                  selected_keyframes_.contains(keyframes[i].id);
+                                  hasSelectedKeyframe(selected_keyframes_, keyframes[i].id);
             const bool is_loop = keyframes[i].is_loop_point;
 
             const auto base = is_loop ? p.info : (i % 2 == 0 ? p.primary : p.secondary);
@@ -1802,14 +1820,14 @@ namespace lfs::vis {
                         selected_keyframes_.clear();
                         for (size_t j = lo; j <= hi; ++j) {
                             if (!keyframes[j].is_loop_point)
-                                selected_keyframes_.insert(keyframes[j].id);
+                                addSelectedKeyframe(selected_keyframes_, keyframes[j].id);
                         }
                     } else if (input.key_ctrl) {
                         const auto id = keyframes[i].id;
-                        if (selected_keyframes_.contains(id))
-                            selected_keyframes_.erase(id);
+                        if (hasSelectedKeyframe(selected_keyframes_, id))
+                            removeSelectedKeyframe(selected_keyframes_, id);
                         else
-                            selected_keyframes_.insert(id);
+                            addSelectedKeyframe(selected_keyframes_, id);
                     } else {
                         selected_keyframes_.clear();
                         lfs::core::events::cmd::SequencerSelectKeyframe{.keyframe_index = i}.emit();
@@ -1890,7 +1908,7 @@ namespace lfs::vis {
             for (const auto id : to_delete)
                 removed_any |= controller_.removeKeyframeById(id);
             for (const auto id : to_delete)
-                selected_keyframes_.erase(id);
+                removeSelectedKeyframe(selected_keyframes_, id);
             if (removed_any)
                 lfs::core::events::state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
         }

@@ -339,7 +339,7 @@ namespace lfs::vis {
         sequencer::KeyframeId dragged_keyframe_id_ = sequencer::INVALID_KEYFRAME_ID;
         float drag_start_mouse_x_ = 0.0f;
         std::optional<size_t> hovered_keyframe_;
-        std::set<sequencer::KeyframeId> selected_keyframes_;
+        std::vector<sequencer::KeyframeId> selected_keyframes_;
 
         float zoom_level_ = 1.0f;
         float pan_offset_ = 0.0f;
