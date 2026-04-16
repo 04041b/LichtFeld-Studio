@@ -759,81 +759,81 @@ namespace lfs::vis::gui {
 
                 try {
 
-                switch (format) {
-                case ExportFormat::PLY: {
-                    update_progress(0.1f, "Writing PLY");
-                    const lfs::io::PlySaveOptions options{
-                        .output_path = path,
-                        .binary = true,
-                        .async = false,
-                        .extra_attributes = {}};
-                    if (auto result = lfs::io::save_ply(*splat_data, options); result) {
-                        success = true;
-                        update_progress(1.0f, "Complete");
-                    } else {
-                        error_msg = result.error().message;
-                        if (result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
-                            lfs::core::events::state::DiskSpaceSaveFailed{
-                                .iteration = 0,
-                                .path = path,
-                                .error = result.error().message,
-                                .required_bytes = result.error().required_bytes,
-                                .available_bytes = result.error().available_bytes,
-                                .is_disk_space_error = true,
-                                .is_checkpoint = false}
-                                .emit();
+                    switch (format) {
+                    case ExportFormat::PLY: {
+                        update_progress(0.1f, "Writing PLY");
+                        const lfs::io::PlySaveOptions options{
+                            .output_path = path,
+                            .binary = true,
+                            .async = false,
+                            .extra_attributes = {}};
+                        if (auto result = lfs::io::save_ply(*splat_data, options); result) {
+                            success = true;
+                            update_progress(1.0f, "Complete");
+                        } else {
+                            error_msg = result.error().message;
+                            if (result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
+                                lfs::core::events::state::DiskSpaceSaveFailed{
+                                    .iteration = 0,
+                                    .path = path,
+                                    .error = result.error().message,
+                                    .required_bytes = result.error().required_bytes,
+                                    .available_bytes = result.error().available_bytes,
+                                    .is_disk_space_error = true,
+                                    .is_checkpoint = false}
+                                    .emit();
+                            }
                         }
+                        break;
                     }
-                    break;
-                }
-                case ExportFormat::SOG: {
-                    const lfs::io::SogSaveOptions options{
-                        .output_path = path,
-                        .kmeans_iterations = 10,
-                        .progress_callback = update_progress};
-                    if (auto result = lfs::io::save_sog(*splat_data, options); result) {
-                        success = true;
-                    } else {
-                        error_msg = result.error().message;
+                    case ExportFormat::SOG: {
+                        const lfs::io::SogSaveOptions options{
+                            .output_path = path,
+                            .kmeans_iterations = 10,
+                            .progress_callback = update_progress};
+                        if (auto result = lfs::io::save_sog(*splat_data, options); result) {
+                            success = true;
+                        } else {
+                            error_msg = result.error().message;
+                        }
+                        break;
                     }
-                    break;
-                }
-                case ExportFormat::SPZ: {
-                    update_progress(0.1f, "Writing SPZ");
-                    const lfs::io::SpzSaveOptions options{.output_path = path};
-                    if (auto result = lfs::io::save_spz(*splat_data, options); result) {
-                        success = true;
-                        update_progress(1.0f, "Complete");
-                    } else {
-                        error_msg = result.error().message;
+                    case ExportFormat::SPZ: {
+                        update_progress(0.1f, "Writing SPZ");
+                        const lfs::io::SpzSaveOptions options{.output_path = path};
+                        if (auto result = lfs::io::save_spz(*splat_data, options); result) {
+                            success = true;
+                            update_progress(1.0f, "Complete");
+                        } else {
+                            error_msg = result.error().message;
+                        }
+                        break;
                     }
-                    break;
-                }
-                case ExportFormat::HTML_VIEWER: {
-                    const HtmlViewerExportOptions options{
-                        .output_path = path,
-                        .progress_callback = [&update_progress](float p, const std::string& s) {
-                            update_progress(p, s);
-                        }};
-                    if (auto result = export_html_viewer(*splat_data, options); result) {
-                        success = true;
-                    } else {
-                        error_msg = result.error();
+                    case ExportFormat::HTML_VIEWER: {
+                        const HtmlViewerExportOptions options{
+                            .output_path = path,
+                            .progress_callback = [&update_progress](float p, const std::string& s) {
+                                update_progress(p, s);
+                            }};
+                        if (auto result = export_html_viewer(*splat_data, options); result) {
+                            success = true;
+                        } else {
+                            error_msg = result.error();
+                        }
+                        break;
                     }
-                    break;
-                }
-                case ExportFormat::USD: {
-                    update_progress(0.1f, "Writing USD");
-                    const lfs::io::UsdSaveOptions options{.output_path = path};
-                    if (auto result = lfs::io::save_usd(*splat_data, options); result) {
-                        success = true;
-                        update_progress(1.0f, "Complete");
-                    } else {
-                        error_msg = result.error().message;
+                    case ExportFormat::USD: {
+                        update_progress(0.1f, "Writing USD");
+                        const lfs::io::UsdSaveOptions options{.output_path = path};
+                        if (auto result = lfs::io::save_usd(*splat_data, options); result) {
+                            success = true;
+                            update_progress(1.0f, "Complete");
+                        } else {
+                            error_msg = result.error().message;
+                        }
+                        break;
                     }
-                    break;
-                }
-                }
+                    }
 
                 } catch (const std::exception& e) {
                     error_msg = std::string("Export crashed with exception: ") + e.what();

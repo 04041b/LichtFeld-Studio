@@ -18,15 +18,15 @@
 #include <string>
 #include <vector>
 
-#include <pxr/base/tf/diagnostic.h>
-#include <pxr/base/tf/diagnosticMgr.h>
-#include <pxr/base/tf/errorMark.h>
 #include <pxr/base/gf/half.h>
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/base/gf/quatf.h>
 #include <pxr/base/gf/quath.h>
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/gf/vec3h.h>
+#include <pxr/base/tf/diagnostic.h>
+#include <pxr/base/tf/diagnosticMgr.h>
+#include <pxr/base/tf/errorMark.h>
 #include <pxr/base/vt/array.h>
 #include <pxr/base/vt/value.h>
 #include <pxr/usd/sdf/layer.h>

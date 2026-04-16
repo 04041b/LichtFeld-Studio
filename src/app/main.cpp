@@ -31,7 +31,8 @@ namespace {
 #else
         std::error_code ec;
         auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
-        if (!ec) return p.parent_path();
+        if (!ec)
+            return p.parent_path();
 #endif
         return {};
     }
@@ -42,12 +43,14 @@ namespace {
     // Windows because USD DLLs may initialise before main() runs.
     void configure_usd_plugins() {
         const auto exe_dir = get_exe_directory();
-        if (exe_dir.empty()) return;
+        if (exe_dir.empty())
+            return;
 
         auto usd_dir = exe_dir / ".." / "lib" / "usd";
         std::error_code ec;
         usd_dir = std::filesystem::canonical(usd_dir, ec);
-        if (ec || !std::filesystem::is_directory(usd_dir, ec)) return;
+        if (ec || !std::filesystem::is_directory(usd_dir, ec))
+            return;
 
         const std::string path_utf8 = lfs::core::path_to_utf8(usd_dir);
 
