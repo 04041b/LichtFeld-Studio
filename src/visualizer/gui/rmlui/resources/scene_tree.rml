@@ -22,10 +22,10 @@
 
     <div id="scene-view">
         <div id="search-container">
-            <img id="search-icon" class="row-icon" src="../icon/scene/search.png" />
+            <img id="search-icon" class="row-icon" />
             <input id="filter-input" type="text" placeholder="Search" />
             <button id="filter-clear" type="button">
-                <img src="../icon/scene/x.png" />
+                <img />
             </button>
         </div>
 

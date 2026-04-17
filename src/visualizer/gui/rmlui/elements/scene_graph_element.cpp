@@ -186,17 +186,17 @@ namespace lfs::vis::gui {
             return "";
         }
 
-        [[nodiscard]] const char* typeIconPath(const core::NodeType type) {
+        [[nodiscard]] const char* typeIconSprite(const core::NodeType type) {
             switch (type) {
-            case core::NodeType::SPLAT: return "../icon/scene/splat.png";
-            case core::NodeType::POINTCLOUD: return "../icon/scene/pointcloud.png";
-            case core::NodeType::GROUP: return "../icon/scene/group.png";
-            case core::NodeType::DATASET: return "../icon/scene/dataset.png";
+            case core::NodeType::SPLAT: return "icon-splat";
+            case core::NodeType::POINTCLOUD: return "icon-pointcloud";
+            case core::NodeType::GROUP: return "icon-group";
+            case core::NodeType::DATASET: return "icon-dataset";
             case core::NodeType::CAMERA:
-            case core::NodeType::CAMERA_GROUP: return "../icon/scene/camera.png";
-            case core::NodeType::CROPBOX: return "../icon/scene/cropbox.png";
-            case core::NodeType::ELLIPSOID: return "../icon/scene/ellipsoid.png";
-            case core::NodeType::MESH: return "../icon/scene/mesh.png";
+            case core::NodeType::CAMERA_GROUP: return "icon-camera";
+            case core::NodeType::CROPBOX: return "icon-cropbox";
+            case core::NodeType::ELLIPSOID: return "icon-ellipsoid";
+            case core::NodeType::MESH: return "icon-mesh";
             case core::NodeType::KEYFRAME_GROUP:
             case core::NodeType::KEYFRAME:
             case core::NodeType::IMAGE_GROUP:
@@ -449,7 +449,7 @@ namespace lfs::vis::gui {
             auto trash_icon = doc->CreateElement("img");
             trash_icon->SetClass("row-icon", true);
             trash_icon->SetClass("trash-icon", true);
-            trash_icon->SetAttribute("src", "../icon/scene/trash.png");
+            trash_icon->SetAttribute("sprite", "icon-trash");
             trash_icon->SetAttribute("data-action", "delete");
             slot.delete_icon = slot.content->AppendChild(std::move(trash_icon));
 
@@ -465,7 +465,7 @@ namespace lfs::vis::gui {
             auto mask_icon = doc->CreateElement("img");
             mask_icon->SetClass("row-icon", true);
             mask_icon->SetClass("mask-icon", true);
-            mask_icon->SetAttribute("src", "../icon/scene/mask.png");
+            mask_icon->SetAttribute("sprite", "icon-mask");
             slot.mask_icon = slot.content->AppendChild(std::move(mask_icon));
 
             auto expand = doc->CreateElement("span");
@@ -889,13 +889,13 @@ namespace lfs::vis::gui {
         setCachedAttribute(slot.delete_icon, "data-node-id", row.node_id_text);
         setCachedProperty(slot.delete_icon, "display", row.deletable ? "inline" : "none");
 
-        const std::string_view icon_path = typeIconPath(row.type);
+        const std::string_view icon_sprite = typeIconSprite(row.type);
         const std::string_view unicode = unicodeIcon(row.type);
         setCachedTypeClass(slot.type_icon, typeClass(row.type));
         setCachedTypeClass(slot.unicode_icon, typeClass(row.type));
 
-        if (!icon_path.empty()) {
-            setCachedAttribute(slot.type_icon, "src", std::string(icon_path));
+        if (!icon_sprite.empty()) {
+            setCachedAttribute(slot.type_icon, "sprite", std::string(icon_sprite));
             setCachedProperty(slot.type_icon, "display", "inline");
             setCachedProperty(slot.unicode_icon, "display", "none");
         } else if (!unicode.empty()) {

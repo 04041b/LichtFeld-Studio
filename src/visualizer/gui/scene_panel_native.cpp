@@ -9,8 +9,10 @@
 #include "core/path_utils.hpp"
 #include "gui/gui_manager.hpp"
 #include "gui/rmlui/elements/scene_graph_element.hpp"
+#include "gui/rmlui/rml_theme.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/utils/native_file_dialog.hpp"
+#include "internal/resource_paths.hpp"
 #include "operation/undo_history.hpp"
 #include "visualizer/core/services.hpp"
 
@@ -67,6 +69,16 @@ namespace lfs::vis::gui {
 
         [[nodiscard]] std::string cacheAttrName(std::string_view kind, std::string_view name) {
             return std::format("data-lfs-{}-{}", kind, name);
+        }
+
+        [[nodiscard]] std::string resolveRmlImageSource(const std::string_view asset_path) {
+            try {
+                return rml_theme::pathToRmlImageSource(
+                    lfs::vis::getAssetPath(std::string(asset_path)));
+            } catch (const std::exception& e) {
+                LOG_WARN("NativeScenePanel: failed to resolve icon '{}': {}", asset_path, e.what());
+                return {};
+            }
         }
 
         struct LogLevelChoice {
@@ -462,6 +474,18 @@ namespace lfs::vis::gui {
         logging_scroll_el_ = document_->GetElementById("logging-scroll");
         logging_list_el_ = document_->GetElementById("logging-list");
         logging_empty_el_ = document_->GetElementById("logging-empty");
+
+        if (auto* search_icon = document_->GetElementById("search-icon")) {
+            const std::string search_icon_source = resolveRmlImageSource("icon/scene/search.png");
+            if (!search_icon_source.empty())
+                search_icon->SetAttribute("src", search_icon_source);
+        }
+
+        if (auto* clear_icon = filter_clear_el_ ? filter_clear_el_->GetChild(0) : nullptr) {
+            const std::string clear_icon_source = resolveRmlImageSource("icon/scene/x.png");
+            if (!clear_icon_source.empty())
+                clear_icon->SetAttribute("src", clear_icon_source);
+        }
 
         if (!tree_el_ || !scene_tab_el_ || !history_tab_el_ || !logging_tab_el_ || !chip_row_el_ ||
             !summary_model_chip_el_ || !summary_node_chip_el_ || !summary_selection_chip_el_ ||
