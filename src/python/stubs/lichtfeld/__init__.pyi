@@ -425,6 +425,9 @@ def is_fullscreen() -> bool:
 def toggle_ui() -> None:
     """Toggle UI overlay visibility"""
 
+def toggle_independent_split_view() -> None:
+    """Toggle independent split view"""
+
 def get_render_mode() -> RenderMode:
     """Get current render mode (Splats, Points, Rings, Centers)"""
 

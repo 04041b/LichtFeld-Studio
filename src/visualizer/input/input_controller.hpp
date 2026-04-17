@@ -78,6 +78,11 @@ namespace lfs::vis {
             focusSplitPanel(panel);
         }
 
+        void toggleIndependentSplitView() {
+            lfs::core::events::cmd::ToggleIndependentSplitView{.viewport = &viewport_}.emit();
+            focusSplitPanel(SplitViewPanelId::Left);
+        }
+
         // Set special input modes
         void setPointCloudMode(bool enabled) {
             point_cloud_mode_ = enabled;

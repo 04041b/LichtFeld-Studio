@@ -365,6 +365,16 @@ class _UtilityToolbarController:
                     selected=camera_view_snap,
                 )
             )
+            projection_buttons.append(
+                _button_record(
+                    "util-split-view",
+                    "toggle_independent_split_view",
+                    "",
+                    _icon_src("layout-columns"),
+                    tooltip_text="Independent Split View",
+                    selected=lf.ui.get_split_view_mode() == "independent_dual",
+                )
+            )
 
             seq_visible = lf.ui.is_sequencer_visible()
             utility_extra_buttons.append(
@@ -420,6 +430,9 @@ class _UtilityToolbarController:
             return
         if action == "toggle_camera_view_snap":
             lf.set_camera_view_snap_enabled(not lf.get_camera_view_snap_enabled())
+            return
+        if action == "toggle_independent_split_view":
+            lf.toggle_independent_split_view()
             return
         if action == "toggle_sequencer":
             lf.ui.set_sequencer_visible(not lf.ui.is_sequencer_visible())

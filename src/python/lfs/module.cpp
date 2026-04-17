@@ -1389,6 +1389,14 @@ NB_MODULE(lichtfeld, m) {
     m.def(
         "toggle_ui", []() { lfs::core::events::ui::ToggleUI{}.emit(); },
         "Toggle UI overlay visibility");
+    m.def(
+        "toggle_independent_split_view", []() {
+            auto* controller = lfs::vis::InputController::instance();
+            if (!controller)
+                return;
+            controller->toggleIndependentSplitView();
+        },
+        "Toggle independent split view");
 
     m.def(
         "get_render_mode", []() -> RenderMode {
