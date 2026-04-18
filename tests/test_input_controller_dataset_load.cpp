@@ -13,9 +13,9 @@
 #include "scene/scene_manager.hpp"
 #include "tools/tool_base.hpp"
 
+#include <filesystem>
 #include <gtest/gtest.h>
 #include <imgui.h>
-#include <filesystem>
 
 namespace lfs::vis {
 
