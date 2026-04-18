@@ -2,17 +2,20 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/events.hpp"
+#include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "input/input_controller.hpp"
 #include "internal/viewport.hpp"
 #include "rendering/coordinate_conventions.hpp"
+#include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
 #include "tools/tool_base.hpp"
 
 #include <gtest/gtest.h>
 #include <imgui.h>
+#include <filesystem>
 
 namespace lfs::vis {
 
@@ -92,6 +95,20 @@ namespace lfs::vis {
         EXPECT_NE(viewport.camera.home_pivot, glm::vec3(10.0f, 20.0f, 30.0f));
         EXPECT_EQ(viewport.camera.home_t, viewport.camera.t);
         EXPECT_EQ(viewport.camera.home_pivot, viewport.camera.pivot);
+    }
+
+    TEST_F(InputControllerDatasetLoadTest, DroppedHdrUpdatesEnvironmentRenderSettings) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        RenderingManager rendering_manager;
+        services().set(&rendering_manager);
+
+        const auto drop_path = std::filesystem::temp_directory_path() / "drag_drop_environment.hdr";
+        controller.handleFileDrop({lfs::core::path_to_utf8(drop_path)});
+
+        const auto settings = rendering_manager.getSettings();
+        EXPECT_EQ(settings.environment_mode, EnvironmentBackgroundMode::Equirectangular);
+        EXPECT_EQ(lfs::core::utf8_to_path(settings.environment_map_path), drop_path);
     }
 
 } // namespace lfs::vis

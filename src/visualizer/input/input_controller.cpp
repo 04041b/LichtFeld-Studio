@@ -46,6 +46,26 @@ namespace lfs::vis {
         constexpr double kCameraContextMenuDragThreshold = 4.0;
         namespace string_keys = lichtfeld::Strings;
 
+        [[nodiscard]] bool isEnvironmentMapExtension(const std::string_view ext) {
+            return ext == ".hdr" || ext == ".exr";
+        }
+
+        void applyDroppedEnvironmentMap(const std::filesystem::path& environment_map_path) {
+            auto* const rendering_manager = services().renderingOrNull();
+            if (!rendering_manager) {
+                LOG_WARN("Ignoring dropped environment map because RenderingManager is not available");
+                return;
+            }
+
+            auto settings = rendering_manager->getSettings();
+            settings.environment_mode = EnvironmentBackgroundMode::Equirectangular;
+            settings.environment_map_path = lfs::core::path_to_utf8(environment_map_path);
+            rendering_manager->updateSettings(settings);
+
+            LOG_INFO("Applied environment map via drag-and-drop: {}",
+                     lfs::core::path_to_utf8(environment_map_path.filename()));
+        }
+
         bool dispatchKeyToModals(int key, int scancode, int action, int mods,
                                  double x, double y, const bool over_gui) {
             op::ModalEvent evt{};
@@ -1573,6 +1593,7 @@ namespace lfs::vis {
 
         std::vector<std::filesystem::path> splat_files;
         std::optional<std::filesystem::path> dataset_path;
+        std::optional<std::filesystem::path> environment_map_path;
         std::vector<std::string> unrecognized_files;
 
         for (const auto& path_str : paths) {
@@ -1592,6 +1613,12 @@ namespace lfs::vis {
                     cmd::LoadConfigFile{.path = filepath}.emit();
                     LOG_INFO("Loading config via drag-and-drop: {}", lfs::core::path_to_utf8(filepath.filename()));
                     return;
+                }
+            } else if (isEnvironmentMapExtension(ext)) {
+                if (!environment_map_path) {
+                    environment_map_path = filepath;
+                } else {
+                    LOG_DEBUG("Ignoring additional dropped environment map: {}", lfs::core::path_to_utf8(filepath));
                 }
             } else if (ext == ".ply" || ext == ".sog" || ext == ".spz" ||
                        ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz") {
@@ -1655,9 +1682,13 @@ namespace lfs::vis {
             cmd::ShowDatasetLoadPopup{.dataset_path = *dataset_path}.emit();
         }
 
-        if (!unrecognized_files.empty() && splat_files.empty() && !dataset_path) {
+        if (environment_map_path) {
+            applyDroppedEnvironmentMap(*environment_map_path);
+        }
+
+        if (!unrecognized_files.empty() && splat_files.empty() && !dataset_path && !environment_map_path) {
             static constexpr auto SUPPORTED_FORMATS =
-                "Supported formats: .ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .json, .resume, or dataset directories";
+                "Supported formats: .ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .hdr, .exr, .json, .resume, or dataset directories";
             LOG_DEBUG("Dropped {} unrecognized file(s)", unrecognized_files.size());
             state::FileDropFailed{.files = unrecognized_files, .error = SUPPORTED_FORMATS}.emit();
         }
