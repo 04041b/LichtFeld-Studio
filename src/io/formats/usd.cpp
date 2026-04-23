@@ -24,6 +24,15 @@
 #include <pxr/base/gf/quath.h>
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/gf/vec3h.h>
+// pxr/base/tf/hashset.h pulls in the deprecated <ext/hash_set> on GCC.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcpp"
+#endif
+#include <pxr/base/plug/registry.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/base/tf/diagnosticMgr.h>
 #include <pxr/base/tf/errorMark.h>
@@ -744,6 +753,16 @@ namespace lfs::io {
         }
 
         LOG_INFO("Saving USD file: {}", lfs::core::path_to_utf8(options.output_path));
+
+        // Pre-flight check: ArResolver requires USD plugins to be registered.
+        // If none are registered, the USD plugin path may not be configured.
+        const auto plugin_count = pxr::PlugRegistry::GetInstance().GetAllPlugins().size();
+        if (plugin_count == 0) {
+            LOG_ERROR("[USD] No USD plugins registered — UsdStage::CreateNew will crash fatally");
+            return make_error(ErrorCode::WRITE_FAILURE,
+                              "USD plugins not registered — ensure the USD plugin path is configured before calling save_usd",
+                              options.output_path);
+        }
 
         const auto means = splat_data.means().contiguous().to(Device::CPU);
         const auto scaling = splat_data.scaling_raw().contiguous().to(Device::CPU);
