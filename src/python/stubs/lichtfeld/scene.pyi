@@ -582,6 +582,15 @@ class Scene:
     def set_selection_mask(self, mask: lichtfeld.Tensor) -> None:
         """Set selection from boolean mask tensor [N]"""
 
+    def preview_selection_mask(self, mask: lichtfeld.Tensor) -> None:
+        """Preview a selection mask without pushing an undo step"""
+
+    def commit_selection_preview(self) -> None:
+        """Commit a transient selection update as one undo step"""
+
+    def cancel_selection_preview(self) -> None:
+        """Cancel a transient selection update and restore the original selection"""
+
     def clear_selection(self) -> None:
         """Clear all selected Gaussians"""
 

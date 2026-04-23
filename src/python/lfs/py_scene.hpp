@@ -475,6 +475,9 @@ namespace lfs::python {
         std::optional<PyTensor> selection_mask() const;
         void set_selection(const std::vector<size_t>& indices);
         void set_selection_mask(const PyTensor& mask);
+        void preview_selection_mask(const PyTensor& mask);
+        void commit_selection_preview();
+        void cancel_selection_preview();
         void clear_selection();
         bool has_selection() const { return scene_->hasSelection(); }
 

@@ -454,6 +454,19 @@ namespace lfs::vis {
         return commitSelection(mask, mode, {}, SelectionFilterState{}, "selection.mask");
     }
 
+    SelectionResult SelectionService::previewMask(const core::Tensor& mask, SelectionMode mode) {
+        if (!scene_manager_ || !rendering_manager_) {
+            return {false, 0, "Missing managers"};
+        }
+
+        const size_t total = scene_manager_->getScene().getTotalGaussianCount();
+        if (total == 0 || mask.numel() != total) {
+            return {false, 0, "Mask size mismatch"};
+        }
+
+        return commitSelection(mask, mode, {}, SelectionFilterState{}, "selection.preview", false);
+    }
+
     void SelectionService::beginStroke() {
         if (!scene_manager_) {
             return;
@@ -990,7 +1003,8 @@ namespace lfs::vis {
     SelectionResult SelectionService::commitSelection(const core::Tensor& selection, const SelectionMode mode,
                                                       const std::vector<bool>& node_mask,
                                                       const SelectionFilterState& filters,
-                                                      const char* undo_name) {
+                                                      const char* undo_name,
+                                                      const bool push_undo) {
         if (!scene_manager_ || !rendering_manager_) {
             return {false, 0, "Missing managers"};
         }
@@ -1023,15 +1037,20 @@ namespace lfs::vis {
             selection_mask, existing_ref, output_mask, group_id, *locked_groups,
             add_mode, transform_indices.get(), node_mask, replace_mode);
 
-        auto entry = std::make_unique<op::SceneSnapshot>(*scene_manager_, undo_name);
-        entry->captureSelection();
+        std::unique_ptr<op::SceneSnapshot> entry;
+        if (push_undo) {
+            entry = std::make_unique<op::SceneSnapshot>(*scene_manager_, undo_name);
+            entry->captureSelection();
+        }
 
         // Snapshot the selection result before reusing the rotating output buffer.
         auto new_selection = std::make_shared<core::Tensor>(output_mask.clone());
         scene.setSelectionMask(new_selection);
 
-        entry->captureAfter();
-        op::pushSceneSnapshotIfChanged(std::move(entry));
+        if (entry) {
+            entry->captureAfter();
+            op::pushSceneSnapshotIfChanged(std::move(entry));
+        }
 
         rendering_manager_->markDirty(DirtyFlag::SELECTION);
         return {true, countSelected(*new_selection), {}};

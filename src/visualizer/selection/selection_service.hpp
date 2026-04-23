@@ -88,6 +88,7 @@ namespace lfs::vis {
 
         [[nodiscard]] SelectionResult applyMask(const std::vector<uint8_t>& mask, SelectionMode mode);
         [[nodiscard]] SelectionResult applyMask(const core::Tensor& mask, SelectionMode mode);
+        [[nodiscard]] SelectionResult previewMask(const core::Tensor& mask, SelectionMode mode);
 
         void beginStroke();
         [[nodiscard]] core::Tensor* getStrokeSelection();
@@ -154,7 +155,8 @@ namespace lfs::vis {
         [[nodiscard]] SelectionResult commitSelection(const core::Tensor& selection, SelectionMode mode,
                                                       const std::vector<bool>& node_mask,
                                                       const SelectionFilterState& filters,
-                                                      const char* undo_name);
+                                                      const char* undo_name,
+                                                      bool push_undo = true);
         [[nodiscard]] core::Tensor& resetBoolScratchBuffer(core::Tensor& buffer, size_t size);
         [[nodiscard]] std::optional<ViewerViewportContext> resolveViewerViewportContext(
             std::optional<glm::vec2> screen_point = std::nullopt,

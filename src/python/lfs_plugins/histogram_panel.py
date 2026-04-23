@@ -125,10 +125,12 @@ class HistogramPanel(Panel):
         self._selected_compare_cells: set[tuple[int, int]] = set()
         self._histogram_overlay_bounds: tuple[int, int] | None = None
         self._compare_overlay_bounds: tuple[int, int, int, int] | None = None
+        self._scene_selection_preview_active = False
 
         self._dragging_mark = False
         self._drag_selection_mode = "replace"
         self._drag_selection_base_mask: lf.Tensor | None = None
+        self._drag_selection_base_bins: set[int] | None = None
         self._marked_bin_start: int | None = None
         self._marked_bin_end: int | None = None
         self._marked_value_min: float | None = None
@@ -136,6 +138,7 @@ class HistogramPanel(Panel):
         self._dragging_compare_mark = False
         self._drag_compare_selection_mode = "replace"
         self._drag_compare_selection_base_mask: lf.Tensor | None = None
+        self._drag_compare_selection_base_cells: set[tuple[int, int]] | None = None
         self._compare_mark_start: tuple[int, int] | None = None
         self._compare_mark_end: tuple[int, int] | None = None
         self._compare_mark_x_min: float | None = None
@@ -299,6 +302,16 @@ class HistogramPanel(Panel):
                 trainer_state == self._trainer_state and
                 current_lang == self._last_lang and
                 not space_changed):
+            return False
+
+        if self._dragging_mark or self._dragging_compare_mark:
+            self._scene_generation = scene_generation
+            self._history_generation = history_generation
+            self._last_lang = current_lang
+            self._trainer_state = trainer_state
+            if self._scene_selection_preview_active:
+                self._selection_owned = True
+                self._pending_selection_commit = max(self._pending_selection_commit, 2)
             return False
 
         if scene_changed or history_changed:
@@ -1466,11 +1479,32 @@ class HistogramPanel(Panel):
             return
         self._handle.update_record_list("compare_bins", list(self._build_compare_bin_records()))
 
-    def _compare_count_for_value_bounds(self, x_min: float, x_max: float, y_min: float, y_max: float) -> int:
-        mask = self._selection_mask_for_compare_value_bounds(x_min, x_max, y_min, y_max)
-        if mask is None:
-            return 0
-        return int(mask.count_nonzero())
+    def _compare_count_for_bin_bounds(self, x_lo: int, x_hi: int, y_lo: int, y_hi: int) -> int | None:
+        if self._compare_counts is None:
+            return None
+        total = 0
+        for y_bin in range(int(y_lo), int(y_hi) + 1):
+            row_offset = y_bin * self._compare_x_bin_count
+            for x_bin in range(int(x_lo), int(x_hi) + 1):
+                total += int(self._compare_counts[row_offset + x_bin])
+        return total
+
+    def _selected_compare_cells_hint(self, x_lo: int, x_hi: int, y_lo: int, y_hi: int) -> set[tuple[int, int]] | None:
+        drag_cells = {
+            (x_bin, y_bin)
+            for y_bin in range(int(y_lo), int(y_hi) + 1)
+            for x_bin in range(int(x_lo), int(x_hi) + 1)
+        }
+        if self._drag_compare_selection_mode == "replace":
+            return drag_cells
+        base_cells = self._drag_compare_selection_base_cells
+        if base_cells is None:
+            return None
+        if self._drag_compare_selection_mode == "add":
+            return set(base_cells) | drag_cells
+        if self._drag_compare_selection_mode == "subtract":
+            return set(base_cells) - drag_cells
+        return None
 
     def _capture_histogram_mark_value_bounds(self) -> tuple[float, float] | None:
         if self._marked_value_min is None or self._marked_value_max is None:
@@ -1561,28 +1595,43 @@ class HistogramPanel(Panel):
             ),
         )
 
-    def _marked_count_for_value_bounds(self, range_min: float, range_max: float) -> int:
-        mask = self._selection_mask_for_value_bounds(range_min, range_max)
-        if mask is None:
-            return 0
-        return int(mask.count_nonzero())
-
-    def _selection_mask_for_histogram_bin(self, bin_index: int) -> lf.Tensor | None:
-        if self._hist_edges is None or bin_index < 0 or bin_index + 1 >= len(self._hist_edges):
+    def _selection_mask_for_histogram_bin_bounds(self, lo: int, hi: int) -> lf.Tensor | None:
+        if self._primary_finite_mask is None or self._selection_bin_indices is None:
             return None
-        return self._selection_mask_for_value_bounds(
-            float(self._hist_edges[bin_index]),
-            float(self._hist_edges[bin_index + 1]),
+        return (
+            self._primary_finite_mask &
+            (self._selection_bin_indices >= int(lo)) &
+            (self._selection_bin_indices <= int(hi))
         )
 
-    def _toggle_histogram_bin_selection(self, bin_index: int) -> bool:
+    def _histogram_count_for_bin_bounds(self, lo: int, hi: int) -> int | None:
+        if self._hist_prefix_counts is None:
+            return None
+        lo = max(0, min(int(lo), len(self._hist_prefix_counts) - 2))
+        hi = max(lo, min(int(hi), len(self._hist_prefix_counts) - 2))
+        return int(self._hist_prefix_counts[hi + 1] - self._hist_prefix_counts[lo])
+
+    def _selected_histogram_bins_hint(self, lo: int, hi: int) -> set[int] | None:
+        drag_bins = set(range(int(lo), int(hi) + 1))
+        if self._drag_selection_mode == "replace":
+            return drag_bins
+        base_bins = self._drag_selection_base_bins
+        if base_bins is None:
+            return None
+        if self._drag_selection_mode == "add":
+            return set(base_bins) | drag_bins
+        if self._drag_selection_mode == "subtract":
+            return set(base_bins) - drag_bins
+        return None
+
+    def _toggle_histogram_bin_selection(self, bin_index: int, preview_scene: bool = False) -> bool:
         base_mask = self._drag_selection_base_mask
         if base_mask is None:
             base_mask = self._current_selection_mask_for_source("histogram")
         if base_mask is None:
             return False
 
-        bin_mask = self._selection_mask_for_histogram_bin(bin_index)
+        bin_mask = self._selection_mask_for_histogram_bin_bounds(bin_index, bin_index)
         normalized_base = self._normalize_selection_mask(base_mask, self._primary_values)
         if normalized_base is None or bin_mask is None:
             return False
@@ -1591,10 +1640,11 @@ class HistogramPanel(Panel):
             return False
 
         next_mask = normalized_base & ~bin_mask
-        if self._any_true(next_mask):
-            self._commit_histogram_mask_selection(next_mask, apply_scene=True)
-        else:
-            self._reset_marked_state(clear_scene=True)
+        self._commit_histogram_mask_selection(
+            next_mask,
+            apply_scene=not preview_scene,
+            preview_scene=preview_scene,
+        )
         return True
 
     def _maybe_promote_histogram_drag_selection_mode(self, event) -> bool:
@@ -1606,24 +1656,80 @@ class HistogramPanel(Panel):
         self._drag_selection_mode = mode
         if self._drag_selection_base_mask is None:
             self._drag_selection_base_mask = self._current_selection_mask_for_source("histogram")
+        if self._drag_selection_base_bins is None:
+            self._drag_selection_base_bins = self._selected_histogram_bins_from_mask(self._drag_selection_base_mask)
         return True
 
-    def _apply_scene_selection_mask(self, mask: lf.Tensor | None):
+    def _commit_scene_selection_preview(self):
+        if not self._scene_selection_preview_active:
+            return
+
+        scene = lf.get_scene()
+        if scene is not None and scene.is_valid():
+            commit_preview = getattr(scene, "commit_selection_preview", None)
+            if callable(commit_preview):
+                try:
+                    commit_preview()
+                except Exception:
+                    pass
+
+        self._scene_selection_preview_active = False
+        self._selection_owned = True
+        self._pending_selection_commit = 2
+
+    def _cancel_scene_selection_preview(self):
+        if not self._scene_selection_preview_active:
+            return
+
+        scene = lf.get_scene()
+        if scene is not None and scene.is_valid():
+            cancel_preview = getattr(scene, "cancel_selection_preview", None)
+            if callable(cancel_preview):
+                try:
+                    cancel_preview()
+                except Exception:
+                    pass
+
+        self._scene_selection_preview_active = False
+        self._selection_owned = False
+        self._pending_selection_commit = 0
+
+    def _apply_scene_selection_mask(self, mask: lf.Tensor | None, preview: bool = False):
         scene = lf.get_scene()
         if scene is None or not scene.is_valid():
             self._selection_owned = False
             self._pending_selection_commit = 0
             return
 
-        normalized = self._normalize_selection_mask(mask, self._primary_values if self._primary_values is not None else self._compare_values)
-        if normalized is None or not self._any_true(normalized):
+        reference = self._primary_values if self._primary_values is not None else self._compare_values
+        normalized = self._normalize_selection_mask(mask, reference)
+        if normalized is None and preview and reference is not None:
+            normalized = self._zero_mask_like(reference)
+        if normalized is None:
             scene.clear_selection()
             self._selection_owned = False
             self._pending_selection_commit = 0
             return
 
         try:
-            scene.set_selection_mask(normalized.contiguous())
+            normalized = normalized.contiguous()
+            has_selection = self._any_true(normalized)
+            if preview:
+                preview_mask = getattr(scene, "preview_selection_mask", None)
+                if callable(preview_mask):
+                    preview_mask(normalized)
+                elif has_selection:
+                    scene.set_selection_mask(normalized)
+                else:
+                    scene.clear_selection()
+                self._scene_selection_preview_active = True
+            elif has_selection:
+                scene.set_selection_mask(normalized)
+            else:
+                scene.clear_selection()
+                self._selection_owned = False
+                self._pending_selection_commit = 0
+                return
             self._selection_owned = True
             # A histogram commit can trigger separate scene and undo/history updates.
             # Keep ownership across both so we do not immediately resync stale scene state.
@@ -1658,9 +1764,12 @@ class HistogramPanel(Panel):
         self,
         mask: lf.Tensor | None,
         apply_scene: bool,
+        preview_scene: bool = False,
         force_full_domain: bool = False,
         overlay_bounds: tuple[int, int] | None = None,
         explicit_value_bounds: tuple[float, float] | None = None,
+        count_hint: int | None = None,
+        selected_bins_hint: set[int] | None = None,
     ):
         normalized = self._normalize_selection_mask(mask, self._primary_values)
         if normalized is None:
@@ -1669,15 +1778,21 @@ class HistogramPanel(Panel):
 
         normalized = normalized & self._primary_finite_mask
         if not self._any_true(normalized):
-            self._reset_marked_state(clear_scene=apply_scene)
+            if apply_scene or preview_scene:
+                self._apply_scene_selection_mask(normalized, preview=preview_scene and not apply_scene)
+            self._reset_marked_state(clear_scene=False)
             return
 
         self._panel_selection_mask = normalized.contiguous()
         self._active_mark_source = "histogram"
         self._clear_compare_overlay()
         self._selected_compare_cells.clear()
-        if force_full_domain:
+        if selected_bins_hint is not None:
+            selected_bins = sorted(selected_bins_hint)
+        elif force_full_domain:
             selected_bins = list(range(self._histogram_bin_count))
+        elif explicit_value_bounds is not None and overlay_bounds is not None:
+            selected_bins = list(range(overlay_bounds[0], overlay_bounds[1] + 1))
         else:
             selected_bins = sorted(self._selected_histogram_bins_from_mask(normalized))
         self._selected_histogram_bins = set(selected_bins)
@@ -1725,7 +1840,7 @@ class HistogramPanel(Panel):
             self._marked_value_max = selected_value_max
             self._marked_range_text = self._format_range_text(selected_value_min, selected_value_max)
 
-        self._marked_count = int(normalized.count_nonzero())
+        self._marked_count = int(count_hint) if count_hint is not None else int(normalized.count_nonzero())
         self._marked_count_text = _trf(
             "histogram.gaussian_count",
             "{count} Gaussians",
@@ -1736,8 +1851,8 @@ class HistogramPanel(Panel):
             "Marked range becomes the active Gaussian selection.",
         )
 
-        if apply_scene:
-            self._apply_scene_selection_mask(normalized)
+        if apply_scene or preview_scene:
+            self._apply_scene_selection_mask(normalized, preview=preview_scene and not apply_scene)
         self._update_bin_records()
         if self._handle:
             self._handle.dirty_all()
@@ -1746,9 +1861,12 @@ class HistogramPanel(Panel):
         self,
         mask: lf.Tensor | None,
         apply_scene: bool,
+        preview_scene: bool = False,
         force_full_domain: bool = False,
         overlay_bounds: tuple[int, int, int, int] | None = None,
         explicit_value_bounds: tuple[float, float, float, float] | None = None,
+        count_hint: int | None = None,
+        selected_cells_hint: set[tuple[int, int]] | None = None,
     ):
         normalized = self._normalize_selection_mask(mask, self._compare_values)
         if normalized is None:
@@ -1757,18 +1875,28 @@ class HistogramPanel(Panel):
 
         normalized = normalized & self._compare_finite_mask
         if not self._any_true(normalized):
-            self._reset_marked_state(clear_scene=apply_scene)
+            if apply_scene or preview_scene:
+                self._apply_scene_selection_mask(normalized, preview=preview_scene and not apply_scene)
+            self._reset_marked_state(clear_scene=False)
             return
 
         self._panel_selection_mask = normalized.contiguous()
         self._active_mark_source = "compare"
         self._clear_histogram_overlay()
         self._selected_histogram_bins.clear()
-        if force_full_domain:
+        if selected_cells_hint is not None:
+            selected_cells = selected_cells_hint
+        elif force_full_domain:
             selected_cells = {
                 (x_bin, y_bin)
                 for y_bin in range(self._compare_y_bin_count)
                 for x_bin in range(self._compare_x_bin_count)
+            }
+        elif explicit_value_bounds is not None and overlay_bounds is not None:
+            selected_cells = {
+                (x_bin, y_bin)
+                for y_bin in range(overlay_bounds[2], overlay_bounds[3] + 1)
+                for x_bin in range(overlay_bounds[0], overlay_bounds[1] + 1)
             }
         else:
             selected_cells = self._selected_compare_cells_from_mask(normalized)
@@ -1857,7 +1985,7 @@ class HistogramPanel(Panel):
                 y_range=self._format_range_text(selected_y_min, selected_y_max),
             )
 
-        self._marked_count = int(normalized.count_nonzero())
+        self._marked_count = int(count_hint) if count_hint is not None else int(normalized.count_nonzero())
         self._marked_count_text = _trf(
             "histogram.gaussian_count",
             "{count} Gaussians",
@@ -1868,8 +1996,8 @@ class HistogramPanel(Panel):
             "Marked compare region becomes the active Gaussian selection.",
         )
 
-        if apply_scene:
-            self._apply_scene_selection_mask(normalized)
+        if apply_scene or preview_scene:
+            self._apply_scene_selection_mask(normalized, preview=preview_scene and not apply_scene)
         self._update_compare_bin_records()
         if self._handle:
             self._handle.dirty_all()
@@ -1966,12 +2094,13 @@ class HistogramPanel(Panel):
 
         self._drag_selection_mode = self._selection_mode_from_event(event)
         self._drag_selection_base_mask = self._current_selection_mask_for_source("histogram")
+        self._drag_selection_base_bins = self._selected_histogram_bins_from_mask(self._drag_selection_base_mask)
         self._clear_compare_mark(clear_scene=False)
         bin_index = self._bin_index_for_mouse_x(self._event_mouse_x(event))
         self._dragging_mark = True
         self._marked_bin_start = bin_index
         self._marked_bin_end = bin_index
-        self._sync_marked_range(apply_scene=False)
+        self._sync_marked_range(apply_scene=False, preview_scene=True)
         event.stop_propagation()
 
     def _on_compare_chart_mousedown(self, event):
@@ -1987,8 +2116,12 @@ class HistogramPanel(Panel):
 
         self._drag_compare_selection_mode = self._selection_mode_from_event(event)
         self._drag_compare_selection_base_mask = None
+        self._drag_compare_selection_base_cells = None
         if self._drag_compare_selection_mode != "replace":
             self._drag_compare_selection_base_mask = self._current_selection_mask_for_source("compare")
+            self._drag_compare_selection_base_cells = self._selected_compare_cells_from_mask(
+                self._drag_compare_selection_base_mask
+            )
         self._clear_histogram_mark(clear_scene=False)
         x_bin, y_bin = self._compare_bin_indices_for_mouse(
             self._event_mouse_x(event),
@@ -1997,7 +2130,7 @@ class HistogramPanel(Panel):
         self._dragging_compare_mark = True
         self._compare_mark_start = (x_bin, y_bin)
         self._compare_mark_end = (x_bin, y_bin)
-        self._sync_compare_mark(apply_scene=False)
+        self._sync_compare_mark(apply_scene=False, preview_scene=True)
         event.stop_propagation()
 
     def _on_document_mousemove(self, event):
@@ -2006,7 +2139,7 @@ class HistogramPanel(Panel):
             if bins == self._compare_mark_end:
                 return
             self._compare_mark_end = bins
-            self._sync_compare_mark(apply_scene=False)
+            self._sync_compare_mark(apply_scene=False, preview_scene=True)
             event.stop_propagation()
             return
 
@@ -2016,15 +2149,17 @@ class HistogramPanel(Panel):
             if bin_index == self._marked_bin_end and not mode_changed:
                 return
             self._marked_bin_end = bin_index
-            self._sync_marked_range(apply_scene=False)
+            self._sync_marked_range(apply_scene=False, preview_scene=True)
             event.stop_propagation()
 
     def _on_document_mouseup(self, event):
         if self._dragging_compare_mark:
-            self._sync_compare_mark(apply_scene=True)
+            self._sync_compare_mark(apply_scene=False, preview_scene=True)
+            self._commit_scene_selection_preview()
             self._dragging_compare_mark = False
             self._drag_compare_selection_mode = "replace"
             self._drag_compare_selection_base_mask = None
+            self._drag_compare_selection_base_cells = None
             event.stop_propagation()
             return
 
@@ -2034,13 +2169,15 @@ class HistogramPanel(Panel):
                 self._drag_selection_mode == "replace" and
                 self._marked_bin_start is not None and
                 self._marked_bin_start == self._marked_bin_end and
-                self._toggle_histogram_bin_selection(self._marked_bin_start)
+                self._toggle_histogram_bin_selection(self._marked_bin_start, preview_scene=True)
             )
             if not toggled:
-                self._sync_marked_range(apply_scene=True)
+                self._sync_marked_range(apply_scene=False, preview_scene=True)
+            self._commit_scene_selection_preview()
             self._dragging_mark = False
             self._drag_selection_mode = "replace"
             self._drag_selection_base_mask = None
+            self._drag_selection_base_bins = None
             event.stop_propagation()
 
     def _event_mouse_x(self, event) -> float:
@@ -2152,7 +2289,12 @@ class HistogramPanel(Panel):
             (self._panel_selection_mask is not None and self._any_true(self._panel_selection_mask))
         )
 
-    def _sync_marked_range(self, apply_scene: bool, preserve_value_bounds: bool = False):
+    def _sync_marked_range(
+        self,
+        apply_scene: bool,
+        preserve_value_bounds: bool = False,
+        preview_scene: bool = False,
+    ):
         if self._hist_counts is None or self._hist_edges is None:
             self._reset_footer_mark_state(clear_scene=apply_scene)
             return
@@ -2167,14 +2309,28 @@ class HistogramPanel(Panel):
             self._marked_value_min = float(self._hist_edges[lo])
             self._marked_value_max = float(self._hist_edges[hi + 1])
         explicit_bounds = (self._marked_value_min, self._marked_value_max)
+        count_hint = (
+            self._histogram_count_for_bin_bounds(lo, hi)
+            if self._drag_selection_mode == "replace" and not preserve_value_bounds
+            else None
+        )
+        selected_bins_hint = self._selected_histogram_bins_hint(lo, hi)
+        drag_mask = (
+            self._selection_mask_for_histogram_bin_bounds(lo, hi)
+            if not preserve_value_bounds
+            else self._selection_mask_for_value_bounds(self._marked_value_min, self._marked_value_max)
+        )
         self._commit_histogram_mask_selection(
             self._compose_selection_mask(
-                self._selection_mask_for_value_bounds(self._marked_value_min, self._marked_value_max),
+                drag_mask,
                 "histogram",
             ),
             apply_scene=apply_scene,
+            preview_scene=preview_scene,
             overlay_bounds=(lo, hi),
             explicit_value_bounds=explicit_bounds if self._drag_selection_mode == "replace" else None,
+            count_hint=count_hint,
+            selected_bins_hint=selected_bins_hint,
         )
 
     def _histogram_bar_geometry(self, bin_count: int) -> tuple[float, float, float]:
@@ -2197,7 +2353,12 @@ class HistogramPanel(Panel):
         width = ((hi - lo) + 1) * bar_width + max(0, hi - lo) * gap_width
         return left, width
 
-    def _sync_compare_mark(self, apply_scene: bool, preserve_value_bounds: bool = False):
+    def _sync_compare_mark(
+        self,
+        apply_scene: bool,
+        preserve_value_bounds: bool = False,
+        preview_scene: bool = False,
+    ):
         if self._compare_counts is None or self._compare_x_edges is None or self._compare_y_edges is None:
             self._reset_footer_mark_state(clear_scene=apply_scene)
             return
@@ -2227,28 +2388,46 @@ class HistogramPanel(Panel):
             self._compare_mark_y_min,
             self._compare_mark_y_max,
         )
+        count_hint = (
+            self._compare_count_for_bin_bounds(x_lo, x_hi, y_lo, y_hi)
+            if self._drag_compare_selection_mode == "replace" and not preserve_value_bounds
+            else None
+        )
+        selected_cells_hint = self._selected_compare_cells_hint(x_lo, x_hi, y_lo, y_hi)
+        drag_mask = (
+            self._selection_mask_for_compare_bin_bounds(x_lo, x_hi, y_lo, y_hi)
+            if not preserve_value_bounds
+            else self._selection_mask_for_compare_value_bounds(
+                self._compare_mark_x_min,
+                self._compare_mark_x_max,
+                self._compare_mark_y_min,
+                self._compare_mark_y_max,
+            )
+        )
         self._commit_compare_mask_selection(
             self._compose_selection_mask(
-                self._selection_mask_for_compare_value_bounds(
-                    self._compare_mark_x_min,
-                    self._compare_mark_x_max,
-                    self._compare_mark_y_min,
-                    self._compare_mark_y_max,
-                ),
+                drag_mask,
                 "compare",
             ),
             apply_scene=apply_scene,
+            preview_scene=preview_scene,
             overlay_bounds=(x_lo, x_hi, y_lo, y_hi),
             explicit_value_bounds=explicit_bounds if self._drag_compare_selection_mode == "replace" else None,
+            count_hint=count_hint,
+            selected_cells_hint=selected_cells_hint,
         )
 
     def _reset_footer_mark_state(self, clear_scene: bool):
+        if clear_scene and self._scene_selection_preview_active:
+            self._cancel_scene_selection_preview()
         self._clear_histogram_overlay()
         self._clear_compare_overlay()
         self._drag_selection_mode = "replace"
         self._drag_selection_base_mask = None
+        self._drag_selection_base_bins = None
         self._drag_compare_selection_mode = "replace"
         self._drag_compare_selection_base_mask = None
+        self._drag_compare_selection_base_cells = None
         self._panel_selection_mask = None
         self._selected_histogram_bins.clear()
         self._selected_compare_cells.clear()
@@ -2327,12 +2506,19 @@ class HistogramPanel(Panel):
         )
         return mask
 
-    def _apply_scene_selection(self, range_min: float, range_max: float):
-        self._apply_scene_selection_mask(self._selection_mask_for_value_bounds(range_min, range_max))
-
-    def _apply_compare_scene_selection(self, x_min: float, x_max: float, y_min: float, y_max: float):
-        self._apply_scene_selection_mask(
-            self._selection_mask_for_compare_value_bounds(x_min, x_max, y_min, y_max)
+    def _selection_mask_for_compare_bin_bounds(self, x_lo: int, x_hi: int, y_lo: int, y_hi: int) -> lf.Tensor | None:
+        if (
+            self._compare_finite_mask is None or
+            self._compare_x_bin_indices is None or
+            self._compare_y_bin_indices is None
+        ):
+            return None
+        return (
+            self._compare_finite_mask &
+            (self._compare_x_bin_indices >= int(x_lo)) &
+            (self._compare_x_bin_indices <= int(x_hi)) &
+            (self._compare_y_bin_indices >= int(y_lo)) &
+            (self._compare_y_bin_indices <= int(y_hi))
         )
 
     def _compare_bin_indices_for_mouse(self, mouse_x: float, mouse_y: float) -> tuple[int, int]:
@@ -2352,6 +2538,8 @@ class HistogramPanel(Panel):
         return x_bin, y_bin
 
     def _clear_owned_scene_selection(self):
+        if self._scene_selection_preview_active:
+            self._cancel_scene_selection_preview()
         scene = lf.get_scene()
         if scene is not None and scene.is_valid() and self._selection_owned:
             scene.clear_selection()

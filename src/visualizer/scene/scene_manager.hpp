@@ -24,6 +24,10 @@
 
 namespace lfs::vis {
 
+    namespace op {
+        class SceneSnapshot;
+    }
+
     // Forward declarations
     class Trainer;
 
@@ -250,6 +254,9 @@ namespace lfs::vis {
         [[nodiscard]] SelectionResult selectRing(float x, float y, const std::string& mode, int camera_index = 0);
         [[nodiscard]] SelectionResult applySelectionMask(const std::vector<uint8_t>& mask);
         [[nodiscard]] SelectionResult applySelectionMask(const lfs::core::Tensor& mask);
+        [[nodiscard]] SelectionResult previewSelectionMask(const lfs::core::Tensor& mask);
+        void commitSelectionPreview();
+        void cancelSelectionPreview();
 
         void initSelectionService();
         [[nodiscard]] SelectionService* getSelectionService() { return selection_service_.get(); }
@@ -324,8 +331,12 @@ namespace lfs::vis {
         std::unique_ptr<lfs::training::PPISP> appearance_ppisp_;
         std::unique_ptr<lfs::training::PPISPControllerPool> appearance_controller_pool_;
 
+        void beginSelectionPreview();
+
         // Selection service (GPU-based rect/polygon/brush selection)
         std::unique_ptr<SelectionService> selection_service_;
+        std::unique_ptr<op::SceneSnapshot> selection_preview_snapshot_;
+        std::optional<core::Scene::SelectionStateSnapshot> selection_preview_before_;
     };
 
 } // namespace lfs::vis

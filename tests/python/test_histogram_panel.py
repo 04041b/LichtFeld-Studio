@@ -35,12 +35,25 @@ class _SceneSelectionStub:
     def __init__(self, selection_mask=None):
         self.selection_mask = selection_mask
         self.clear_calls = 0
+        self.preview_mask_calls = 0
+        self.commit_preview_calls = 0
+        self.cancel_preview_calls = 0
 
     def is_valid(self):
         return True
 
     def set_selection_mask(self, mask):
         self.selection_mask = (mask.reshape([-1]) != 0).contiguous()
+
+    def preview_selection_mask(self, mask):
+        self.preview_mask_calls += 1
+        self.set_selection_mask(mask)
+
+    def commit_selection_preview(self):
+        self.commit_preview_calls += 1
+
+    def cancel_selection_preview(self):
+        self.cancel_preview_calls += 1
 
     def clear_selection(self):
         self.selection_mask = None
@@ -347,6 +360,43 @@ def test_histogram_drag_can_expand_across_multiple_bins(histogram_panel_module, 
 
     assert panel._marked_bounds() == (1, 5)
     assert panel._marked_count == 2
+
+
+def test_histogram_drag_live_updates_scene_selection_before_mouseup(histogram_panel_module, lf, numpy, monkeypatch):
+    panel = histogram_panel_module.HistogramPanel()
+    panel._show_chart = True
+    panel._metric_id = "opacity"
+    panel._chart_el = SimpleNamespace(absolute_left=0.0, absolute_width=160.0)
+
+    values = lf.Tensor.from_numpy(numpy.array([0.05, 0.15, 0.35], dtype=numpy.float32))
+    finite_mask = values.isfinite()
+    panel._primary_values = values
+    panel._primary_finite_mask = finite_mask
+    panel._primary_valid_values = values[finite_mask]
+    panel._primary_histogram_min = 0.0
+    panel._primary_histogram_max = 1.0
+    panel._histogram_bin_count = 16
+    panel._rebuild_histogram_from_cache()
+
+    scene = _SceneSelectionStub()
+    monkeypatch.setattr(lf, "get_scene", lambda: scene)
+
+    panel._on_chart_mousedown(_MouseEventStub(mouse_x=1.0))
+
+    assert scene.preview_mask_calls == 1
+    assert scene.commit_preview_calls == 0
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([True, False, False]))
+
+    panel._on_document_mousemove(_MouseEventStub(mouse_x=51.0))
+
+    assert scene.preview_mask_calls == 2
+    assert scene.commit_preview_calls == 0
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([True, True, True]))
+
+    panel._on_document_mouseup(_MouseEventStub(mouse_x=51.0))
+
+    assert scene.commit_preview_calls == 1
+    numpy.testing.assert_array_equal(scene.selection_mask.cpu().numpy(), numpy.array([True, True, True]))
 
 
 def test_histogram_selection_geometry_accounts_for_bar_gaps(histogram_panel_module):

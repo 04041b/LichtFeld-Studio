@@ -857,6 +857,26 @@ namespace lfs::python {
         scene_->setSelectionMask(std::make_shared<core::Tensor>(mask.tensor()));
     }
 
+    void PyScene::preview_selection_mask(const PyTensor& mask) {
+        if (auto* const scene_manager = get_scene_manager()) {
+            (void)scene_manager->previewSelectionMask(mask.tensor());
+            return;
+        }
+        scene_->setSelectionMask(std::make_shared<core::Tensor>(mask.tensor()));
+    }
+
+    void PyScene::commit_selection_preview() {
+        if (auto* const scene_manager = get_scene_manager()) {
+            scene_manager->commitSelectionPreview();
+        }
+    }
+
+    void PyScene::cancel_selection_preview() {
+        if (auto* const scene_manager = get_scene_manager()) {
+            scene_manager->cancelSelectionPreview();
+        }
+    }
+
     void PyScene::clear_selection() {
         if (auto* const scene_manager = get_scene_manager()) {
             scene_manager->deselectAllGaussians();
@@ -1281,6 +1301,9 @@ Returns:
             .def_prop_ro("selection_mask", &PyScene::selection_mask, "Current selection mask tensor [N] uint8 (None if no selection)")
             .def("set_selection", &PyScene::set_selection, nb::arg("indices"), "Set selection from index tensor")
             .def("set_selection_mask", &PyScene::set_selection_mask, nb::arg("mask"), "Set selection from boolean mask tensor [N]")
+            .def("preview_selection_mask", &PyScene::preview_selection_mask, nb::arg("mask"), "Preview a selection mask without pushing an undo step")
+            .def("commit_selection_preview", &PyScene::commit_selection_preview, "Commit a transient selection update as one undo step")
+            .def("cancel_selection_preview", &PyScene::cancel_selection_preview, "Cancel a transient selection update and restore the original selection")
             .def("clear_selection", &PyScene::clear_selection, "Clear all selected Gaussians")
             .def("has_selection", &PyScene::has_selection, "Check if any Gaussians are selected")
             // Selection groups
