@@ -37,15 +37,15 @@ typedef struct {
 
 static inline Delimiter new_delimiter() { return (Delimiter){0}; }
 
-static inline bool is_format(Delimiter *delimiter) { return delimiter->flags & Format; }
+static inline bool is_format(Delimiter* delimiter) { return delimiter->flags & Format; }
 
-static inline bool is_raw(Delimiter *delimiter) { return delimiter->flags & Raw; }
+static inline bool is_raw(Delimiter* delimiter) { return delimiter->flags & Raw; }
 
-static inline bool is_triple(Delimiter *delimiter) { return delimiter->flags & Triple; }
+static inline bool is_triple(Delimiter* delimiter) { return delimiter->flags & Triple; }
 
-static inline bool is_bytes(Delimiter *delimiter) { return delimiter->flags & Bytes; }
+static inline bool is_bytes(Delimiter* delimiter) { return delimiter->flags & Bytes; }
 
-static inline int32_t end_character(Delimiter *delimiter) {
+static inline int32_t end_character(Delimiter* delimiter) {
     if (delimiter->flags & SingleQuote) {
         return '\'';
     }
@@ -58,27 +58,27 @@ static inline int32_t end_character(Delimiter *delimiter) {
     return 0;
 }
 
-static inline void set_format(Delimiter *delimiter) { delimiter->flags |= Format; }
+static inline void set_format(Delimiter* delimiter) { delimiter->flags |= Format; }
 
-static inline void set_raw(Delimiter *delimiter) { delimiter->flags |= Raw; }
+static inline void set_raw(Delimiter* delimiter) { delimiter->flags |= Raw; }
 
-static inline void set_triple(Delimiter *delimiter) { delimiter->flags |= Triple; }
+static inline void set_triple(Delimiter* delimiter) { delimiter->flags |= Triple; }
 
-static inline void set_bytes(Delimiter *delimiter) { delimiter->flags |= Bytes; }
+static inline void set_bytes(Delimiter* delimiter) { delimiter->flags |= Bytes; }
 
-static inline void set_end_character(Delimiter *delimiter, int32_t character) {
+static inline void set_end_character(Delimiter* delimiter, int32_t character) {
     switch (character) {
-        case '\'':
-            delimiter->flags |= SingleQuote;
-            break;
-        case '"':
-            delimiter->flags |= DoubleQuote;
-            break;
-        case '`':
-            delimiter->flags |= BackQuote;
-            break;
-        default:
-            assert(false);
+    case '\'':
+        delimiter->flags |= SingleQuote;
+        break;
+    case '"':
+        delimiter->flags |= DoubleQuote;
+        break;
+    case '`':
+        delimiter->flags |= BackQuote;
+        break;
+    default:
+        assert(false);
     }
 }
 
@@ -88,12 +88,12 @@ typedef struct {
     bool inside_interpolated_string;
 } Scanner;
 
-static inline void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
+static inline void advance(TSLexer* lexer) { lexer->advance(lexer, false); }
 
-static inline void skip(TSLexer *lexer) { lexer->advance(lexer, true); }
+static inline void skip(TSLexer* lexer) { lexer->advance(lexer, true); }
 
-bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
-    Scanner *scanner = (Scanner *)payload;
+bool tree_sitter_python_external_scanner_scan(void* payload, TSLexer* lexer, const bool* valid_symbols) {
+    Scanner* scanner = (Scanner*)payload;
 
     bool error_recovery_mode = valid_symbols[STRING_CONTENT] && valid_symbols[INDENT];
     bool within_brackets = valid_symbols[CLOSE_BRACE] || valid_symbols[CLOSE_PAREN] || valid_symbols[CLOSE_BRACKET];
@@ -101,7 +101,7 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
     bool advanced_once = false;
     if (valid_symbols[ESCAPE_INTERPOLATION] && scanner->delimiters.size > 0 &&
         (lexer->lookahead == '{' || lexer->lookahead == '}') && !error_recovery_mode) {
-        Delimiter *delimiter = array_back(&scanner->delimiters);
+        Delimiter* delimiter = array_back(&scanner->delimiters);
         if (is_format(delimiter)) {
             lexer->mark_end(lexer);
             bool is_left_brace = lexer->lookahead == '{';
@@ -118,7 +118,7 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
     }
 
     if (valid_symbols[STRING_CONTENT] && scanner->delimiters.size > 0 && !error_recovery_mode) {
-        Delimiter *delimiter = array_back(&scanner->delimiters);
+        Delimiter* delimiter = array_back(&scanner->delimiters);
         int32_t end_char = end_character(delimiter);
         bool has_content = advanced_once;
         while (lexer->lookahead) {
@@ -361,8 +361,8 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
     return false;
 }
 
-unsigned tree_sitter_python_external_scanner_serialize(void *payload, char *buffer) {
-    Scanner *scanner = (Scanner *)payload;
+unsigned tree_sitter_python_external_scanner_serialize(void* payload, char* buffer) {
+    Scanner* scanner = (Scanner*)payload;
 
     size_t size = 0;
 
@@ -389,8 +389,8 @@ unsigned tree_sitter_python_external_scanner_serialize(void *payload, char *buff
     return size;
 }
 
-void tree_sitter_python_external_scanner_deserialize(void *payload, const char *buffer, unsigned length) {
-    Scanner *scanner = (Scanner *)payload;
+void tree_sitter_python_external_scanner_deserialize(void* payload, const char* buffer, unsigned length) {
+    Scanner* scanner = (Scanner*)payload;
 
     array_delete(&scanner->delimiters);
     array_delete(&scanner->indents);
@@ -416,21 +416,21 @@ void tree_sitter_python_external_scanner_deserialize(void *payload, const char *
     }
 }
 
-void *tree_sitter_python_external_scanner_create() {
+void* tree_sitter_python_external_scanner_create() {
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
     _Static_assert(sizeof(Delimiter) == sizeof(char), "");
 #else
     assert(sizeof(Delimiter) == sizeof(char));
 #endif
-    Scanner *scanner = calloc(1, sizeof(Scanner));
+    Scanner* scanner = calloc(1, sizeof(Scanner));
     array_init(&scanner->indents);
     array_init(&scanner->delimiters);
     tree_sitter_python_external_scanner_deserialize(scanner, NULL, 0);
     return scanner;
 }
 
-void tree_sitter_python_external_scanner_destroy(void *payload) {
-    Scanner *scanner = (Scanner *)payload;
+void tree_sitter_python_external_scanner_destroy(void* payload) {
+    Scanner* scanner = (Scanner*)payload;
     array_delete(&scanner->indents);
     array_delete(&scanner->delimiters);
     free(scanner);
