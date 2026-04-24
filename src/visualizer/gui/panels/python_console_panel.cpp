@@ -17,10 +17,10 @@
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/ElementDocument.h>
+#include <RmlUi/Core/Elements/ElementFormControlInput.h>
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/EventListener.h>
 #include <RmlUi/Core/StringUtilities.h>
-#include <RmlUi/Core/Elements/ElementFormControlInput.h>
 #include <SDL3/SDL_clipboard.h>
 #include <SDL3/SDL_scancode.h>
 #include <atomic>

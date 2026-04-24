@@ -2968,7 +2968,7 @@ namespace lfs::vis::editor {
             impl_->mouse_y = mouse.y;
             impl_->mouse_pos_valid = true;
             const float wheel = event.GetParameter("wheel_delta_y",
-                                event.GetParameter("wheel_delta", 0.0f));
+                                                   event.GetParameter("wheel_delta", 0.0f));
             impl_->editor->OnMouseWheel(mouse, -wheel);
             event.StopPropagation();
             return;
