@@ -7,16 +7,26 @@
 #include <thread>
 #include <vector>
 
+#include "core/parameters.hpp"
 #include "core/point_cloud.hpp"
 #include "core/scene.hpp"
 #include "core/tensor.hpp"
 #include "python/python_runtime.hpp"
+#include "training/training_setup.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 
 namespace lfs::python {
 
     namespace {
-        std::unique_ptr<core::SplatData> make_test_splat(size_t count) {
+        size_t sh_rest_coefficients_for_degree(const int degree) {
+            if (degree <= 0) {
+                return 0;
+            }
+            const auto d = static_cast<size_t>(degree);
+            return (d + 1) * (d + 1) - 1;
+        }
+
+        std::unique_ptr<core::SplatData> make_test_splat(size_t count, const int sh_degree = 0) {
             std::vector<float> means(count * 3, 0.0f);
             std::vector<float> rotations(count * 4, 0.0f);
             for (size_t i = 0; i < count; ++i) {
@@ -25,14 +35,27 @@ namespace lfs::python {
             }
 
             return std::make_unique<core::SplatData>(
-                0,
+                sh_degree,
                 core::Tensor::from_vector(means, {count, size_t{3}}, core::Device::CPU),
                 core::Tensor::zeros({count, size_t{1}, size_t{3}}, core::Device::CPU, core::DataType::Float32),
-                core::Tensor::zeros({count, size_t{0}, size_t{3}}, core::Device::CPU, core::DataType::Float32),
+                core::Tensor::zeros({count, sh_rest_coefficients_for_degree(sh_degree), size_t{3}}, core::Device::CPU, core::DataType::Float32),
                 core::Tensor::zeros({count, size_t{3}}, core::Device::CPU, core::DataType::Float32),
                 core::Tensor::from_vector(rotations, {count, size_t{4}}, core::Device::CPU),
                 core::Tensor::zeros({count, size_t{1}}, core::Device::CPU, core::DataType::Float32),
                 1.0f);
+        }
+
+        void expect_sh_degree(const core::SplatData& splat, const int sh_degree, const size_t count) {
+            const size_t expected_rest_coeffs = sh_rest_coefficients_for_degree(sh_degree);
+
+            EXPECT_EQ(splat.get_max_sh_degree(), sh_degree);
+            EXPECT_EQ(splat.get_active_sh_degree(), sh_degree);
+            ASSERT_TRUE(splat.shN().is_valid());
+            ASSERT_EQ(splat.shN().ndim(), 3);
+            EXPECT_EQ(splat.shN().shape()[0], count);
+            EXPECT_EQ(splat.shN().shape()[1], expected_rest_coeffs);
+            EXPECT_EQ(splat.shN().shape()[2], size_t{3});
+            EXPECT_EQ(splat.get_shs().shape()[1], expected_rest_coeffs + 1);
         }
     } // namespace
 
@@ -177,6 +200,43 @@ namespace lfs::python {
         ASSERT_NE(count_it, counts.end());
         EXPECT_EQ(count_it->second, 6u);
         EXPECT_EQ(dummy_scene_.getTrainingModelGaussianCount(), 6u);
+    }
+
+    TEST_F(SceneValidityTest, SplatDataSetSHDegreeSupportsAllDegrees) {
+        constexpr size_t count = 4;
+
+        for (const int target_degree : {0, 1, 2, 3}) {
+            auto splat = make_test_splat(count, 3);
+
+            splat->set_sh_degree(target_degree);
+
+            expect_sh_degree(*splat, target_degree, count);
+        }
+    }
+
+    TEST_F(SceneValidityTest, SplatDataSetSHDegreeCanExpandMissingCoefficients) {
+        constexpr size_t count = 4;
+        auto splat = make_test_splat(count, 0);
+
+        EXPECT_TRUE(splat->set_sh_degree(2));
+
+        expect_sh_degree(*splat, 2, count);
+    }
+
+    TEST_F(SceneValidityTest, InitializeTrainingModelAdjustsExistingTrainingModelSHDegree) {
+        constexpr size_t count = 4;
+        dummy_scene_.addNode("Model", make_test_splat(count, 3));
+        dummy_scene_.setTrainingModelNode("Model");
+
+        core::param::TrainingParameters params;
+        params.optimization.sh_degree = 1;
+
+        const auto result = lfs::training::initializeTrainingModel(params, dummy_scene_);
+
+        ASSERT_TRUE(result.has_value()) << result.error();
+        const auto* model = dummy_scene_.getTrainingModel();
+        ASSERT_NE(model, nullptr);
+        expect_sh_degree(*model, 1, count);
     }
 
     TEST_F(SceneValidityTest, SceneManagerEmptyStateKeepsApplicationSceneContext) {
