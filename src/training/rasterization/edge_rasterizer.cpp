@@ -4,8 +4,8 @@
 
 #include "edge_rasterizer.hpp"
 #include "core/cuda/memory_arena.hpp"
-#include <edge_rasterization_api.h>
 #include <cassert>
+#include <edge_rasterization_api.h>
 
 namespace lfs::training {
 

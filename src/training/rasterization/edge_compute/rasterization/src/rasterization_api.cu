@@ -12,8 +12,8 @@
 #include "utils.h"
 #include <cuda_runtime.h>
 #include <functional>
-#include <string>
 #include <stdexcept>
+#include <string>
 
 namespace edge_compute::rasterization {
 

@@ -44,4 +44,4 @@ namespace fast_lfs::rasterization {
         const float far,
         bool mip_filter);
 
-}
+} // namespace fast_lfs::rasterization
