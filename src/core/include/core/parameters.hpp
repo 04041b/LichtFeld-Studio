@@ -238,6 +238,9 @@ namespace lfs::core {
             bool invert_masks = false;
             float mask_threshold = 0.5f;
 
+            // Not serialized — UI-controlled per import.
+            std::string centralize_dataset = "off";
+
             nlohmann::json to_json() const;
             static DatasetConfig from_json(const nlohmann::json& j);
         };
