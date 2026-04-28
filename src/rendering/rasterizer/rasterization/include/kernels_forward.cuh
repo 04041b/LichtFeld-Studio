@@ -359,16 +359,15 @@ namespace lfs::rendering::kernels::forward {
 
         float3 cov2d = kernels::project_cov3d(proj.jw_r1, proj.jw_r2, cov3d);
 
-        cov2d.x += config::pre_blur_amount;
-        cov2d.z += config::pre_blur_amount;
-        const float det_orig = fmaxf(cov2d.x * cov2d.z - cov2d.y * cov2d.y, 0.0f);
-        cov2d.x += config::blur_amount;
-        cov2d.z += config::blur_amount;
+        const float det_raw = mip_filter ? fmaxf(cov2d.x * cov2d.z - cov2d.y * cov2d.y, 0.0f) : 0.0f;
+        const float kernel_size = mip_filter ? config::dilation_mip_filter : config::dilation;
+        cov2d.x += kernel_size;
+        cov2d.z += kernel_size;
         const float det_for_opacity = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
         if (det_for_opacity < 1e-8f)
             active = false;
         const float det_for_opacity_safe = fmaxf(det_for_opacity, 1e-8f);
-        const float output_opacity = opacity * sqrtf(det_orig / det_for_opacity_safe);
+        const float output_opacity = mip_filter ? opacity * sqrtf(det_raw / det_for_opacity_safe) : opacity;
         const bool low_opacity_query_only = active &&
                                             output_opacity < config::min_alpha_threshold && include_low_opacity_selection_queries;
         if (output_opacity < config::min_alpha_threshold && !include_low_opacity_selection_queries)

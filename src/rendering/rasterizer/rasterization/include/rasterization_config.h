@@ -10,8 +10,8 @@
 
 namespace lfs::rendering::config {
     DEF bool debug = false;
-    DEF float pre_blur_amount = 0.0f;
-    DEF float blur_amount = 0.3f;
+    DEF float dilation = 0.3f;                  // Standard dilation when mip_filter OFF
+    DEF float dilation_mip_filter = 0.1f;       // Smaller dilation when mip_filter ON
     DEF float max_stddev = 2.8284271247461903f; // sqrt(8)
     DEF float max_power_threshold = 4.0f;       // 0.5 * max_stddev^2
     DEF float min_alpha_threshold = 0.5f / 255.0f;
