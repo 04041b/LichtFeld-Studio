@@ -24,6 +24,8 @@ namespace lfs::vis {
         int width;
         int height;
         float fov;
+        bool orthographic = false;
+        float ortho_scale = 100.0f;
     };
 
     struct SetViewParams {

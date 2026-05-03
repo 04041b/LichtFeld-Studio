@@ -798,6 +798,8 @@ namespace lfs::python {
             .height = view_info->height,
             .fov_x = vertical_fov_to_horizontal_fov(view_info->fov, view_info->width, view_info->height),
             .fov_y = view_info->fov,
+            .orthographic = view_info->orthographic,
+            .ortho_scale = view_info->ortho_scale,
         };
     }
 
@@ -834,6 +836,15 @@ namespace lfs::python {
             .def_ro("height", &PyViewInfo::height)
             .def_ro("fov_x", &PyViewInfo::fov_x)
             .def_ro("fov_y", &PyViewInfo::fov_y)
+            .def_ro("orthographic", &PyViewInfo::orthographic)
+            .def_ro("ortho_scale", &PyViewInfo::ortho_scale)
+            .def_prop_ro(
+                "ortho_view_extent_world", [](const PyViewInfo& self) -> float {
+                    if (!self.orthographic || self.ortho_scale <= 0.0f)
+                        return 0.0f;
+                    return static_cast<float>(self.height) / self.ortho_scale;
+                },
+                "Vertical view extent in world units (Blender-compatible orthographic scale). Larger when zoomed out, smaller when zoomed in.")
             .def_prop_ro(
                 "position", [](const PyViewInfo& self) -> std::tuple<float, float, float> {
                     auto t = self.translation.tensor().cpu();

@@ -26,6 +26,8 @@ namespace lfs::python {
         int height;
         float fov_x;
         float fov_y;
+        bool orthographic;
+        float ortho_scale;
     };
 
     struct PyViewportRender {
