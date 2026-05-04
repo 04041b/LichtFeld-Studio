@@ -17,7 +17,6 @@
 #include <cmath>
 #include <glm/gtc/quaternion.hpp>
 #include <string>
-#include <imgui.h>
 
 namespace lfs::vis::tools {
 
@@ -25,11 +24,11 @@ namespace lfs::vis::tools {
 
         constexpr lfs::rendering::OverlayColor kOverlayShadow{0.0f, 0.0f, 0.0f, 180.0f / 255.0f};
 
-        [[nodiscard]] lfs::rendering::OverlayColor toOverlay(const ImVec4& c) {
+        [[nodiscard]] lfs::rendering::OverlayColor toOverlay(const auto& c) {
             return {c.x, c.y, c.z, c.w};
         }
 
-        [[nodiscard]] lfs::rendering::OverlayColor toOverlay(const ImVec4& c, float alpha) {
+        [[nodiscard]] lfs::rendering::OverlayColor toOverlay(const auto& c, float alpha) {
             return {c.x, c.y, c.z, alpha};
         }
 
@@ -313,8 +312,10 @@ namespace lfs::vis::tools {
             {viewport_bounds.x, viewport_bounds.y},
             {viewport_bounds.x + viewport_bounds.width, viewport_bounds.y + viewport_bounds.height});
 
-        const ImVec2 mouse_pos = ImGui::GetMousePos();
-        const glm::vec2 mp{mouse_pos.x, mouse_pos.y};
+        float mouse_x = 0.0f;
+        float mouse_y = 0.0f;
+        SDL_GetMouseState(&mouse_x, &mouse_y);
+        const glm::vec2 mp{mouse_x, mouse_y};
         const auto& t = theme();
         const auto sel_border = toOverlay(t.palette.primary, 0.85f);
 
