@@ -1,12 +1,7 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-// clang-format off
-#include <glad/glad.h>
-// clang-format on
-
 #include "gui/film_strip_renderer.hpp"
-#include "core/logger.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
 #include "sequencer/sequencer_controller.hpp"
@@ -18,45 +13,6 @@
 #include <limits>
 
 namespace lfs::vis::gui {
-
-    void FilmStripRenderer::initGL() {
-        if (gl_initialized_ || gl_init_failed_)
-            return;
-
-        glGenFramebuffers(1, fbo_.ptr());
-        glGenRenderbuffers(1, depth_rbo_.ptr());
-
-        glBindRenderbuffer(GL_RENDERBUFFER, depth_rbo_.get());
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, THUMB_WIDTH, THUMB_HEIGHT);
-        glBindRenderbuffer(GL_RENDERBUFFER, 0);
-
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo_.get());
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth_rbo_.get());
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        for (auto& slot : slots_) {
-            glGenTextures(1, slot.texture.ptr());
-            glBindTexture(GL_TEXTURE_2D, slot.texture.get());
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, THUMB_WIDTH, THUMB_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        }
-        glBindTexture(GL_TEXTURE_2D, 0);
-
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo_.get());
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slots_[0].texture.get(), 0);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-            LOG_ERROR("Film strip FBO incomplete");
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            gl_init_failed_ = true;
-            return;
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        gl_initialized_ = true;
-    }
 
     int FilmStripRenderer::findSlot(const float time, const float tolerance,
                                     const std::array<bool, MAX_SLOTS>& claimed_slots) const {
@@ -106,15 +62,9 @@ namespace lfs::vis::gui {
         const auto state = timeline.evaluate(time);
         const glm::mat3 cam_rot = glm::mat3_cast(state.rotation);
 
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo_.get());
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                               slots_[slot_idx].texture.get(), 0);
-
-        const bool ok = rm->renderPreviewFrame(sm, cam_rot, state.position, state.focal_length_mm,
-                                               fbo_, slots_[slot_idx].texture,
-                                               THUMB_WIDTH, THUMB_HEIGHT);
-
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        const auto image = rm->renderPreviewImage(sm, cam_rot, state.position, state.focal_length_mm,
+                                                  THUMB_WIDTH, THUMB_HEIGHT);
+        const bool ok = image && slots_[slot_idx].texture.upload(*image, THUMB_WIDTH, THUMB_HEIGHT);
 
         if (ok) {
             slots_[slot_idx].time = time;
@@ -174,11 +124,7 @@ namespace lfs::vis::gui {
         float anim_end = 0.0f;
 
         if (has_animation && rm && sm && num_thumbs > 0) {
-            if (!gl_initialized_)
-                initGL();
-
-            if (gl_initialized_) {
-                ++frame_counter_;
+            ++frame_counter_;
                 visible_slot_assignments_.resize(static_cast<size_t>(num_thumbs), -1);
                 std::array<bool, MAX_SLOTS> claimed_slots{};
 
@@ -332,7 +278,6 @@ namespace lfs::vis::gui {
                 }
                 if (burst_remaining_ > 0)
                     --burst_remaining_;
-            }
         } else {
             last_hover_focus_time_.reset();
             visible_slot_assignments_.clear();
@@ -363,11 +308,11 @@ namespace lfs::vis::gui {
         }
     }
 
-    unsigned int FilmStripRenderer::textureIdForSlot(const int slot_idx) const {
+    std::uintptr_t FilmStripRenderer::textureIdForSlot(const int slot_idx) const {
         if (slot_idx < 0 || slot_idx >= MAX_SLOTS)
             return 0;
         const auto& slot = slots_[slot_idx];
-        return slot.valid ? slot.texture.get() : 0;
+        return slot.valid ? slot.texture.textureId() : 0;
     }
 
     bool FilmStripRenderer::slotIsCurrentGeneration(const int slot_idx) const {
@@ -382,16 +327,12 @@ namespace lfs::vis::gui {
         burst_remaining_ = BURST_FRAMES;
     }
 
-    void FilmStripRenderer::destroyGLResources() {
+    void FilmStripRenderer::destroyGraphicsResources() {
         for (auto& slot : slots_) {
-            slot.texture = {};
+            slot.texture.reset();
             slot.valid = false;
             slot.generation = 0;
         }
-        fbo_ = {};
-        depth_rbo_ = {};
-        gl_initialized_ = false;
-        gl_init_failed_ = false;
         generation_ = 0;
         burst_remaining_ = 0;
         hover_state_.reset();
