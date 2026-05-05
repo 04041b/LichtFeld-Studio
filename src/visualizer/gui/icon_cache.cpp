@@ -2,8 +2,8 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core/image_io.hpp"
 #include "icon_cache.hpp"
+#include "core/image_io.hpp"
 #include "internal/resource_paths.hpp"
 
 #include <cstdint>

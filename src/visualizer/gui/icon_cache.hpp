@@ -8,8 +8,8 @@
 #include "gui/vulkan_ui_texture.hpp"
 
 #include <cstdint>
-#include <mutex>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 

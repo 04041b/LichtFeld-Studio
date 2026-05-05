@@ -9,8 +9,8 @@
 #include "rendering/render_constants.hpp"
 #include <algorithm>
 #include <array>
-#include <cstdint>
 #include <cmath>
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <optional>
 #include <string>

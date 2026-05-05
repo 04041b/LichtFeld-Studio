@@ -66,6 +66,7 @@ namespace lfs::vis {
         [[nodiscard]] Viewport& secondaryViewport() { return secondary_viewport_; }
         [[nodiscard]] const Viewport& secondaryViewport() const { return secondary_viewport_; }
         void updateInfo(const FrameResources& resources);
+
     private:
         enum class GTExitBehavior {
             PreserveCurrent,

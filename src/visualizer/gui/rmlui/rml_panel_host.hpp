@@ -136,7 +136,6 @@ namespace lfs::vis::gui {
         int last_forwarded_mx_ = -1;
         int last_forwarded_my_ = -1;
         bool last_hovered_ = false;
-
     };
 
 } // namespace lfs::vis::gui

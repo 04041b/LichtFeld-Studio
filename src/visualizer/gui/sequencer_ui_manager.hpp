@@ -5,13 +5,13 @@
 #pragma once
 
 #include "gui/film_strip_renderer.hpp"
-#include "gui/line_renderer.hpp"
-#include "gui/vulkan_ui_texture.hpp"
 #include "gui/keyframe_scene_sync.hpp"
+#include "gui/line_renderer.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/sequencer_ui_state.hpp"
 #include "gui/sequencer_viewport_edit_mode.hpp"
 #include "gui/ui_context.hpp"
+#include "gui/vulkan_ui_texture.hpp"
 #include "sequencer/rml_sequencer_panel.hpp"
 #include "sequencer/sequencer_controller.hpp"
 #include <chrono>

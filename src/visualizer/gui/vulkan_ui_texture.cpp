@@ -652,9 +652,9 @@ namespace lfs::vis::gui {
     }
 
     bool VulkanUiTexture::upload(const std::uint8_t* const pixels,
-                                    const int width,
-                                    const int height,
-                                    const int channels) {
+                                 const int width,
+                                 const int height,
+                                 const int channels) {
         if (!impl_) {
             impl_ = new Impl();
         }
@@ -676,8 +676,8 @@ namespace lfs::vis::gui {
     }
 
     bool VulkanUiTexture::upload(const lfs::core::Tensor& image,
-                                    const int expected_width,
-                                    const int expected_height) {
+                                 const int expected_width,
+                                 const int expected_height) {
         if (!impl_) {
             impl_ = new Impl();
         }

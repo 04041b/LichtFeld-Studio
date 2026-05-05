@@ -109,7 +109,8 @@ namespace {
 
         constexpr auto messages = static_cast<EShMessages>(EShMsgSpvRules | EShMsgVulkanRules);
         if (!shader.parse(GetDefaultResources(), 450, false, messages)) {
-            std::cerr << "Failed to compile " << input << ":\n" << shader.getInfoLog() << '\n'
+            std::cerr << "Failed to compile " << input << ":\n"
+                      << shader.getInfoLog() << '\n'
                       << shader.getInfoDebugLog() << '\n';
             return std::nullopt;
         }
@@ -117,7 +118,8 @@ namespace {
         glslang::TProgram program;
         program.addShader(&shader);
         if (!program.link(messages)) {
-            std::cerr << "Failed to link " << input << ":\n" << program.getInfoLog() << '\n'
+            std::cerr << "Failed to link " << input << ":\n"
+                      << program.getInfoLog() << '\n'
                       << program.getInfoDebugLog() << '\n';
             return std::nullopt;
         }
@@ -165,7 +167,7 @@ namespace {
              << "} // namespace lfs::vis::viewport_shaders\n";
         return true;
     }
-}
+} // namespace
 
 int main(const int argc, char** argv) {
     const auto args = parseArgs(argc, argv);

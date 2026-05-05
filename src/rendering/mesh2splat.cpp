@@ -466,11 +466,11 @@ void main() {
         }
 
         [[nodiscard]] glm::vec4 compute_face_tangent(const glm::vec3& v0,
-                                                      const glm::vec3& v1,
-                                                      const glm::vec3& v2,
-                                                      const glm::vec2& uv0,
-                                                      const glm::vec2& uv1,
-                                                      const glm::vec2& uv2) {
+                                                     const glm::vec3& v1,
+                                                     const glm::vec3& v2,
+                                                     const glm::vec2& uv0,
+                                                     const glm::vec2& uv1,
+                                                     const glm::vec2& uv2) {
             const glm::vec3 dv1 = v1 - v0;
             const glm::vec3 dv2 = v2 - v0;
             const glm::vec2 duv1 = uv1 - uv0;
@@ -604,8 +604,8 @@ void main() {
         };
 
         [[nodiscard]] std::expected<std::vector<uint32_t>, std::string> compile_shader(std::string_view source,
-                                                                                        EShLanguage stage,
-                                                                                        const char* label) {
+                                                                                       EShLanguage stage,
+                                                                                       const char* label) {
             static std::mutex mutex;
             std::lock_guard lock(mutex);
             static GlslangLifetime lifetime;
@@ -756,8 +756,8 @@ void main() {
             [[nodiscard]] VkQueue queue() const { return queue_; }
 
             [[nodiscard]] uint32_t findMemoryType(uint32_t type_filter,
-                                                   VkMemoryPropertyFlags properties,
-                                                   std::string& error) const {
+                                                  VkMemoryPropertyFlags properties,
+                                                  std::string& error) const {
                 VkPhysicalDeviceMemoryProperties mem_properties{};
                 vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_properties);
                 for (uint32_t i = 0; i < mem_properties.memoryTypeCount; ++i) {
@@ -769,8 +769,8 @@ void main() {
             }
 
             [[nodiscard]] std::expected<Buffer, std::string> createBuffer(VkDeviceSize size,
-                                                                           VkBufferUsageFlags usage,
-                                                                           VkMemoryPropertyFlags properties) const {
+                                                                          VkBufferUsageFlags usage,
+                                                                          VkMemoryPropertyFlags properties) const {
                 Buffer out;
                 out.device = device_;
                 out.size = size;
@@ -803,9 +803,9 @@ void main() {
             }
 
             [[nodiscard]] std::expected<Image, std::string> createImage(uint32_t width,
-                                                                         uint32_t height,
-                                                                         VkFormat format,
-                                                                         VkImageUsageFlags usage) const {
+                                                                        uint32_t height,
+                                                                        VkFormat format,
+                                                                        VkImageUsageFlags usage) const {
                 Image out;
                 out.device = device_;
                 out.format = format;
@@ -1074,9 +1074,9 @@ void main() {
         }
 
         [[nodiscard]] std::expected<ShaderModule, std::string> create_shader_module(VkDevice device,
-                                                                                     std::string_view source,
-                                                                                     EShLanguage stage,
-                                                                                     const char* label) {
+                                                                                    std::string_view source,
+                                                                                    EShLanguage stage,
+                                                                                    const char* label) {
             auto spirv = compile_shader(source, stage, label);
             if (!spirv)
                 return std::unexpected(spirv.error());
@@ -1108,8 +1108,8 @@ void main() {
         }
 
         [[nodiscard]] std::expected<Image, std::string> upload_texture(VulkanMesh2SplatContext& ctx,
-                                                                        const TextureImage& img,
-                                                                        bool srgb) {
+                                                                       const TextureImage& img,
+                                                                       bool srgb) {
             if (img.width <= 0 || img.height <= 0 || img.pixels.empty())
                 return std::unexpected("Invalid Mesh2Splat texture image");
 
@@ -1208,8 +1208,8 @@ void main() {
         };
 
         [[nodiscard]] std::expected<std::vector<MaterialTextures>, std::string> upload_material_textures(VulkanMesh2SplatContext& ctx,
-                                                                                                          const MeshData& mesh,
-                                                                                                          const Image& dummy) {
+                                                                                                         const MeshData& mesh,
+                                                                                                         const Image& dummy) {
             (void)dummy;
             std::vector<MaterialTextures> textures(mesh.materials.size());
             for (size_t i = 0; i < mesh.materials.size(); ++i) {
@@ -1249,8 +1249,8 @@ void main() {
         }
 
         [[nodiscard]] std::unique_ptr<SplatData> build_splat_data(const std::vector<GaussianVertex>& data,
-                                                                   float scale_multiplier,
-                                                                   float scene_scale) {
+                                                                  float scale_multiplier,
+                                                                  float scene_scale) {
             const auto N = data.size();
             assert(N > 0);
 

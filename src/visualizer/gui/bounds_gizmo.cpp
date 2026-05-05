@@ -599,7 +599,7 @@ namespace lfs::vis::gui {
         draw_config.draw_list->PushClipRect(
             glm::vec2(draw_config.viewport_pos.x, draw_config.viewport_pos.y),
             glm::vec2(draw_config.viewport_pos.x + draw_config.viewport_size.x,
-                   draw_config.viewport_pos.y + draw_config.viewport_size.y),
+                      draw_config.viewport_pos.y + draw_config.viewport_size.y),
             true);
         drawBoundsRects(*draw_config.draw_list, projected_rects, rect_count);
         drawBoundsAnchors(*draw_config.draw_list, projected_rects, rect_count, highlighted);
