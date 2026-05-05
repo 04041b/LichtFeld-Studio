@@ -272,9 +272,11 @@ namespace lfs::vis {
         int last_camview_ = -1;
         int hovered_camera_id_ = -1;
         int last_clicked_camera_id_ = -1;
+        int pressed_camera_frustum_id_ = -1;
         bool press_selected_camera_frustum_ = false;
         std::chrono::steady_clock::time_point last_click_time_;
         glm::dvec2 last_click_pos_{0, 0};
+        glm::dvec2 pressed_camera_frustum_pos_{0, 0};
 
         // General double-click tracking
         std::chrono::steady_clock::time_point last_general_click_time_;

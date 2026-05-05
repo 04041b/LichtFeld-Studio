@@ -47,6 +47,7 @@ namespace lfs::vis {
     namespace {
         constexpr float kWasdShiftSpeedBonus = 20.0f;
         constexpr double kCameraContextMenuDragThreshold = 4.0;
+        constexpr double kCameraFrustumClickThreshold = 5.0;
         namespace string_keys = lichtfeld::Strings;
 
         [[nodiscard]] bool isTransformGizmoOverOrUsing() {
@@ -299,6 +300,7 @@ namespace lfs::vis {
             drag_mode_ = DragMode::None;
             clearSelectedCameraContextMenuGesture();
             press_selected_camera_frustum_ = false;
+            pressed_camera_frustum_id_ = -1;
             std::fill(std::begin(keys_movement_), std::end(keys_movement_), false);
             hovered_camera_id_ = -1;
 
@@ -457,13 +459,20 @@ namespace lfs::vis {
             action == input::ACTION_RELEASE &&
             is_left_button &&
             press_selected_camera_frustum_;
+        const int pressed_camera_frustum_id = pressed_camera_frustum_id_;
+        const glm::dvec2 pressed_camera_frustum_pos = pressed_camera_frustum_pos_;
         if (action == input::ACTION_PRESS && is_left_button)
             press_selected_camera_frustum_ = false;
-        if (action == input::ACTION_RELEASE && is_left_button)
+        if (action == input::ACTION_PRESS && is_left_button)
+            pressed_camera_frustum_id_ = -1;
+        if (action == input::ACTION_RELEASE && is_left_button) {
             press_selected_camera_frustum_ = false;
+            pressed_camera_frustum_id_ = -1;
+        }
         const bool over_gizmo = gui && gui->gizmo().isPositionInViewportGizmo(x, y);
         const bool over_gui = isPointerOverBlockingUi(x, y);
         const bool over_gui_hover = isPointerOverUiHover(x, y);
+        const bool over_transform_gizmo = isTransformGizmoOverOrUsing();
 
         // Consume all mouse events while pie menu is open
         if (gui && gui->gizmo().isPieMenuOpen()) {
@@ -503,8 +512,10 @@ namespace lfs::vis {
             bool is_double_click = (time_since_last < MOUSE_DOUBLE_CLICK_TIME &&
                                     dist < MOUSE_DOUBLE_CLICK_DISTANCE);
 
-            // If we have a hovered camera, check for double-click
-            if (hovered_camera_id_ >= 0) {
+            // If we have a hovered camera, check for double-click. Defer
+            // single-click selection until release so orbit drags that start
+            // over dataset image frustums do not change the node selection.
+            if (hovered_camera_id_ >= 0 && !over_gizmo && !over_transform_gizmo) {
                 if (is_double_click && hovered_camera_id_ == last_clicked_camera_id_) {
                     cmd::GoToCamView{.cam_id = hovered_camera_id_}.emit();
 
@@ -517,7 +528,8 @@ namespace lfs::vis {
                 last_click_time_ = now;
                 last_click_pos_ = {x, y};
                 last_clicked_camera_id_ = hovered_camera_id_;
-                selectCameraByUid(hovered_camera_id_);
+                pressed_camera_frustum_id_ = hovered_camera_id_;
+                pressed_camera_frustum_pos_ = {x, y};
                 press_selected_camera_frustum_ = true;
             } else {
                 last_click_time_ = std::chrono::steady_clock::time_point();
@@ -579,7 +591,7 @@ namespace lfs::vis {
             }
 
             // Block if a transform gizmo is being used or hovered
-            if (isTransformGizmoOverOrUsing()) {
+            if (over_transform_gizmo) {
                 return;
             }
 
@@ -696,7 +708,7 @@ namespace lfs::vis {
             case input::Action::SELECTION_ADD:
             case input::Action::SELECTION_REMOVE:
                 if (!over_gui && !over_gizmo && tool_context_ &&
-                    !isTransformGizmoOverOrUsing()) {
+                    !over_transform_gizmo) {
                     if (selection_tool_ && selection_tool_->isEnabled()) {
                         // Invoke selection stroke operator
                         auto* gm = services().guiOrNull();
@@ -769,7 +781,7 @@ namespace lfs::vis {
                                                drag_action == input::Action::NODE_RECT_SELECT);
 
                 if (!over_gui && !over_gizmo && is_left_button && tool_context_ &&
-                    !isTransformGizmoOverOrUsing() && has_node_binding) {
+                    !over_transform_gizmo && has_node_binding) {
                     is_node_rect_dragging_ = true;
                     node_rect_panel_ = splitPanelForScreenX(x);
                     node_rect_start_ = glm::vec2(static_cast<float>(x), static_cast<float>(y));
@@ -826,6 +838,20 @@ namespace lfs::vis {
                     .translation = moved_viewport->getTranslation()}
                     .emit();
                 onCameraMovementEnd();
+            }
+
+            if (press_consumed_camera_frustum) {
+                const double drag_dist = glm::length(glm::dvec2(x, y) - pressed_camera_frustum_pos);
+                if (pressed_camera_frustum_id >= 0 &&
+                    drag_dist < kCameraFrustumClickThreshold &&
+                    !over_gui &&
+                    !over_transform_gizmo) {
+                    selectCameraByUid(pressed_camera_frustum_id);
+                }
+                if (is_left_button) {
+                    is_node_rect_dragging_ = false;
+                }
+                return;
             }
 
             // Node picking on release
@@ -939,6 +965,9 @@ namespace lfs::vis {
             return;
         }
 
+        const bool over_viewport_gizmo = gui && gui->gizmo().isPositionInViewportGizmo(x, y);
+        const bool over_transform_gizmo = isTransformGizmoOverOrUsing();
+
         if (drag_mode_ == DragMode::Splitter && services().renderingOrNull()) {
             const auto viewport_size = glm::ivec2(static_cast<int>(viewport_bounds_.width),
                                                   static_cast<int>(viewport_bounds_.height));
@@ -967,7 +996,9 @@ namespace lfs::vis {
         if (services().renderingOrNull() &&
             isInViewport(x, y) &&
             drag_mode_ == DragMode::None &&
-            !over_gui) {
+            !over_gui &&
+            !over_viewport_gizmo &&
+            !over_transform_gizmo) {
 
             // Additional throttling based on movement distance
             static glm::dvec2 last_pick_pos{-1, -1};
@@ -1532,6 +1563,8 @@ namespace lfs::vis {
             drag_mode_ = DragMode::None;
             drag_button_ = -1;
             drag_viewport_ = nullptr;
+            press_selected_camera_frustum_ = false;
+            pressed_camera_frustum_id_ = -1;
 
             ui::CameraMove{
                 .rotation = released_viewport->getRotationMatrix(),
@@ -1544,12 +1577,16 @@ namespace lfs::vis {
             drag_mode_ = DragMode::None;
             drag_button_ = -1;
             drag_viewport_ = nullptr;
+            press_selected_camera_frustum_ = false;
+            pressed_camera_frustum_id_ = -1;
         }
 
         if (drag_mode_ == DragMode::Rotate && drag_button_released) {
             drag_mode_ = DragMode::None;
             drag_button_ = -1;
             drag_viewport_ = nullptr;
+            press_selected_camera_frustum_ = false;
+            pressed_camera_frustum_id_ = -1;
         }
 
         if (drag_mode_ == DragMode::Splitter &&
@@ -1557,12 +1594,15 @@ namespace lfs::vis {
             drag_mode_ = DragMode::None;
             drag_button_ = -1;
             press_selected_camera_frustum_ = false;
+            pressed_camera_frustum_id_ = -1;
             SDL_SetCursor(SDL_GetDefaultCursor());
         }
 
         if (drag_mode_ == DragMode::Brush && drag_button_released) {
             drag_mode_ = DragMode::None;
             drag_button_ = -1;
+            press_selected_camera_frustum_ = false;
+            pressed_camera_frustum_id_ = -1;
         }
 
         // Sync movement key states with actual keyboard (using cached keys)
@@ -2105,6 +2145,7 @@ namespace lfs::vis {
         drag_split_panel_ = SplitViewPanelId::Left;
         clearSelectedCameraContextMenuGesture();
         press_selected_camera_frustum_ = false;
+        pressed_camera_frustum_id_ = -1;
 
         if (was_camera_drag) {
             onCameraMovementEnd();
