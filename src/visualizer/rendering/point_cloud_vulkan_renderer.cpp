@@ -873,15 +873,20 @@ namespace lfs::vis {
             // size change would otherwise destroy images the in-flight submit
             // is still sampling.
             vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
-            // Also wait for the VulkanContext's in-flight frame fence. pcFence signals
-            // when CB1 (point cloud render) finishes, but the VulkanContext's CB2
-            // (which reads the output image) may still be executing. If ensureOutputImages
-            // destroys the slot on a resize while CB2 is in-flight, the GPU reads freed
-            // memory → VK_ERROR_DEVICE_LOST.
-            context->waitForSubmittedFrames();
-            vkResetFences(device, 1, &fence);
 
             auto& slot = slots[slot_idx];
+            const bool will_recreate = slot.color_image == VK_NULL_HANDLE ||
+                                       slot.depth_image == VK_NULL_HANDLE ||
+                                       slot.size != req.size;
+            if (will_recreate) {
+                // pcFence covers this renderer's CB only; the context's frame CB also
+                // samples slot.color_image and must finish before destroySlot frees it.
+                if (!context->waitForSubmittedFrames()) {
+                    return std::unexpected<std::string>(
+                        std::format("waitForSubmittedFrames failed before slot recreate: {}",
+                                    context->lastError()));
+                }
+            }
             if (auto r = ensureOutputImages(slot, req.size); !r) {
                 return std::unexpected<std::string>(r.error());
             }
@@ -1017,6 +1022,10 @@ namespace lfs::vis {
             si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             si.commandBufferCount = 1;
             si.pCommandBuffers = &command_buffer;
+            r = vkResetFences(device, 1, &fence);
+            if (r != VK_SUCCESS) {
+                return std::unexpected<std::string>(vkError("vkResetFences", r));
+            }
             r = vkQueueSubmit(context->graphicsQueue(), 1, &si, fence);
             if (r != VK_SUCCESS) {
                 return std::unexpected<std::string>(vkError("vkQueueSubmit", r));
