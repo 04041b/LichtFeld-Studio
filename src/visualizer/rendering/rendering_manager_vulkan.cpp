@@ -1203,13 +1203,24 @@ namespace lfs::vis {
 
                         // VkSplat returns early before the shared mesh-frame setup
                         // below. Republish it here so the viewport pass sees the
-                        // current camera; vksplat doesn't expose splat depth, so
-                        // depth_blit stays empty (mesh and splat composite without
-                        // splat→mesh z-test, same as before this branch existed).
+                        // current camera and can depth-test meshes against the
+                        // GPU-native VkSplat depth image.
                         if (!frame_ctx.scene_state.meshes.empty() ||
                             environmentBackgroundEnabled(settings_)) {
                             auto mesh_frame = populateMeshFrame(frame_ctx, settings_, pending_split_view);
                             populate_independent_split_mesh_panels(mesh_frame);
+                            if (render_result->depth_image_view != VK_NULL_HANDLE) {
+                                mesh_frame.depth_blit.external_image_view = render_result->depth_image_view;
+                                mesh_frame.depth_blit.external_image_generation = render_result->depth_generation;
+                                mesh_frame.depth_blit.depth_is_ndc = false;
+                                mesh_frame.depth_blit.flip_y = render_result->flip_y;
+                                mesh_frame.depth_blit.near_plane = request.frame_view.near_plane > 0.0f
+                                                                       ? request.frame_view.near_plane
+                                                                       : 0.1f;
+                                mesh_frame.depth_blit.far_plane = request.frame_view.far_plane > 0.0f
+                                                                      ? request.frame_view.far_plane
+                                                                      : 1000.0f;
+                            }
                             setVulkanMeshFrame(std::move(mesh_frame));
                         } else {
                             clearVulkanMeshFrame();
@@ -1261,7 +1272,10 @@ namespace lfs::vis {
                 rendered_metadata.depth_panels[0].depth->is_valid()) {
                 gpu_mesh_frame.depth_blit.depth = rendered_metadata.depth_panels[0].depth;
                 gpu_mesh_frame.depth_blit.depth_is_ndc = rendered_metadata.depth_is_ndc;
-                gpu_mesh_frame.depth_blit.flip_y = !rendered_metadata.flip_y;
+                // Depth and color tensors share storage orientation; the viewport
+                // pass already flips the screen quad's UVs for the color image,
+                // so the depth-blit pass inherits that flip and needs no extra one.
+                gpu_mesh_frame.depth_blit.flip_y = false;
                 gpu_mesh_frame.depth_blit.near_plane = rendered_metadata.near_plane > 0.0f
                                                            ? rendered_metadata.near_plane
                                                            : 0.1f;
