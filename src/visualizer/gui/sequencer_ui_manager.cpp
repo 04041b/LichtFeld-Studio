@@ -1264,7 +1264,8 @@ namespace lfs::vis::gui {
 
         const auto image = rm->renderPreviewImage(sm, cam_rot, cam_pos, cam_focal_length_mm,
                                                   PREVIEW_WIDTH, PREVIEW_HEIGHT);
-        if (image && pip_texture_.upload(*image, PREVIEW_WIDTH, PREVIEW_HEIGHT)) {
+        // Rasterizer output uses OpenGL (bottom-left) origin; RmlUi samples top-left, so flip on upload.
+        if (image && pip_texture_.upload(*image, PREVIEW_WIDTH, PREVIEW_HEIGHT, /*flip_y=*/true)) {
             pip_last_render_time_ = now;
             if (!is_playing) {
                 pip_last_keyframe_ = selected;
@@ -1324,7 +1325,8 @@ namespace lfs::vis::gui {
                                         }();
 
         overlay_->showPreviewWindow(left, top, scaled_width, scaled_height,
-                                    title, is_playing, pip_texture_.textureId());
+                                    title, is_playing,
+                                    pip_texture_.rmlSrcUrl(PREVIEW_WIDTH, PREVIEW_HEIGHT));
     }
 
     void SequencerUIManager::renderKeyframeEditOverlay(const ViewportLayout& viewport) {

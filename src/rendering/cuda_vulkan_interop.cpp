@@ -258,6 +258,7 @@ namespace lfs::rendering {
             int channels,
             CudaVulkanTensorLayout layout,
             CudaVulkanTensorElementType element_type,
+            bool flip_y,
             const cudaStream_t stream);
         [[nodiscard]] cudaError_t launchCudaVulkanCopyTensorToSurfaceR32f(
             cudaSurfaceObject_t surface,
@@ -266,6 +267,7 @@ namespace lfs::rendering {
             std::uint32_t height,
             int channels,
             CudaVulkanTensorLayout layout,
+            bool flip_y,
             const cudaStream_t stream);
     } // namespace detail
 
@@ -468,15 +470,16 @@ namespace lfs::rendering {
         return staging_tensor_;
     }
 
-    bool CudaVulkanInterop::copyViewToSurface(const cudaStream_t stream) const {
+    bool CudaVulkanInterop::copyViewToSurface(const cudaStream_t stream, const bool flip_y) const {
         if (!staging_tensor_.is_valid()) {
             return fail("CUDA/Vulkan interop staging tensor has not been requested");
         }
-        return copyTensorToSurface(staging_tensor_, stream);
+        return copyTensorToSurface(staging_tensor_, stream, flip_y);
     }
 
     bool CudaVulkanInterop::copyTensorToSurface(const lfs::core::Tensor& tensor,
-                                                const cudaStream_t stream) const {
+                                                const cudaStream_t stream,
+                                                const bool flip_y) const {
         last_error_.clear();
         if (!valid()) {
             return fail("CUDA/Vulkan interop target is not initialized");
@@ -505,6 +508,7 @@ namespace lfs::rendering {
                 extent_.height,
                 prepared.channels,
                 prepared.layout,
+                flip_y,
                 stream);
         } else {
             status = detail::launchCudaVulkanCopyTensorToSurface(
@@ -515,6 +519,7 @@ namespace lfs::rendering {
                 prepared.channels,
                 prepared.layout,
                 prepared.element_type,
+                flip_y,
                 stream);
         }
         return failCuda("copy tensor to CUDA surface", status);

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <optional>
 #include <semaphore>
@@ -95,6 +96,75 @@ namespace {
         return source.rfind("preview://", 0) == 0;
     }
 
+    bool IsLfsVkTextureSource(std::string_view source) {
+        return source.rfind("lfs-vk://", 0) == 0;
+    }
+
+    struct LfsVkTextureRequest {
+        VkImageView image_view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        int width = 0;
+        int height = 0;
+    };
+
+    std::optional<std::uintptr_t> ParseHexHandle(std::string_view value) {
+        if (value.empty())
+            return std::nullopt;
+        std::uintptr_t parsed = 0;
+        const auto* first = value.data();
+        const auto* last = value.data() + value.size();
+        const auto [ptr, ec] = std::from_chars(first, last, parsed, 16);
+        if (ec != std::errc() || ptr != last)
+            return std::nullopt;
+        return parsed;
+    }
+
+    int ParseIntParam(std::string_view value) {
+        int parsed = 0;
+        const auto* first = value.data();
+        const auto* last = value.data() + value.size();
+        const auto [ptr, ec] = std::from_chars(first, last, parsed);
+        if (ec != std::errc() || ptr != last)
+            return 0;
+        return std::max(parsed, 0);
+    }
+
+    std::optional<LfsVkTextureRequest> ParseLfsVkTextureRequest(std::string_view source) {
+        if (!IsLfsVkTextureSource(source))
+            return std::nullopt;
+        source.remove_prefix(std::string_view("lfs-vk://").size());
+        if (!source.empty() && source.front() == '?')
+            source.remove_prefix(1);
+
+        LfsVkTextureRequest request;
+        while (!source.empty()) {
+            const size_t sep = source.find('&');
+            const std::string_view part = sep == std::string_view::npos ? source : source.substr(0, sep);
+            if (const size_t eq = part.find('='); eq != std::string_view::npos) {
+                const std::string_view key = part.substr(0, eq);
+                const std::string_view value = part.substr(eq + 1);
+                if (key == "v") {
+                    if (const auto h = ParseHexHandle(value))
+                        request.image_view = reinterpret_cast<VkImageView>(*h);
+                } else if (key == "s") {
+                    if (const auto h = ParseHexHandle(value))
+                        request.sampler = reinterpret_cast<VkSampler>(*h);
+                } else if (key == "w") {
+                    request.width = ParseIntParam(value);
+                } else if (key == "h") {
+                    request.height = ParseIntParam(value);
+                }
+            }
+            if (sep == std::string_view::npos)
+                break;
+            source.remove_prefix(sep + 1);
+        }
+        if (request.image_view == VK_NULL_HANDLE || request.sampler == VK_NULL_HANDLE ||
+            request.width <= 0 || request.height <= 0)
+            return std::nullopt;
+        return request;
+    }
+
     int HexValue(char c) {
         if (c >= '0' && c <= '9')
             return c - '0';
@@ -121,16 +191,6 @@ namespace {
             decoded.push_back(value[i] == '+' ? ' ' : value[i]);
         }
         return decoded;
-    }
-
-    int ParseIntParam(std::string_view value) {
-        int parsed = 0;
-        const auto* first = value.data();
-        const auto* last = value.data() + value.size();
-        const auto [ptr, ec] = std::from_chars(first, last, parsed);
-        if (ec != std::errc() || ptr != last)
-            return 0;
-        return std::max(parsed, 0);
     }
 
     std::optional<PreviewTextureRequest> ParsePreviewTextureRequest(std::string_view source) {
@@ -233,6 +293,19 @@ RenderInterface_VK::RenderInterface_VK() : m_is_transform_enabled{false},
 }
 
 RenderInterface_VK::~RenderInterface_VK() {}
+
+std::string RenderInterface_VK::MakeExternalTextureSource(VkImageView image_view, VkSampler sampler,
+                                                          int width, int height) {
+    if (image_view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE || width <= 0 || height <= 0)
+        return {};
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "lfs-vk://?v=%llx&s=%llx&w=%d&h=%d",
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(image_view)),
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(sampler)),
+                  width, height);
+    return std::string(buf);
+}
 
 Rml::CompiledGeometryHandle RenderInterface_VK::CompileGeometry(Rml::Span<const Rml::Vertex> vertices, Rml::Span<const int> indices) {
     RMLUI_ZoneScopedN("Vulkan - CompileGeometry");
@@ -719,6 +792,18 @@ struct TGAHeader {
 Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source) {
     if (IsPreviewTextureSource(source))
         return LoadAsyncPreviewTexture(texture_dimensions, source);
+
+    if (auto vk_request = ParseLfsVkTextureRequest(source)) {
+        auto* texture = new texture_data_t{};
+        texture->m_p_vk_image = VK_NULL_HANDLE;
+        texture->m_p_vk_image_view = vk_request->image_view;
+        texture->m_p_vk_sampler = vk_request->sampler;
+        texture->m_p_vk_descriptor_set = VK_NULL_HANDLE;
+        texture->m_p_vma_allocation = VK_NULL_HANDLE;
+        texture_dimensions.x = vk_request->width;
+        texture_dimensions.y = vk_request->height;
+        return reinterpret_cast<Rml::TextureHandle>(texture);
+    }
 
     auto load_with_stbi = [&](const std::string& path) -> Rml::TextureHandle {
         int width = 0;
@@ -3024,12 +3109,10 @@ void RenderInterface_VK::Destroy_Texture(const texture_data_t& texture) noexcept
         m_image_barriers.forgetImage(texture.m_p_vk_image);
         vmaDestroyImage(m_p_allocator, texture.m_p_vk_image, texture.m_p_vma_allocation);
         vkDestroyImageView(m_p_device, texture.m_p_vk_image_view, nullptr);
+    }
 
-        VkDescriptorSet p_set = texture.m_p_vk_descriptor_set;
-
-        if (p_set) {
-            m_manager_descriptors.Free_Descriptors(m_p_device, &p_set);
-        }
+    if (VkDescriptorSet p_set = texture.m_p_vk_descriptor_set; p_set) {
+        m_manager_descriptors.Free_Descriptors(m_p_device, &p_set);
     }
 }
 

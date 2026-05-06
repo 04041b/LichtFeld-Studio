@@ -488,18 +488,17 @@ namespace lfs::vis::gui {
     void RmlSequencerOverlay::showPreviewWindow(const float left, const float top,
                                                 const float width, const float height,
                                                 const std::string& title, const bool playing,
-                                                const std::uintptr_t texture_id) {
-        if (!ensureContextReady() || texture_id == 0)
+                                                const std::string& texture_src) {
+        if (!ensureContextReady() || texture_src.empty())
             return;
 
-        (void)texture_id;
         if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface() ||
             !el_preview_window_ || !el_preview_title_ || !el_preview_image_)
             return;
 
-        if (!preview_source_.empty()) {
-            el_preview_image_->SetAttribute("src", "");
-            preview_source_.clear();
+        if (preview_source_ != texture_src) {
+            el_preview_image_->SetAttribute("src", texture_src);
+            preview_source_ = texture_src;
         }
 
         el_preview_window_->SetProperty("left", fmt::format("{:.1f}px", left));
