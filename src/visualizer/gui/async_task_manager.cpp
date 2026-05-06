@@ -534,6 +534,7 @@ namespace lfs::vis::gui {
                 params.dataset.centralize_dataset = cmd.centralize_dataset;
             if (cmd.max_width.has_value() && *cmd.max_width >= 0)
                 params.dataset.max_width = *cmd.max_width;
+            import_state_.apply_auto_crop.store(cmd.apply_auto_crop);
             startAsyncImport(cmd.path, params);
         });
 
@@ -559,6 +560,13 @@ namespace lfs::vis::gui {
         });
 
         state::DatasetLoadCompleted::when([this](const auto& e) {
+            // Consume the flag exchange-style so the auto-crop fires at most
+            // once per load — DatasetLoadCompleted is also emitted from the
+            // scene_manager path, which bypasses the import_state_ updates
+            // below.
+            if (e.success && import_state_.apply_auto_crop.exchange(false))
+                applyAutoCropToLoadedScene();
+
             if (import_state_.show_completion.load())
                 return;
             {
@@ -1053,6 +1061,30 @@ namespace lfs::vis::gui {
             .num_images = num_images_val,
             .num_points = num_points_val}
             .emit();
+    }
+
+    void AsyncTaskManager::applyAutoCropToLoadedScene() {
+        auto* const scene_manager = viewer_->getSceneManager();
+        if (!scene_manager)
+            return;
+
+        // Highest-id pointcloud/splat root = the one the import just produced.
+        const core::SceneNode* target = nullptr;
+        for (const auto* node : scene_manager->getScene().getNodes()) {
+            if (node->type != core::NodeType::POINTCLOUD && node->type != core::NodeType::SPLAT)
+                continue;
+            if (!target || node->id > target->id)
+                target = node;
+        }
+        if (!target) {
+            LOG_WARN("Auto-crop requested but no pointcloud/splat node was found after load");
+            return;
+        }
+
+        // AddCropBox selects the new node; FitCropBoxToScene then operates
+        // on that selection. Both handlers run synchronously inside emit().
+        lfs::core::events::cmd::AddCropBox{.node_name = target->name}.emit();
+        lfs::core::events::cmd::FitCropBoxToScene{.use_percentile = true}.emit();
     }
 
     void AsyncTaskManager::cancelVideoExport() {

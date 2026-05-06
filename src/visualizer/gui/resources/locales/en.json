@@ -983,7 +983,8 @@
     "centralize_by_cameras": "By Cameras",
     "max_width": "Max Width (px)",
     "max_width_disable": "Disable downscaling",
-    "max_width_hint": "Images wider than this are downscaled. 0 disables the cap."
+    "max_width_hint": "Images wider than this are downscaled. 0 disables the cap.",
+    "apply_auto_crop": "Apply Auto Crop"
   },
   "notification": {
     "cannot_open": "Cannot Open",

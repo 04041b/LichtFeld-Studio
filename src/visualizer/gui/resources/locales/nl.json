@@ -964,7 +964,8 @@
     "centralize_by_cameras": "Op camera's",
     "max_width": "Max. breedte (px)",
     "max_width_disable": "Verkleinen uitschakelen",
-    "max_width_hint": "Bredere afbeeldingen worden verkleind. 0 schakelt de limiet uit."
+    "max_width_hint": "Bredere afbeeldingen worden verkleind. 0 schakelt de limiet uit.",
+    "apply_auto_crop": "Automatisch bijsnijden toepassen"
   },
   "notification": {
     "cannot_open": "Kan niet openen",

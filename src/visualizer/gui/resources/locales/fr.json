@@ -967,7 +967,8 @@
     "centralize_by_cameras": "Par caméras",
     "max_width": "Largeur max. (px)",
     "max_width_disable": "Désactiver la réduction",
-    "max_width_hint": "Les images plus larges sont réduites. 0 désactive la limite."
+    "max_width_hint": "Les images plus larges sont réduites. 0 désactive la limite.",
+    "apply_auto_crop": "Appliquer le recadrage automatique"
   },
   "notification": {
     "cannot_open": "Impossible d'ouvrir",

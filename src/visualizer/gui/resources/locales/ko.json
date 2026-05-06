@@ -967,7 +967,8 @@
     "centralize_by_cameras": "카메라 기준",
     "max_width": "최대 너비 (px)",
     "max_width_disable": "다운스케일링 비활성화",
-    "max_width_hint": "이보다 넓은 이미지는 축소됩니다. 0이면 제한 없음."
+    "max_width_hint": "이보다 넓은 이미지는 축소됩니다. 0이면 제한 없음.",
+    "apply_auto_crop": "자동 자르기 적용"
   },
   "notification": {
     "cannot_open": "열 수 없음",

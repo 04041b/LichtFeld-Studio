@@ -57,7 +57,7 @@ namespace lfs::core {
             EVENT(ResetTraining, );
             EVENT(SwitchToLatestCheckpoint, );
             EVENT(SaveCheckpoint, std::optional<int> iteration;);
-            EVENT(LoadFile, std::filesystem::path path; bool is_dataset; std::filesystem::path output_path; std::filesystem::path init_path; std::string centralize_dataset; std::optional<int> max_width;);
+            EVENT(LoadFile, std::filesystem::path path; bool is_dataset; std::filesystem::path output_path; std::filesystem::path init_path; std::string centralize_dataset; std::optional<int> max_width; bool apply_auto_crop = false;);
             EVENT(LoadCheckpointForTraining, std::filesystem::path checkpoint_path; std::filesystem::path dataset_path; std::filesystem::path output_path;);
             EVENT(ImportColmapCameras, std::filesystem::path sparse_path;);
             EVENT(LoadConfigFile, std::filesystem::path path;);
@@ -141,7 +141,7 @@ namespace lfs::core {
             EVENT(SetSelectionSubMode, int selection_mode;);
             EVENT(ExecuteMirror, int axis;); // 0=X, 1=Y, 2=Z
             EVENT(CancelActiveOperator, );   // Cancel and revert current operator
-        } // namespace tools
+        }                                    // namespace tools
 
         // ============================================================================
         // State - Notifications about what has happened (broadcasts)
@@ -285,8 +285,8 @@ namespace lfs::core {
             EVENT(WindowFocusLost, );
             EVENT(DisplayScaleChanged, float scale;);
             EVENT(UiScaleChangeRequested, float scale;); // 0 = auto (from OS)
-        } // namespace internal
-    } // namespace events
+        }                                                // namespace internal
+    }                                                    // namespace events
 
     // ============================================================================
     // Convenience functions

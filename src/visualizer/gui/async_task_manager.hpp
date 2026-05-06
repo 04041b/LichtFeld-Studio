@@ -173,6 +173,7 @@ namespace lfs::vis {
                                   const lfs::core::param::TrainingParameters& params);
             void checkAsyncImportCompletion();
             void applyLoadedDataToScene();
+            void applyAutoCropToLoadedScene();
             void startVideoExport(const std::filesystem::path& path,
                                   const io::video::VideoExportOptions& options);
             void resetVideoExportEnvironmentState();
@@ -223,6 +224,7 @@ namespace lfs::vis {
                 size_t num_points{0};
                 bool success{false};
                 bool is_mesh{false};
+                std::atomic<bool> apply_auto_crop{false};
                 std::chrono::steady_clock::time_point completion_time;
                 std::optional<lfs::io::LoadResult> load_result;
                 lfs::core::param::TrainingParameters params;

@@ -967,7 +967,8 @@
     "centralize_by_cameras": "Według kamer",
     "max_width": "Maks. szerokość (px)",
     "max_width_disable": "Wyłącz skalowanie",
-    "max_width_hint": "Szersze obrazy są zmniejszane. 0 wyłącza limit."
+    "max_width_hint": "Szersze obrazy są zmniejszane. 0 wyłącza limit.",
+    "apply_auto_crop": "Zastosuj automatyczne kadrowanie"
   },
   "notification": {
     "cannot_open": "Nie można otworzyć",
