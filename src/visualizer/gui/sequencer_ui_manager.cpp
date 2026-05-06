@@ -203,6 +203,17 @@ namespace lfs::vis::gui {
             film_strip_.invalidateAll();
         });
 
+        // File → New Project (and any dataset swap) emits SceneCleared. Drop the camera path
+        // and film-strip thumbs by wiping the timeline; the keyframes belong to the old scene.
+        state::SceneCleared::when([this](const auto&) {
+            if (controller_.timeline().realKeyframeCount() == 0 &&
+                !controller_.timeline().hasAnimationClip())
+                return;
+            controller_.clear();
+            film_strip_.invalidateAll();
+            state::KeyframeListChanged{.count = 0}.emit();
+        });
+
         ui::NodeSelected::when([this](const auto& e) {
             if (e.type != "KEYFRAME") {
                 viewport_edit_mode_ = SequencerViewportEditMode::None;
