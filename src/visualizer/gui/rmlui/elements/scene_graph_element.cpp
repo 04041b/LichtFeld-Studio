@@ -21,6 +21,7 @@
 #include "visualizer/gui_capabilities.hpp"
 
 #include <RmlUi/Core.h>
+#include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/Input.h>
 #include <SDL3/SDL_keyboard.h>
@@ -99,6 +100,11 @@ namespace lfs::vis::gui {
 
         [[nodiscard]] std::string formatDp(const int value) {
             return std::to_string(value) + "dp";
+        }
+
+        [[nodiscard]] float currentDpRatio(const Rml::Element* element) {
+            const Rml::Context* context = element ? element->GetContext() : nullptr;
+            return context ? std::max(context->GetDensityIndependentPixelRatio(), 0.01f) : 1.0f;
         }
 
         [[nodiscard]] std::string cacheAttrName(std::string_view kind, std::string_view name) {
@@ -552,6 +558,7 @@ namespace lfs::vis::gui {
         last_selection_generation_ = std::numeric_limits<uint32_t>::max();
         last_visible_start_ = kUnsetVisibleRange;
         last_visible_end_ = kUnsetVisibleRange;
+        last_bound_dp_ratio_ = -1.0f;
         tree_rebuild_needed_ = false;
         markStateDirty();
     }
@@ -863,6 +870,12 @@ namespace lfs::vis::gui {
                                       : false;
 
         bool changed = false;
+        const float dp_ratio = currentDpRatio(this);
+        if (std::abs(dp_ratio - last_bound_dp_ratio_) > 0.001f) {
+            markStateDirty();
+            changed = true;
+        }
+
         if (invert_masks != invert_masks_) {
             invert_masks_ = invert_masks;
             markStateDirty();
@@ -1082,9 +1095,10 @@ namespace lfs::vis::gui {
         updateHeader();
         updateContentHeight();
 
-        // Rml scroll metrics already use the same logical units as our row heights.
-        const float row_height = kRowHeightDp;
-        const float header_height = kHeaderHeightDp;
+        const float dp_ratio = currentDpRatio(this);
+        const bool dp_ratio_changed = std::abs(dp_ratio - last_bound_dp_ratio_) > 0.001f;
+        const float row_height = kRowHeightDp * dp_ratio;
+        const float header_height = kHeaderHeightDp * dp_ratio;
         const float client_height = GetClientHeight();
         const float scroll_top = GetScrollTop();
         const bool has_prev_window =
@@ -1099,6 +1113,7 @@ namespace lfs::vis::gui {
             last_visible_start_ = 0;
             last_visible_end_ = 0;
             last_bound_revision_ = state_revision_;
+            last_bound_dp_ratio_ = dp_ratio;
             last_client_height_ = client_height;
             return;
         }
@@ -1114,6 +1129,7 @@ namespace lfs::vis::gui {
             last_visible_start_ == start &&
             last_visible_end_ == end &&
             std::abs(client_height - last_client_height_) < 0.5f &&
+            !dp_ratio_changed &&
             !dom_dirty_) {
             return;
         }
@@ -1124,7 +1140,8 @@ namespace lfs::vis::gui {
         const size_t next_count = end - start;
         const bool state_unchanged =
             !force && last_bound_revision_ == state_revision_ && !dom_dirty_ &&
-            std::abs(client_height - last_client_height_) < 0.5f;
+            std::abs(client_height - last_client_height_) < 0.5f &&
+            !dp_ratio_changed;
         if (state_unchanged && prev_count == next_count && prev_count > 0) {
             const ptrdiff_t delta =
                 static_cast<ptrdiff_t>(start) - static_cast<ptrdiff_t>(prev_start);
@@ -1167,6 +1184,7 @@ namespace lfs::vis::gui {
         last_visible_start_ = start;
         last_visible_end_ = end;
         last_bound_revision_ = state_revision_;
+        last_bound_dp_ratio_ = dp_ratio;
         last_client_height_ = client_height;
         dom_dirty_ = false;
     }
@@ -1176,8 +1194,11 @@ namespace lfs::vis::gui {
         if (it == flat_index_by_id_.end())
             return;
 
-        const float row_top = kHeaderHeightDp + static_cast<float>(it->second) * kRowHeightDp;
-        const float row_bottom = row_top + kRowHeightDp;
+        const float dp_ratio = currentDpRatio(this);
+        const float row_height = kRowHeightDp * dp_ratio;
+        const float header_height = kHeaderHeightDp * dp_ratio;
+        const float row_top = header_height + static_cast<float>(it->second) * row_height;
+        const float row_bottom = row_top + row_height;
         const float scroll_top = GetScrollTop();
         const float view_h = GetClientHeight();
 
@@ -1198,10 +1219,13 @@ namespace lfs::vis::gui {
             return;
         }
 
-        const float row_top = kHeaderHeightDp + static_cast<float>(it->second) * kRowHeightDp;
-        const float content_h = kHeaderHeightDp + static_cast<float>(flat_rows_.size()) * kRowHeightDp;
+        const float dp_ratio = currentDpRatio(this);
+        const float row_height = kRowHeightDp * dp_ratio;
+        const float header_height = kHeaderHeightDp * dp_ratio;
+        const float row_top = header_height + static_cast<float>(it->second) * row_height;
+        const float content_h = header_height + static_cast<float>(flat_rows_.size()) * row_height;
         const float max_scroll = std::max(0.0f, content_h - view_h);
-        const float desired = row_top + 0.5f * kRowHeightDp - 0.5f * view_h;
+        const float desired = row_top + 0.5f * row_height - 0.5f * view_h;
         SetScrollTop(std::clamp(desired, 0.0f, max_scroll));
     }
 

@@ -191,6 +191,7 @@ namespace lfs::vis::gui {
         size_t last_training_model_gaussian_count_ = std::numeric_limits<size_t>::max();
         size_t last_visible_start_ = kUnsetVisibleRange;
         size_t last_visible_end_ = kUnsetVisibleRange;
+        float last_bound_dp_ratio_ = -1.0f;
         float last_client_height_ = -1.0f;
         float last_content_height_ = -1.0f;
         std::string last_header_text_;
