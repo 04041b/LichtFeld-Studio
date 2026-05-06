@@ -429,7 +429,7 @@
       "bg_image_browse": "Bladeren naar een achtergrondafbeelding",
       "bg_image_clear": "Geselecteerde achtergrondafbeelding wissen",
       "dataset_path": "Pad naar de geladen dataset",
-      "dataset_images": "Aantal afbeeldingen in de dataset",
+      "dataset_images": "Naam van de afbeeldingssubmap in de dataset (bijv. images, images_4)",
       "dataset_output": "Uitvoermap voor getrainde artefacten",
       "opt_strategy_display": "Actieve verdichtingsstrategie",
       "bilateral_grid_x": "X-resolutie van bilateraal raster",

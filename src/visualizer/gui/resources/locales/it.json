@@ -431,7 +431,7 @@
       "bg_image_browse": "Sfoglia per un'immagine di sfondo",
       "bg_image_clear": "Rimuovi l'immagine di sfondo selezionata",
       "dataset_path": "Percorso del dataset caricato",
-      "dataset_images": "Numero di immagini nel dataset",
+      "dataset_images": "Nome della sottocartella delle immagini nel dataset (es. images, images_4)",
       "dataset_output": "Directory di output per gli artefatti addestrati",
       "opt_strategy_display": "Strategia di densificazione attiva",
       "bilateral_grid_x": "Risoluzione X della griglia bilaterale",

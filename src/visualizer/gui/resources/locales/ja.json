@@ -432,7 +432,7 @@
       "bg_image_browse": "背景画像を参照",
       "bg_image_clear": "選択した背景画像をクリア",
       "dataset_path": "読み込まれたデータセットのパス",
-      "dataset_images": "データセット内の画像数",
+      "dataset_images": "データセット内の画像サブフォルダ名 (例: images, images_4)",
       "dataset_output": "学習済み成果物の出力ディレクトリ",
       "opt_strategy_display": "アクティブな高密度化戦略",
       "bilateral_grid_x": "バイラテラルグリッドの X 解像度",

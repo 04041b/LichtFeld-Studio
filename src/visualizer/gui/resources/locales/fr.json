@@ -432,7 +432,7 @@
       "bg_image_browse": "Rechercher une image de fond",
       "bg_image_clear": "Effacer l'image de fond sélectionnée",
       "dataset_path": "Chemin vers le jeu de données chargé",
-      "dataset_images": "Nombre d'images dans le jeu de données",
+      "dataset_images": "Nom du sous-dossier des images dans le jeu de données (par ex. images, images_4)",
       "dataset_output": "Répertoire de sortie pour les artefacts entraînés",
       "opt_strategy_display": "Stratégie de densification active",
       "bilateral_grid_x": "Résolution X de la grille bilatérale",

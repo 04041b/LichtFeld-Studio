@@ -276,7 +276,7 @@
       "bg_image_browse": "浏览背景图像",
       "bg_image_clear": "清除已选背景图像",
       "dataset_path": "已加载数据集的路径",
-      "dataset_images": "数据集中的图像数量",
+      "dataset_images": "数据集中图像子文件夹的名称 (例如 images, images_4)",
       "dataset_output": "训练产物的输出目录",
       "opt_strategy_display": "当前活动的稠密化策略",
       "bilateral_grid_x": "双边网格 X 分辨率",

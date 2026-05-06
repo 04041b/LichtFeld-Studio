@@ -432,7 +432,7 @@
       "bg_image_browse": "Przeglądaj obraz tła",
       "bg_image_clear": "Wyczyść wybrany obraz tła",
       "dataset_path": "Ścieżka do załadowanego zbioru danych",
-      "dataset_images": "Liczba obrazów w zbiorze danych",
+      "dataset_images": "Nazwa podfolderu obrazów w zbiorze danych (np. images, images_4)",
       "dataset_output": "Katalog wyjściowy dla wytrenowanych artefaktów",
       "opt_strategy_display": "Aktywna strategia zagęszczania",
       "bilateral_grid_x": "Rozdzielczość X siatki bilateralnej",

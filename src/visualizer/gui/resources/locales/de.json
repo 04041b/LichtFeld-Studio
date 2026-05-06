@@ -429,7 +429,7 @@
       "bg_image_browse": "Nach Hintergrundbild suchen",
       "bg_image_clear": "Ausgewähltes Hintergrundbild entfernen",
       "dataset_path": "Pfad zum geladenen Datensatz",
-      "dataset_images": "Anzahl der Bilder im Datensatz",
+      "dataset_images": "Name des Bildunterordners im Datensatz (z. B. images, images_4)",
       "dataset_output": "Ausgabeverzeichnis für trainierte Artefakte",
       "opt_strategy_display": "Aktive Verdichtungsstrategie",
       "bilateral_grid_x": "Bilaterales Gitter: X-Auflösung",

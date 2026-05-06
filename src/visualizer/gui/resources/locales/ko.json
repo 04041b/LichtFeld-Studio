@@ -432,7 +432,7 @@
       "bg_image_browse": "배경 이미지 찾아보기",
       "bg_image_clear": "선택된 배경 이미지 지우기",
       "dataset_path": "로드된 데이터셋 경로",
-      "dataset_images": "데이터셋의 이미지 수",
+      "dataset_images": "데이터셋 내 이미지 하위 폴더 이름 (예: images, images_4)",
       "dataset_output": "훈련된 결과물의 출력 디렉토리",
       "opt_strategy_display": "활성 밀도화 전략",
       "bilateral_grid_x": "양방향 그리드 X 해상도",
