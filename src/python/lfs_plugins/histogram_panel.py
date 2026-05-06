@@ -66,6 +66,7 @@ class HistogramPanel(Panel):
         self._compare_y_bin_count = DEFAULT_COMPARE_Y_BIN_COUNT
         self._scene_generation = -1
         self._history_generation = -1
+        self._selected_nodes_signature: tuple[int, ...] = ()
         self._last_lang = ""
         self._trainer_state = ""
         self._show_chart = False
@@ -297,19 +298,23 @@ class HistogramPanel(Panel):
         history_generation = self._history_generation_value()
         current_lang = lf.ui.get_current_language()
         trainer_state = AppState.trainer_state.value
+        selection_signature = self._scene_node_selection_signature()
         scene_changed = scene_generation != self._scene_generation
         history_changed = history_generation != self._history_generation
+        selection_changed = selection_signature != self._selected_nodes_signature
         sync_selection_from_scene = False
         if (scene_generation == self._scene_generation and
                 history_generation == self._history_generation and
                 trainer_state == self._trainer_state and
                 current_lang == self._last_lang and
+                not selection_changed and
                 not space_changed):
             return False
 
         if self._dragging_mark or self._dragging_compare_mark:
             self._scene_generation = scene_generation
             self._history_generation = history_generation
+            self._selected_nodes_signature = selection_signature
             self._last_lang = current_lang
             self._trainer_state = trainer_state
             if self._scene_selection_preview_active:
@@ -324,8 +329,12 @@ class HistogramPanel(Panel):
                 self._selection_owned = False
                 sync_selection_from_scene = True
 
+        if selection_changed:
+            self._clear_all_marks(clear_scene=False)
+
         self._scene_generation = scene_generation
         self._history_generation = history_generation
+        self._selected_nodes_signature = selection_signature
         self._last_lang = current_lang
         self._trainer_state = trainer_state
         self._rebuild_metric_options()
@@ -477,18 +486,32 @@ class HistogramPanel(Panel):
             return
 
         visible_mask = self._extract_visible_mask(model, values)
+        scope_mask = self._selection_scope_mask(scene, values)
+        scope_active = scope_mask is not None
+        if scope_mask is not None:
+            visible_mask = scope_mask if visible_mask is None else (visible_mask & scope_mask)
+
         finite_mask = values.isfinite()
         if visible_mask is not None and visible_mask.shape == values.shape:
             finite_mask = finite_mask & visible_mask
 
         if not self._any_true(finite_mask):
-            self._set_empty(
-                _tr("histogram.empty.no_visible_values.title", "No visible values"),
-                _tr(
-                    "histogram.empty.no_visible_values.message",
-                    "The selected metric does not contain any visible finite samples to visualize.",
-                ),
-            )
+            if scope_active:
+                self._set_empty(
+                    _tr("histogram.empty.no_selected_values.title", "No samples in selection"),
+                    _tr(
+                        "histogram.empty.no_selected_values.message",
+                        "The selected models contain no finite samples for this metric.",
+                    ),
+                )
+            else:
+                self._set_empty(
+                    _tr("histogram.empty.no_visible_values.title", "No visible values"),
+                    _tr(
+                        "histogram.empty.no_visible_values.message",
+                        "The selected metric does not contain any visible finite samples to visualize.",
+                    ),
+                )
             return
 
         valid_values = values[finite_mask]
@@ -1020,6 +1043,118 @@ class HistogramPanel(Panel):
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _scene_node_selection_signature() -> tuple[int, ...]:
+        try:
+            ctx = lf.ui.context()
+        except Exception:
+            return ()
+        try:
+            selected = list(getattr(ctx, "selected_objects", []) or [])
+        except Exception:
+            return ()
+        ids: list[int] = []
+        for node in selected:
+            try:
+                ids.append(int(node.id))
+            except Exception:
+                continue
+        return tuple(sorted(ids))
+
+    @staticmethod
+    def _selection_scope_node_ids() -> set[int] | None:
+        try:
+            ctx = lf.ui.context()
+            selected = list(getattr(ctx, "selected_objects", []) or [])
+        except Exception:
+            return None
+        if not selected:
+            return None
+
+        cropbox_type = getattr(getattr(lf, "NodeType", None), "CROPBOX", None)
+        if cropbox_type is None:
+            cropbox_type = getattr(getattr(getattr(lf, "scene", None), "NodeType", None), "CROPBOX", None)
+
+        scope_ids: set[int] = set()
+        for node in selected:
+            try:
+                node_id = int(node.id)
+            except Exception:
+                continue
+            if cropbox_type is not None and getattr(node, "type", None) == cropbox_type:
+                parent_id = int(getattr(node, "parent_id", -1) or -1)
+                if parent_id < 0:
+                    continue
+                node_id = parent_id
+            scope_ids.add(node_id)
+        return scope_ids or None
+
+    def _selection_scope_mask(self, scene, reference: lf.Tensor) -> lf.Tensor | None:
+        scope_ids = self._selection_scope_node_ids()
+        if not scope_ids:
+            return None
+
+        try:
+            nodes = list(scene.get_nodes())
+        except Exception:
+            return None
+        node_by_id: dict[int, object] = {}
+        for node in nodes:
+            try:
+                node_by_id[int(node.id)] = node
+            except Exception:
+                continue
+
+        def is_in_scope(node_id: int) -> bool:
+            visited: set[int] = set()
+            current = node_id
+            while current >= 0 and current not in visited:
+                if current in scope_ids:
+                    return True
+                visited.add(current)
+                node = node_by_id.get(current)
+                if node is None:
+                    return False
+                try:
+                    current = int(getattr(node, "parent_id", -1) or -1)
+                except Exception:
+                    return False
+            return False
+
+        visible_nodes = self._visible_splat_nodes(scene)
+        total = int(reference.shape[0]) if int(getattr(reference, "ndim", 0) or 0) > 0 else int(reference.numel)
+        if total <= 0:
+            return None
+
+        device = self._device_string(reference)
+        segments: list[lf.Tensor] = []
+        counted = 0
+        any_in_scope = False
+        for node in visible_nodes:
+            count = int(getattr(node, "gaussian_count", 0) or 0)
+            if count <= 0:
+                continue
+            if counted + count > total:
+                return None
+            try:
+                node_id = int(node.id)
+            except Exception:
+                return None
+            if is_in_scope(node_id):
+                segments.append(lf.Tensor.ones([count], dtype="bool", device=device))
+                any_in_scope = True
+            else:
+                segments.append(lf.Tensor.zeros([count], dtype="bool", device=device))
+            counted += count
+
+        if counted != total or not segments:
+            return None
+        if not any_in_scope:
+            return None
+        if len(segments) == 1:
+            return segments[0].contiguous()
+        return lf.Tensor.cat(segments, 0).contiguous()
 
     @staticmethod
     def _effective_rank_from_scaling(scaling: lf.Tensor) -> lf.Tensor:
