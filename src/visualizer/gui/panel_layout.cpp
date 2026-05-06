@@ -8,7 +8,6 @@
 #include "theme/theme.hpp"
 #include "visualizer_impl.hpp"
 #include <algorithm>
-#include <imgui.h>
 
 namespace lfs::vis::gui {
 
@@ -279,40 +278,6 @@ namespace lfs::vis::gui {
 
         const float max_scroll = std::max(0.0f, tab_content_total_h_ - tab_content_h);
         tab_scroll_offset_ = std::clamp(tab_scroll_offset_, 0.0f, max_scroll);
-
-        if (max_scroll > 0.0f && tab_content_h > 0.0f) {
-            auto* dl = static_cast<ImDrawList*>(input.bg_draw_list);
-            const float track_x = content_x + content_draw_w + scrollbar_pad;
-            const float track_y = tab_content_y;
-            const float track_h = tab_content_h;
-
-            const float ratio = tab_content_h / tab_content_total_h_;
-            const float thumb_h = std::max(t.sizes.grab_min_size, track_h * ratio);
-            const float scroll_frac = tab_scroll_offset_ / max_scroll;
-            const float thumb_y = track_y + scroll_frac * (track_h - thumb_h);
-
-            const float rounding = std::max(t.sizes.scrollbar_rounding, scrollbar_w * 0.5f);
-            const bool over_scrollbar =
-                masked_panel_input.mouse_x >= content_x + content_draw_w &&
-                masked_panel_input.mouse_x < content_x + content_w &&
-                masked_panel_input.mouse_y >= track_y &&
-                masked_panel_input.mouse_y < track_y + track_h;
-
-            const ImU32 track_col = ImGui::ColorConvertFloat4ToU32(
-                withAlpha(t.palette.background, 0.5f));
-            const ImU32 thumb_col = ImGui::ColorConvertFloat4ToU32(
-                withAlpha(tab_scrollbar_dragging_
-                              ? t.palette.primary
-                              : (over_scrollbar ? t.palette.primary_dim : t.palette.text_dim),
-                          tab_scrollbar_dragging_ ? 0.9f : (over_scrollbar ? 0.78f : 0.63f)));
-
-            dl->AddRectFilled(ImVec2(track_x, track_y),
-                              ImVec2(track_x + scrollbar_w, track_y + track_h),
-                              track_col, rounding);
-            dl->AddRectFilled(ImVec2(track_x, thumb_y),
-                              ImVec2(track_x + scrollbar_w, thumb_y + thumb_h),
-                              thumb_col, rounding);
-        }
     }
 
     void PanelLayoutManager::renderBottomDock(const PanelDrawContext& draw_ctx,
@@ -409,16 +374,6 @@ namespace lfs::vis::gui {
         bottom_dock_top_y_ = bottom_dock_visible_ ? panel_y : -1.0f;
         if (!bottom_dock_visible_)
             return;
-
-        if (auto* dl = static_cast<ImDrawList*>(input.bg_draw_list)) {
-            const auto& t = lfs::vis::theme();
-            const ImU32 line_col = ImGui::ColorConvertFloat4ToU32(withAlpha(t.palette.border, 0.7f));
-            const float grip_y = panel_y;
-            dl->AddLine(ImVec2(screen.work_pos.x, grip_y),
-                        ImVec2(screen.work_pos.x + panel_w, grip_y),
-                        line_col,
-                        1.0f);
-        }
 
         reg.draw_panels_direct(PanelSpace::BottomDock,
                                screen.work_pos.x,
