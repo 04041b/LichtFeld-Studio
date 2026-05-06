@@ -864,6 +864,7 @@
     "seq_loop_off": "Activer la lecture en boucle",
     "seq_loop_on": "Désactiver la lecture en boucle",
     "seq_add": "Ajouter une image clé à la position actuelle",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_speed": "Vitesse de lecture (cliquer pour changer)",
     "seq_snap": "Aligner les images clés sur la grille (clic droit pour les options)",
     "seq_follow": "Suivre la tête de lecture pendant la lecture",

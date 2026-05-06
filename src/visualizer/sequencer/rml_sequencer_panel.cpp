@@ -122,6 +122,7 @@ namespace lfs::vis {
         assert(rml_manager_);
         transport_listener_.panel = this;
         quality_scrub_listener_.panel = this;
+        duration_listener_.panel = this;
     }
 
     RmlSequencerPanel::~RmlSequencerPanel() = default;
@@ -312,6 +313,9 @@ namespace lfs::vis {
         el_quality_fill_ = nullptr;
         el_quality_display_ = nullptr;
         el_quality_input_ = nullptr;
+        el_duration_field_ = nullptr;
+        el_duration_input_ = nullptr;
+        duration_editing_ = false;
         el_btn_equirect_ = nullptr;
         el_btn_save_ = nullptr;
         el_btn_load_ = nullptr;
@@ -448,6 +452,8 @@ namespace lfs::vis {
         el_quality_fill_ = document_->GetElementById("quality-fill");
         el_quality_display_ = document_->GetElementById("quality-display");
         el_quality_input_ = document_->GetElementById("quality-input");
+        el_duration_field_ = document_->GetElementById("duration-field");
+        el_duration_input_ = document_->GetElementById("duration-input");
         el_btn_equirect_ = document_->GetElementById("btn-equirect");
         el_btn_save_ = document_->GetElementById("btn-save-path");
         el_btn_load_ = document_->GetElementById("btn-load-path");
@@ -499,6 +505,13 @@ namespace lfs::vis {
         if (el_quality_input_) {
             el_quality_input_->AddEventListener(Rml::EventId::Change, &quality_scrub_listener_);
             el_quality_input_->AddEventListener(Rml::EventId::Blur, &quality_scrub_listener_);
+        }
+
+        if (el_duration_field_)
+            el_duration_field_->AddEventListener(Rml::EventId::Click, &duration_listener_);
+        if (el_duration_input_) {
+            el_duration_input_->AddEventListener(Rml::EventId::Change, &duration_listener_);
+            el_duration_input_->AddEventListener(Rml::EventId::Blur, &duration_listener_);
         }
     }
 
@@ -562,11 +575,7 @@ namespace lfs::vis {
             return;
 
         el_current_time_->SetInnerRML(formatTime(controller_.playhead()));
-
-        const float end = controller_.timeline().empty()
-                              ? sequencer_ui::DEFAULT_TIMELINE_DURATION
-                              : controller_.timeline().endTime();
-        el_duration_->SetInnerRML(" / " + formatTime(end));
+        syncDurationDisplay();
     }
 
     void RmlSequencerPanel::rebuildKeyframes() {
@@ -1041,6 +1050,62 @@ namespace lfs::vis {
         if (el_quality_scrub_)
             el_quality_scrub_->SetClass("is-editing", false);
         syncQualityScrub();
+    }
+
+    // ── Clip Duration Field ─────────────────────────────────
+
+    void RmlSequencerPanel::DurationEditListener::ProcessEvent(Rml::Event& event) {
+        assert(panel);
+        const auto event_id = event.GetId();
+        auto* el = event.GetCurrentElement();
+        if (!el)
+            return;
+
+        if (event_id == Rml::EventId::Click && el->GetId() == "duration-field") {
+            if (event.GetParameter<int>("button", 0) != 0)
+                return;
+            panel->enterDurationEdit();
+            event.StopPropagation();
+        } else if (event_id == Rml::EventId::Change && el->GetId() == "duration-input") {
+            if (event.GetParameter<bool>("linebreak", false))
+                panel->exitDurationEdit(true);
+        } else if (event_id == Rml::EventId::Blur && el->GetId() == "duration-input") {
+            panel->exitDurationEdit(true);
+        }
+    }
+
+    void RmlSequencerPanel::syncDurationDisplay() {
+        if (!el_duration_ || duration_editing_)
+            return;
+        el_duration_->SetInnerRML(" / " + formatTime(controller_.clipDuration()));
+    }
+
+    void RmlSequencerPanel::enterDurationEdit() {
+        if (!el_duration_field_ || !el_duration_input_ || duration_editing_)
+            return;
+
+        duration_editing_ = true;
+        el_duration_field_->SetClass("is-editing", true);
+        el_duration_input_->SetAttribute("value", fmt::format("{:.2f}", controller_.clipDuration()));
+        el_duration_input_->Focus();
+    }
+
+    void RmlSequencerPanel::exitDurationEdit(const bool commit) {
+        if (!duration_editing_)
+            return;
+
+        if (commit && el_duration_input_) {
+            const auto text = el_duration_input_->GetAttribute<Rml::String>("value", "");
+            char* end = nullptr;
+            const float parsed = std::strtof(text.c_str(), &end);
+            if (end != text.c_str())
+                controller_.setClipDuration(parsed);
+        }
+
+        duration_editing_ = false;
+        if (el_duration_field_)
+            el_duration_field_->SetClass("is-editing", false);
+        syncDurationDisplay();
     }
 
 } // namespace lfs::vis

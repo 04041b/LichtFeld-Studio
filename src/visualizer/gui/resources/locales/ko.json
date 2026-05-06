@@ -864,6 +864,7 @@
     "seq_loop_off": "반복 재생 활성화",
     "seq_loop_on": "반복 재생 비활성화",
     "seq_add": "현재 위치에 키프레임 추가",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_speed": "재생 속도 (클릭으로 전환)",
     "seq_snap": "키프레임을 그리드에 스냅 (우클릭으로 옵션)",
     "seq_follow": "재생 중 플레이헤드 따라가기",

@@ -138,22 +138,32 @@ namespace lfs::vis::gui {
 
         cmd::SequencerAddKeyframe::when([this](const auto&) {
             const auto& cam = viewer_->getViewport().camera;
-
-            const float interval = ui_state_.snap_to_grid ? ui_state_.snap_interval : 1.0f;
-            const float time = controller_.timeline().realKeyframeCount() == 0
-                                   ? 0.0f
-                                   : controller_.timeline().realEndTime() + interval;
+            const float time = controller_.playhead();
+            const glm::vec3 position = cam.t;
+            const glm::quat rotation = glm::quat_cast(cam.R);
 
             auto* const rm = viewer_->getRenderingManager();
             const float focal_mm = rm ? rm->getFocalLengthMm() : lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
 
-            lfs::sequencer::Keyframe kf;
-            kf.time = time;
-            kf.position = cam.t;
-            kf.rotation = glm::quat_cast(cam.R);
-            kf.focal_length_mm = focal_mm;
-            controller_.addKeyframeAtTime(kf, time);
-            controller_.seek(time);
+            // Match Blender / After Effects / Maya: clicking + at a time that already has a
+            // keyframe overwrites that keyframe with the current pose instead of stacking.
+            constexpr float REPLACE_EPSILON_S = 0.01f;
+            const auto& keyframes = controller_.timeline().keyframes();
+            const auto existing = std::find_if(keyframes.begin(), keyframes.end(),
+                                               [time](const lfs::sequencer::Keyframe& kf) {
+                                                   return !kf.is_loop_point &&
+                                                          std::abs(kf.time - time) < REPLACE_EPSILON_S;
+                                               });
+            if (existing != keyframes.end()) {
+                controller_.updateKeyframeById(existing->id, position, rotation, focal_mm);
+            } else {
+                lfs::sequencer::Keyframe kf;
+                kf.time = time;
+                kf.position = position;
+                kf.rotation = rotation;
+                kf.focal_length_mm = focal_mm;
+                controller_.addKeyframeAtTime(kf, time);
+            }
             state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
         });
 

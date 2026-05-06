@@ -861,6 +861,7 @@
     "seq_loop_off": "Herhaald afspelen inschakelen",
     "seq_loop_on": "Herhaald afspelen uitschakelen",
     "seq_add": "Keyframe toevoegen op huidige positie",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_speed": "Afspeelsnelheid (klik om te wisselen)",
     "seq_snap": "Keyframes uitlijnen op raster (rechtsklik voor opties)",
     "seq_follow": "Afspeelkop volgen tijdens afspelen",

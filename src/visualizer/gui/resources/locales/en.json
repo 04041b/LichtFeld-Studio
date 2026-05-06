@@ -869,6 +869,7 @@
     "seq_loop_on": "Disable loop playback",
     "seq_add": "Add keyframe at current position",
     "seq_speed": "Playback speed (click to cycle)",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_snap": "Snap keyframes to grid (right-click for options)",
     "seq_follow": "Follow playhead during playback",
     "seq_film_strip": "Show film strip below timeline",

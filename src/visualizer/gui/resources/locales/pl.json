@@ -864,6 +864,7 @@
     "seq_loop_off": "Włącz odtwarzanie w pętli",
     "seq_loop_on": "Wyłącz odtwarzanie w pętli",
     "seq_add": "Dodaj klatkę kluczową w bieżącej pozycji",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_speed": "Prędkość odtwarzania (kliknij, aby zmienić)",
     "seq_snap": "Przyciągaj klatki kluczowe do siatki (prawy przycisk myszy dla opcji)",
     "seq_follow": "Podążaj za głowicą odtwarzania",

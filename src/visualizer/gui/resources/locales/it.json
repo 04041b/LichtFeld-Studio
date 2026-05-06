@@ -863,6 +863,7 @@
     "seq_loop_off": "Attiva la riproduzione in loop",
     "seq_loop_on": "Disattiva la riproduzione in loop",
     "seq_add": "Aggiungi keyframe alla posizione attuale",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_speed": "Velocità di riproduzione (clic per cambiare)",
     "seq_snap": "Allinea i keyframe alla griglia (clic destro per le opzioni)",
     "seq_follow": "Segui la testina durante la riproduzione",

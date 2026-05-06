@@ -217,21 +217,32 @@ namespace lfs::vis {
             void ProcessEvent(Rml::Event& event) override;
         };
 
+        struct DurationEditListener : Rml::EventListener {
+            RmlSequencerPanel* panel = nullptr;
+            void ProcessEvent(Rml::Event& event) override;
+        };
+
         void syncQualityScrub();
         void applyQualityFromDrag(float mouse_x);
         void enterQualityEdit();
         void exitQualityEdit(bool commit);
+
+        void syncDurationDisplay();
+        void enterDurationEdit();
+        void exitDurationEdit(bool commit);
 
         SequencerController& controller_;
         gui::panels::SequencerUIState& ui_state_;
         gui::RmlUIManager* rml_manager_;
         TransportClickListener transport_listener_;
         QualityScrubListener quality_scrub_listener_;
+        DurationEditListener duration_listener_;
 
         bool quality_scrub_active_ = false;
         bool quality_scrub_dragging_ = false;
         bool quality_scrub_editing_ = false;
         float quality_scrub_start_x_ = 0.0f;
+        bool duration_editing_ = false;
 
         Rml::Context* rml_context_ = nullptr;
         Rml::ElementDocument* document_ = nullptr;
@@ -287,6 +298,8 @@ namespace lfs::vis {
         Rml::Element* el_quality_fill_ = nullptr;
         Rml::Element* el_quality_display_ = nullptr;
         Rml::Element* el_quality_input_ = nullptr;
+        Rml::Element* el_duration_field_ = nullptr;
+        Rml::Element* el_duration_input_ = nullptr;
         Rml::Element* el_btn_equirect_ = nullptr;
         Rml::Element* el_btn_save_ = nullptr;
         Rml::Element* el_btn_load_ = nullptr;

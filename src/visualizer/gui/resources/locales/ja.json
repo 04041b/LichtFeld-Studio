@@ -864,6 +864,7 @@
     "seq_loop_off": "ループ再生を有効にする",
     "seq_loop_on": "ループ再生を無効にする",
     "seq_add": "現在の位置にキーフレームを追加",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_speed": "再生速度（クリックで切替）",
     "seq_snap": "キーフレームをグリッドにスナップ（右クリックでオプション）",
     "seq_follow": "再生中にプレイヘッドを追従",

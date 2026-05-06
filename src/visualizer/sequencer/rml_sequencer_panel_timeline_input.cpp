@@ -27,7 +27,7 @@ namespace lfs::vis {
         constexpr float MIN_KEYFRAME_SPACING = 0.1f;
         constexpr float DOUBLE_CLICK_TIME = 0.3f;
         constexpr float DRAG_THRESHOLD_PX = 3.0f;
-        constexpr float PLAYHEAD_HIT_RADIUS = 6.0f;
+        constexpr float PLAYHEAD_HIT_RADIUS = 10.0f;
         constexpr float PLAYHEAD_HANDLE_WIDTH = 8.0f;
 
         [[nodiscard]] std::string formatTime(const float seconds) {
@@ -82,6 +82,15 @@ namespace lfs::vis {
                 const auto rml_key = gui::sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
                 if (rml_key != Rml::Input::KI_UNKNOWN)
                     context->ProcessKeyUp(rml_key, mods);
+            }
+            // SDL TextInput events are distinct from key events; without forwarding them,
+            // <input> fields cannot receive typed characters or IME composition.
+            if (!input.text_inputs.empty()) {
+                for (const auto& s : input.text_inputs)
+                    context->ProcessTextInput(s);
+            } else {
+                for (const std::uint32_t cp : input.text_codepoints)
+                    context->ProcessTextInput(static_cast<Rml::Character>(cp));
             }
         }
 
@@ -378,7 +387,12 @@ namespace lfs::vis {
                                              width,
                                              PLAYHEAD_HANDLE_WIDTH * s);
         const float playhead_dist = std::abs(mx - playhead_x);
-        bool on_playhead_handle = playhead_dist < PLAYHEAD_HIT_RADIUS * s;
+        // The visible #playhead-handle sits at top: -10dp relative to #track-area, i.e. inside
+        // the ruler. mouse_in_timeline's Y band can miss it; give the handle its own Y band
+        // covering the entire ruler+track-bar height so users can grab it where it's drawn.
+        const bool mouse_in_handle_band = mx >= pos.x && mx <= pos.x + width &&
+                                          my >= pos.y && my <= bar_max.y;
+        bool on_playhead_handle = playhead_dist < PLAYHEAD_HIT_RADIUS * s && mouse_in_handle_band;
 
         if (on_playhead_handle && hovered_keyframe_.has_value()) {
             const float kf_x = timeToX(keyframes[*hovered_keyframe_].time, pos.x, width);
@@ -434,15 +448,16 @@ namespace lfs::vis {
             }
         }
 
-        if (input.mouse_clicked[0] && mouse_in_timeline && !dragging_keyframe_ &&
-            (on_playhead_handle || !hovered_keyframe_.has_value())) {
+        if (input.mouse_clicked[0] && !dragging_keyframe_ &&
+            (on_playhead_handle ||
+             (mouse_in_timeline && !hovered_keyframe_.has_value()))) {
             dragging_playhead_ = true;
             controller_.beginScrub();
         }
         if (dragging_playhead_) {
             if (input.mouse_down[0]) {
                 float time = xToTime(mx, pos.x, width);
-                time = std::clamp(time, 0.0f, timeline.endTime());
+                time = std::clamp(time, 0.0f, timeline.clipDuration());
                 if (ui_state_.snap_to_grid)
                     time = snapTime(time);
                 controller_.scrub(time);
@@ -582,7 +597,7 @@ namespace lfs::vis {
                                      ? std::clamp(
                                            sequencer_ui::screenXToTime(input.mouse_x, timeline_x, timeline_width,
                                                                        getDisplayEndTime(), pan_offset_),
-                                           controller_.timeline().startTime(), controller_.timeline().endTime())
+                                           0.0f, controller_.timeline().clipDuration())
                                      : 0.0f;
 
         if (film_strip_scrubbing_) {

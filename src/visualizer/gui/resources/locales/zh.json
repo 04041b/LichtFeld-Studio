@@ -708,6 +708,7 @@
     "seq_loop_off": "启用循环播放",
     "seq_loop_on": "禁用循环播放",
     "seq_add": "在当前位置添加关键帧",
+    "seq_clip_duration": "Clip duration (click to edit, in seconds)",
     "seq_speed": "播放速度（点击切换）",
     "seq_snap": "将关键帧对齐到网格（右键点击查看选项）",
     "seq_follow": "播放时跟随播放头",
