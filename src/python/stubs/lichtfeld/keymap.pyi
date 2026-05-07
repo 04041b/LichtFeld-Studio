@@ -260,6 +260,9 @@ def get_key_name(key: int) -> str:
 def get_modifier_string(modifiers: int) -> str:
     """Get display string for modifier bitmask"""
 
+def get_allowed_trigger_kinds(action: Action) -> list:
+    """Get allowed trigger kinds for an action"""
+
 def get_available_profiles() -> list[str]:
     """Get list of available keymap profile names"""
 
