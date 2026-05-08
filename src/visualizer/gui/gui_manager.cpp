@@ -4982,10 +4982,15 @@ namespace lfs::vis::gui {
             LOG_TIMER("gui_render.status_bar_and_StatusBar");
             const float status_bar_h =
                 PanelLayoutManager::STATUS_BAR_HEIGHT * lfs::python::get_shared_dpi_scale();
+            const float status_bar_x = screen.work_pos.x;
+            const float status_bar_y = screen.work_pos.y + screen.work_size.y - status_bar_h;
+            const float status_bar_w = screen.work_size.x;
+            rml_status_bar_.processInput(panel_input, status_bar_x, status_bar_y,
+                                         status_bar_w, status_bar_h);
             rml_status_bar_.render(draw_ctx,
-                                   screen.work_pos.x,
-                                   screen.work_pos.y + screen.work_size.y - status_bar_h,
-                                   screen.work_size.x,
+                                   status_bar_x,
+                                   status_bar_y,
+                                   status_bar_w,
                                    status_bar_h,
                                    panel_input.screen_w,
                                    panel_input.screen_h);

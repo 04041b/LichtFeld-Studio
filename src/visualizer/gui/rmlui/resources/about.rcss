@@ -17,6 +17,14 @@
     font-size: 10dp;
 }
 
+.info-val--copy {
+    cursor: pointer;
+}
+
+.info-val--copy:hover {
+    text-decoration: underline;
+}
+
 .link-row {
     display: flex;
     align-items: center;
