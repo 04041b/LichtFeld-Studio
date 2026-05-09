@@ -324,12 +324,11 @@ namespace {
         const fs::path usdz_path = temp_dir / "roundtrip.usdz";
         std::vector<float> updates;
 
-        ASSERT_TRUE(save_nurec_usdz(original, {
-                                                .output_path = usdz_path,
-                                                .progress_callback = [&](float progress, const std::string&) {
-                                                    updates.push_back(progress);
-                                                    return true;
-                                                }})
+        ASSERT_TRUE(save_nurec_usdz(original, {.output_path = usdz_path,
+                                               .progress_callback = [&](float progress, const std::string&) {
+                                                   updates.push_back(progress);
+                                                   return true;
+                                               }})
                         .has_value());
         ASSERT_TRUE(fs::exists(usdz_path));
         expect_progress_completed(updates);
@@ -365,11 +364,10 @@ namespace {
         const std::string existing_contents = "existing usdz data";
         write_text_file(usdz_path, existing_contents);
 
-        auto result = save_nurec_usdz(original, {
-                                                    .output_path = usdz_path,
-                                                    .progress_callback = [](float progress, const std::string&) {
-                                                        return progress < 1.0f;
-                                                    }});
+        auto result = save_nurec_usdz(original, {.output_path = usdz_path,
+                                                 .progress_callback = [](float progress, const std::string&) {
+                                                     return progress < 1.0f;
+                                                 }});
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error().code, ErrorCode::CANCELLED);
         expect_existing_target_and_no_temp_files(usdz_path, existing_contents);

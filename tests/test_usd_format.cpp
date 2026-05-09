@@ -155,12 +155,11 @@ namespace {
         const fs::path usd_path = temp_dir / "roundtrip.usda";
         std::vector<float> updates;
 
-        ASSERT_TRUE(save_usd(original, {
-                                      .output_path = usd_path,
-                                      .progress_callback = [&](float progress, const std::string&) {
-                                          updates.push_back(progress);
-                                          return true;
-                                      }})
+        ASSERT_TRUE(save_usd(original, {.output_path = usd_path,
+                                        .progress_callback = [&](float progress, const std::string&) {
+                                            updates.push_back(progress);
+                                            return true;
+                                        }})
                         .has_value());
         ASSERT_TRUE(fs::exists(usd_path));
         expect_progress_completed(updates);
@@ -233,11 +232,10 @@ namespace {
         const std::string existing_contents = "existing usd data";
         write_text_file(usd_path, existing_contents);
 
-        auto result = save_usd(splat, {
-                                          .output_path = usd_path,
-                                          .progress_callback = [](float progress, const std::string&) {
-                                              return progress < 1.0f;
-                                          }});
+        auto result = save_usd(splat, {.output_path = usd_path,
+                                       .progress_callback = [](float progress, const std::string&) {
+                                           return progress < 1.0f;
+                                       }});
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error().code, ErrorCode::CANCELLED);
         expect_existing_target_and_no_temp_files(usd_path, existing_contents);
