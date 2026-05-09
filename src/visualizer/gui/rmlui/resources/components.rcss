@@ -203,7 +203,13 @@ input[type="text"]:focus {
     border-color: #89b4fa;
 }
 
-input[type="text"]:focus-visible,
+input[type="text"]:focus-visible {
+    color: #cdd6f4;
+    background-color: #313244;
+    border-color: #89b4fa;
+    box-shadow: none;
+}
+
 select:focus-visible,
 button:focus-visible,
 .btn:focus-visible,
