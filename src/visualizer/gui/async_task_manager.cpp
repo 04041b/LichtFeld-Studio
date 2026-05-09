@@ -9,6 +9,7 @@
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
+#include "core/services.hpp"
 #include "gui/gui_manager.hpp"
 #include "gui/html_viewer_export.hpp"
 #include "gui/panel_registry.hpp"
@@ -27,12 +28,14 @@
 #include "visualizer/gui/video_widget_interface.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer_impl.hpp"
+#include "window/window_manager.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <format>
 #include <functional>
 #include <future>
+#include <shared_mutex>
 #include <type_traits>
 
 namespace lfs::vis::gui {
@@ -70,6 +73,38 @@ namespace lfs::vis::gui {
 
     void truncateSHDegree(lfs::core::SplatData& splat, const int target_degree) {
         splat.set_sh_degree(target_degree);
+    }
+
+    struct BorrowExportPlan {
+        core::Scene::MergeStorageMode storage_mode = core::Scene::MergeStorageMode::Clone;
+        std::shared_mutex* model_mutex = nullptr;
+    };
+
+    [[nodiscard]] BorrowExportPlan makeBorrowSingleIdentityExportPlan(const lfs::vis::SceneManager& scene_manager,
+                                                                      const std::vector<std::string>& node_names) {
+        BorrowExportPlan plan;
+        if (node_names.size() != 1)
+            return plan;
+
+        const auto& scene = scene_manager.getScene();
+        const auto* const node = scene.getNode(node_names.front());
+        if (!node || node->type != core::NodeType::SPLAT || !node->model)
+            return plan;
+
+        if (node->model->has_deleted_mask())
+            return plan;
+
+        if (node->name == scene.getTrainingModelNodeName()) {
+            const auto* const trainer_manager = scene_manager.getTrainerManager();
+            const auto* const trainer = trainer_manager ? trainer_manager->getTrainer() : nullptr;
+            if (trainer && trainer->is_running() && !trainer->is_paused())
+                return plan;
+            if (trainer)
+                plan.model_mutex = &trainer->getRenderMutex();
+        }
+
+        plan.storage_mode = core::Scene::MergeStorageMode::BorrowSingleIdentity;
+        return plan;
     }
 
     template <typename F>
@@ -613,39 +648,39 @@ namespace lfs::vis::gui {
             return;
 
         const auto& scene = scene_manager->getScene();
-        std::vector<std::pair<const lfs::core::SplatData*, glm::mat4>> splats;
+        std::vector<ExportSplatSource> splats;
         splats.reserve(node_names.size());
         for (const auto& name : node_names) {
             const auto* node = scene.getNode(name);
             if (node && node->type == core::NodeType::SPLAT && node->model) {
-                splats.emplace_back(node->model.get(), scene_coords::nodeDataWorldTransform(scene, node->id));
+                splats.push_back(ExportSplatSource{
+                    .data = node->model.get(),
+                    .transform = scene_coords::nodeDataWorldTransform(scene, node->id)});
             }
         }
         if (splats.empty())
             return;
 
-        auto merged = core::Scene::mergeSplatsWithTransforms(splats);
-        if (!merged)
-            return;
-
-        if (sh_degree < merged->get_max_sh_degree()) {
-            truncateSHDegree(*merged, sh_degree);
-        }
-
-        // Store RAD LOD ratios and flip_y for use during export
-        {
-            const std::lock_guard lock(export_state_.mutex);
-            export_state_.rad_lod_ratios = rad_lod_ratios;
-            export_state_.rad_flip_y = rad_flip_y;
-        }
-
-        startAsyncExport(format, path, std::move(merged));
+        auto borrow_plan = makeBorrowSingleIdentityExportPlan(*scene_manager, node_names);
+        startAsyncExport(format,
+                         path,
+                         std::move(splats),
+                         sh_degree,
+                         borrow_plan.storage_mode == core::Scene::MergeStorageMode::BorrowSingleIdentity,
+                         borrow_plan.model_mutex,
+                         rad_lod_ratios,
+                         rad_flip_y);
     }
 
     void AsyncTaskManager::startAsyncExport(ExportFormat format,
                                             const std::filesystem::path& path,
-                                            std::unique_ptr<lfs::core::SplatData> data) {
-        if (!data) {
+                                            std::vector<ExportSplatSource> splats,
+                                            int sh_degree,
+                                            bool borrow_single_identity,
+                                            std::shared_mutex* model_mutex,
+                                            std::vector<float> rad_lod_ratios,
+                                            bool rad_flip_y) {
+        if (splats.empty()) {
             LOG_ERROR("No splat data to export");
             return;
         }
@@ -661,135 +696,194 @@ namespace lfs::vis::gui {
             export_state_.path = path;
         }
 
-        auto splat_data = std::shared_ptr<lfs::core::SplatData>(std::move(data));
         LOG_INFO("Export started: {} (format: {})", lfs::core::path_to_utf8(path), static_cast<int>(format));
 
         export_state_.thread.emplace(
-            [this, format, path, splat_data](std::stop_token stop_token) {
-                auto update_progress = [this, &stop_token](float progress, const std::string& stage) -> bool {
+            [this,
+             format,
+             path,
+             splats = std::move(splats),
+             sh_degree,
+             borrow_single_identity,
+             model_mutex,
+             rad_lod_ratios = std::move(rad_lod_ratios),
+             rad_flip_y](
+                std::stop_token stop_token) mutable {
+                bool cancellation_logged = false;
+                auto update_progress = [this, &stop_token, &cancellation_logged](float progress, const std::string& stage) -> bool {
+                    if (stop_token.stop_requested() || export_state_.cancel_requested.load()) {
+                        if (!cancellation_logged) {
+                            LOG_INFO("Export cancelled");
+                            cancellation_logged = true;
+                        }
+                        {
+                            const std::lock_guard lock(export_state_.mutex);
+                            export_state_.stage = "Cancelled";
+                        }
+                        if (auto* window_manager = services().windowOrNull()) {
+                            window_manager->wakeEventLoop();
+                        }
+                        return false;
+                    }
                     export_state_.progress.store(progress);
                     {
                         const std::lock_guard lock(export_state_.mutex);
                         export_state_.stage = stage;
                     }
-                    if (stop_token.stop_requested() || export_state_.cancel_requested.load()) {
-                        LOG_INFO("Export cancelled");
-                        return false;
+                    if (auto* window_manager = services().windowOrNull()) {
+                        window_manager->wakeEventLoop();
                     }
                     return true;
                 };
 
                 bool success = false;
+                bool cancelled = false;
                 std::string error_msg;
+                std::unique_ptr<lfs::core::SplatData> splat_data;
+                std::optional<std::shared_lock<std::shared_mutex>> model_lock;
 
                 try {
+                    if (!update_progress(0.0f, "Preparing export data")) {
+                        cancelled = true;
+                        error_msg = "Export cancelled by user";
+                    }
 
-                    switch (format) {
-                    case ExportFormat::PLY: {
-                        update_progress(0.1f, "Writing PLY");
-                        const lfs::io::PlySaveOptions options{
-                            .output_path = path,
-                            .binary = true,
-                            .async = false,
-                            .extra_attributes = {}};
-                        if (auto result = lfs::io::save_ply(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
-                            if (result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
-                                lfs::core::events::state::DiskSpaceSaveFailed{
-                                    .iteration = 0,
-                                    .path = path,
-                                    .error = result.error().message,
-                                    .required_bytes = result.error().required_bytes,
-                                    .available_bytes = result.error().available_bytes,
-                                    .is_disk_space_error = true,
-                                    .is_checkpoint = false}
-                                    .emit();
+                    if (!cancelled && model_mutex) {
+                        model_lock.emplace(*model_mutex);
+                    }
+
+                    if (!cancelled) {
+                        std::vector<std::pair<const lfs::core::SplatData*, glm::mat4>> merge_inputs;
+                        merge_inputs.reserve(splats.size());
+                        for (const auto& source : splats) {
+                            if (source.data) {
+                                merge_inputs.emplace_back(source.data, source.transform);
                             }
                         }
-                        break;
-                    }
-                    case ExportFormat::SOG: {
-                        const lfs::io::SogSaveOptions options{
-                            .output_path = path,
-                            .kmeans_iterations = 10,
-                            .progress_callback = update_progress};
-                        if (auto result = lfs::io::save_sog(*splat_data, options); result) {
-                            success = true;
-                        } else {
-                            error_msg = result.error().message;
+
+                        const auto storage_mode = borrow_single_identity
+                                                      ? core::Scene::MergeStorageMode::BorrowSingleIdentity
+                                                      : core::Scene::MergeStorageMode::Clone;
+                        splat_data = core::Scene::mergeSplatsWithTransforms(merge_inputs, storage_mode);
+                        if (!splat_data) {
+                            error_msg = "No splat data to export";
+                        } else if (sh_degree < splat_data->get_max_sh_degree()) {
+                            truncateSHDegree(*splat_data, sh_degree);
                         }
-                        break;
+                        model_lock.reset();
                     }
-                    case ExportFormat::SPZ: {
-                        update_progress(0.1f, "Writing SPZ");
-                        const lfs::io::SpzSaveOptions options{.output_path = path};
-                        if (auto result = lfs::io::save_spz(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
-                        }
-                        break;
+
+                    if (!cancelled && splat_data && !update_progress(0.0f, "Export data prepared")) {
+                        cancelled = true;
+                        error_msg = "Export cancelled by user";
                     }
-                    case ExportFormat::HTML_VIEWER: {
-                        const HtmlViewerExportOptions options{
-                            .output_path = path,
-                            .progress_callback = [&update_progress](float p, const std::string& s) {
-                                update_progress(p, s);
-                            }};
-                        if (auto result = export_html_viewer(*splat_data, options); result) {
-                            success = true;
-                        } else {
-                            error_msg = result.error();
+
+                    if (!cancelled && splat_data) {
+                        switch (format) {
+                        case ExportFormat::PLY: {
+                            const lfs::io::PlySaveOptions options{
+                                .output_path = path,
+                                .binary = true,
+                                .async = false,
+                                .progress_callback = update_progress,
+                                .extra_attributes = {}};
+                            if (auto result = lfs::io::save_ply(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                                if (result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
+                                    lfs::core::events::state::DiskSpaceSaveFailed{
+                                        .iteration = 0,
+                                        .path = path,
+                                        .error = result.error().message,
+                                        .required_bytes = result.error().required_bytes,
+                                        .available_bytes = result.error().available_bytes,
+                                        .is_disk_space_error = true,
+                                        .is_checkpoint = false}
+                                        .emit();
+                                }
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    case ExportFormat::USD: {
-                        update_progress(0.1f, "Writing USD");
-                        const lfs::io::UsdSaveOptions options{.output_path = path};
-                        if (auto result = lfs::io::save_usd(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
+                        case ExportFormat::SOG: {
+                            const lfs::io::SogSaveOptions options{
+                                .output_path = path,
+                                .kmeans_iterations = 10,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_sog(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    case ExportFormat::NUREC_USDZ: {
-                        update_progress(0.1f, "Writing USDZ");
-                        const lfs::io::NurecUsdzSaveOptions options{.output_path = path};
-                        if (auto result = lfs::io::save_nurec_usdz(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
+                        case ExportFormat::SPZ: {
+                            const lfs::io::SpzSaveOptions options{
+                                .output_path = path,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_spz(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    case ExportFormat::RAD: {
-                        std::vector<float> lod_ratios;
-                        bool flip_y = false;
-                        {
-                            const std::lock_guard lock(export_state_.mutex);
-                            lod_ratios = export_state_.rad_lod_ratios;
-                            flip_y = export_state_.rad_flip_y;
+                        case ExportFormat::HTML_VIEWER: {
+                            const lfs::io::HtmlExportOptions options{
+                                .output_path = path,
+                                .kmeans_iterations = 10,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::export_html(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        const lfs::io::RadSaveOptions options{
-                            .output_path = path,
-                            .compression_level = 6,
-                            .lod_ratios = lod_ratios,
-                            .flip_y = flip_y,
-                            .progress_callback = update_progress};
-                        if (auto result = lfs::io::save_rad(*splat_data, options); result) {
-                            success = true;
-                        } else {
-                            error_msg = result.error().message;
+                        case ExportFormat::USD: {
+                            const lfs::io::UsdSaveOptions options{
+                                .output_path = path,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_usd(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        break;
-                    }
+                        case ExportFormat::NUREC_USDZ: {
+                            const lfs::io::NurecUsdzSaveOptions options{
+                                .output_path = path,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_nurec_usdz(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
+                        }
+                        case ExportFormat::RAD: {
+                            const lfs::io::RadSaveOptions options{
+                                .output_path = path,
+                                .compression_level = 6,
+                                .lod_ratios = rad_lod_ratios,
+                                .flip_y = rad_flip_y,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_rad(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
+                        }
+                        }
                     }
 
                 } catch (const std::exception& e) {
@@ -798,6 +892,12 @@ namespace lfs::vis::gui {
                 } catch (...) {
                     error_msg = "Export crashed with unknown exception";
                     LOG_ERROR("{}", error_msg);
+                }
+
+                if (success && (stop_token.stop_requested() || export_state_.cancel_requested.load())) {
+                    success = false;
+                    cancelled = true;
+                    error_msg = "Export cancelled by user";
                 }
 
                 if (success) {
@@ -809,6 +909,16 @@ namespace lfs::vis::gui {
                     lfs::core::events::state::ExportCompleted{
                         .path = path,
                         .format = format}
+                        .emit();
+                } else if (cancelled) {
+                    LOG_INFO("Export cancelled: {}", lfs::core::path_to_utf8(path));
+                    {
+                        const std::lock_guard lock(export_state_.mutex);
+                        export_state_.error = error_msg;
+                        export_state_.stage = "Cancelled";
+                    }
+                    lfs::core::events::state::ExportFailed{
+                        .error = error_msg}
                         .emit();
                 } else {
                     LOG_ERROR("Export failed: {}", error_msg);
@@ -822,6 +932,8 @@ namespace lfs::vis::gui {
                         .emit();
                 }
 
+                splat_data.reset();
+                lfs::core::Tensor::trim_memory_pool();
                 export_state_.active.store(false);
             });
     }
@@ -831,6 +943,10 @@ namespace lfs::vis::gui {
             return;
         LOG_INFO("Cancelling export");
         export_state_.cancel_requested.store(true);
+        {
+            const std::lock_guard lock(export_state_.mutex);
+            export_state_.stage = "Cancelling";
+        }
         if (export_state_.thread && export_state_.thread->joinable()) {
             export_state_.thread->request_stop();
         }

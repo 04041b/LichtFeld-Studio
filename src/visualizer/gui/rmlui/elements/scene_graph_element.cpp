@@ -8,6 +8,7 @@
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/tensor.hpp"
 #include "gui/global_context_menu.hpp"
 #include "gui/gui_manager.hpp"
 #include "gui/panel_registry.hpp"
@@ -329,6 +330,8 @@ namespace lfs::vis::gui {
             default:
                 return;
             }
+
+            lfs::core::Tensor::trim_memory_pool();
 
             if (!result) {
                 LOG_ERROR("Failed to save '{}' to {}: {}",

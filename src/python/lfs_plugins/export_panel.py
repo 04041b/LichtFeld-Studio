@@ -43,6 +43,16 @@ FORMAT_INFO = (
     (ExportFormat.HTML_VIEWER, "export.format.html_viewer"),
 )
 
+EXPORT_PROGRESS_FORMAT_NAMES = {
+    ExportFormat.PLY: "PLY",
+    ExportFormat.SOG: "SOG",
+    ExportFormat.SPZ: "SPZ",
+    ExportFormat.HTML_VIEWER: "HTML",
+    ExportFormat.USD: "USD",
+    ExportFormat.NUREC_USDZ: "USDZ",
+    ExportFormat.RAD: "RAD",
+}
+
 SCRUB_FIELD_DEFS = {
     "sh_degree": ScrubFieldSpec(0.0, 3.0, 1.0, "%d", data_type=int),
 }
@@ -50,6 +60,10 @@ SCRUB_FIELD_DEFS = {
 
 def _xml_unescape(text):
     return html.unescape(text or "")
+
+
+def _progress_format_name(fmt):
+    return EXPORT_PROGRESS_FORMAT_NAMES.get(fmt, "file")
 
 
 class ExportPanel(Panel):
@@ -670,6 +684,12 @@ class ExportPanel(Panel):
             self._exporting = True
             self._last_progress = -1.0
             self._progress_value = "0"
+            self._cached_export_state = {
+                "active": True,
+                "progress": 0.0,
+                "stage": "Starting",
+                "format": _progress_format_name(self._format),
+            }
             self._dirty_model(
                 "show_form",
                 "show_progress",
@@ -693,6 +713,8 @@ class ExportPanel(Panel):
 
     def _update_export_progress(self):
         state = lf.ui.get_export_state()
+        previous_format = self._cached_export_state.get("format")
+        previous_stage = self._cached_export_state.get("stage")
         self._cached_export_state = state
         if not state.get("active", False):
             self._exporting = False
@@ -706,10 +728,16 @@ class ExportPanel(Panel):
             return True
 
         progress = state.get("progress", 0.0)
-        if progress != self._last_progress:
+        current_format = state.get("format", "file")
+        current_stage = state.get("stage", "")
+        if (
+            progress != self._last_progress
+            or current_format != previous_format
+            or current_stage != previous_stage
+        ):
             self._last_progress = progress
             self._progress_value = str(progress)
-            self._dirty_model("progress_value", "progress_pct", "progress_stage")
+            self._dirty_model("progress_value", "progress_title", "progress_pct", "progress_stage")
             return True
 
         return False

@@ -12,6 +12,7 @@
 #include "core/tensor.hpp"
 #include "cuda/kmeans.hpp"
 #include "cuda/morton_encoding.hpp"
+#include "io/atomic_output.hpp"
 #include "io/error.hpp"
 #include <archive.h>
 #include <archive_entry.h>
@@ -790,6 +791,25 @@ namespace lfs::io {
             [[nodiscard]] bool is_valid() const { return valid_; }
             [[nodiscard]] const std::string& last_error() const { return last_error_; }
 
+            [[nodiscard]] Result<void> close() {
+                if (!a_ || !valid_) {
+                    return {};
+                }
+
+                const int result = archive_write_close(a_);
+                valid_ = false;
+
+                if (result != ARCHIVE_OK) {
+                    return make_error(ErrorCode::ARCHIVE_CREATION_FAILED,
+                                      std::format("Failed to close SOG archive '{}': {}",
+                                                  lfs::core::path_to_utf8(output_path_),
+                                                  archive_error_string(a_) ? archive_error_string(a_) : "unknown error"),
+                                      output_path_);
+                }
+
+                return {};
+            }
+
             [[nodiscard]] Result<void> add_file(const std::string& filename, const void* data, size_t size) {
                 if (!valid_) {
                     return make_error(ErrorCode::ARCHIVE_CREATION_FAILED, last_error_, output_path_);
@@ -966,7 +986,8 @@ namespace lfs::io {
         const auto* indices = sort_indices_cpu.ptr<int64_t>();
 
         auto means_cpu = means_cuda.cpu();
-        SogArchive archive(options.output_path);
+        ScopedAtomicOutputFile atomic_output(options.output_path);
+        SogArchive archive(atomic_output.temp_path());
 
         // Check archive was created successfully
         if (!archive.is_valid()) {
@@ -1244,8 +1265,19 @@ namespace lfs::io {
             return std::unexpected(result.error());
         }
 
+        if (auto result = archive.close(); !result) {
+            return std::unexpected(result.error());
+        }
+
+        if (!report_progress(1.0f, "Complete")) {
+            return make_error(ErrorCode::CANCELLED, "Export cancelled by user");
+        }
+
+        if (auto result = atomic_output.commit(); !result) {
+            return std::unexpected(result.error());
+        }
+
         LOG_INFO("SOG export complete: {} splats", num_rows);
-        report_progress(1.0f, "Complete");
         return {};
     }
 

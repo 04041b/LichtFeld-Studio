@@ -323,6 +323,22 @@ namespace lfs::vis::gui {
                            .color = color});
         }
 
+        void appendViewportDimOverlay(VulkanViewportPassParams& params) {
+            if (params.viewport_size.x <= 0.0f || params.viewport_size.y <= 0.0f) {
+                return;
+            }
+
+            constexpr std::uint32_t kDimOverlayVertexCount = 6;
+            const glm::vec2 a = params.viewport_pos;
+            const glm::vec2 b = params.viewport_pos + glm::vec2(params.viewport_size.x, 0.0f);
+            const glm::vec2 c = params.viewport_pos + params.viewport_size;
+            const glm::vec2 d = params.viewport_pos + glm::vec2(0.0f, params.viewport_size.y);
+            const glm::vec4 dim_color{0.08f, 0.09f, 0.11f, 0.62f};
+            appendScreenOverlayTriangle(params.overlay_triangles, params, a, b, c, dim_color);
+            appendScreenOverlayTriangle(params.overlay_triangles, params, a, c, d, dim_color);
+            params.post_ui_overlay_vertex_count += kDimOverlayVertexCount;
+        }
+
         void appendLineRendererCommandOverlays(VulkanViewportPassParams& params) {
             const auto commands = consumeLineRendererCommands();
             for (const auto& command : commands) {
@@ -4288,6 +4304,7 @@ namespace lfs::vis::gui {
                                                                    const std::size_t frame_slot) const {
         const bool has_viewport_layout =
             viewport_layout_.size.x > 0.0f && viewport_layout_.size.y > 0.0f;
+        const bool export_locked = isViewportExportLocked();
 
         VulkanViewportPassParams params{};
         params.frame_slot = frame_slot;
@@ -4299,6 +4316,7 @@ namespace lfs::vis::gui {
             ImGui::GetIO().DisplayFramebufferScale.x,
             ImGui::GetIO().DisplayFramebufferScale.y,
         };
+
         params.scene_image = vulkan_scene_image_;
         params.scene_image_size = vulkan_scene_image_size_;
         params.scene_image_flip_y = vulkan_scene_image_flip_y_;
@@ -4313,18 +4331,36 @@ namespace lfs::vis::gui {
             params.external_scene_image_layout = vulkan_external_scene_image_layout_;
             params.external_scene_image_generation = vulkan_external_scene_image_generation_;
         }
-        if (params.external_scene_image == VK_NULL_HANDLE && frame_slot < vulkan_scene_interop_.size()) {
-            const auto& target = vulkan_scene_interop_[frame_slot];
-            if (target &&
-                target->interop.valid() &&
-                target->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
-                target->size == params.scene_image_size &&
-                vulkan_scene_image_generation_ != 0 &&
-                target->uploaded_source_generation == vulkan_scene_image_generation_) {
-                params.external_scene_image = target->image.image;
-                params.external_scene_image_view = target->image.view;
-                params.external_scene_image_layout = target->layout;
-                params.external_scene_image_generation = target->generation;
+        const auto bind_cached_interop_slot = [&](const std::size_t slot) -> bool {
+            if (slot >= vulkan_scene_interop_.size()) {
+                return false;
+            }
+            const auto& target = vulkan_scene_interop_[slot];
+            if (!target ||
+                !target->interop.valid() ||
+                target->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
+                target->size != params.scene_image_size ||
+                vulkan_scene_image_generation_ == 0 ||
+                target->uploaded_source_generation != vulkan_scene_image_generation_) {
+                return false;
+            }
+
+            params.external_scene_image = target->image.image;
+            params.external_scene_image_view = target->image.view;
+            params.external_scene_image_layout = target->layout;
+            params.external_scene_image_generation = target->generation;
+            return true;
+        };
+        if (params.external_scene_image == VK_NULL_HANDLE) {
+            const bool bound_current_slot = bind_cached_interop_slot(frame_slot);
+            if (!bound_current_slot && export_locked) {
+                // Export mode freezes the viewport and skips new CUDA/Vulkan interop uploads.
+                // Reuse any already-prepared slot so multi-buffered frames keep the same image.
+                for (std::size_t slot = 0; slot < vulkan_scene_interop_.size(); ++slot) {
+                    if (slot != frame_slot && bind_cached_interop_slot(slot)) {
+                        break;
+                    }
+                }
             }
         }
 
@@ -4482,6 +4518,10 @@ namespace lfs::vis::gui {
         params.vignette_intensity = vignette.intensity;
         params.vignette_radius = vignette.radius;
         params.vignette_softness = vignette.softness;
+
+        if (export_locked) {
+            appendViewportDimOverlay(params);
+        }
 
         return params;
     }
@@ -5045,7 +5085,7 @@ namespace lfs::vis::gui {
             VkClearValue clear_value{};
             clear_value.color = VkClearColorValue{{bg.x, bg.y, bg.z, 1.0f}};
 
-            if (vulkan_context) {
+            if (vulkan_context && !isViewportExportLocked()) {
                 LOG_TIMER("gui_render.prepareVulkanSceneInterop");
                 prepareVulkanSceneInterop(*vulkan_context);
                 prepareVulkanSplitRightInterop(*vulkan_context);
@@ -5115,6 +5155,10 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::renderSelectionOverlays(const UIContext& ctx) {
+        if (isViewportExportLocked()) {
+            return;
+        }
+
         if (auto* const tool = ctx.viewer->getBrushTool(); tool && tool->isEnabled() && !ui_hidden_) {
             tool->renderUI(ctx, nullptr);
         }
@@ -5603,6 +5647,10 @@ namespace lfs::vis::gui {
             return {.blocks_pointer = true, .takes_keyboard_focus = true};
         }
 
+        if (isViewportExportLocked() && isPositionInViewport(x, y)) {
+            return {.blocks_pointer = true, .takes_keyboard_focus = true};
+        }
+
         if (panel_layout_.isResizingPanel() || isPositionOverFloatingPanel(x, y)) {
             return {.blocks_pointer = true, .takes_keyboard_focus = true};
         }
@@ -5625,6 +5673,7 @@ namespace lfs::vis::gui {
             isModalWindowOpen() ||
             startup_overlay_.isVisible() ||
             (global_context_menu_ && global_context_menu_->isOpen()) ||
+            isViewportExportLocked() ||
             sequencer_ui_.blocksKeyboard();
 
         return {
@@ -5872,6 +5921,8 @@ namespace lfs::vis::gui {
     }
 
     bool GuiManager::needsAnimationFrame() const {
+        if (isViewportExportLocked())
+            return true;
         if (startup_overlay_.needsAnimationFrame())
             return true;
         if (video_widget_ && video_widget_->isVideoPlaying())
@@ -5883,6 +5934,10 @@ namespace lfs::vis::gui {
         if (PanelRegistry::instance().needsAnimationFrame())
             return true;
         return false;
+    }
+
+    bool GuiManager::isViewportExportLocked() const {
+        return async_tasks_.isExporting() || async_tasks_.isExportingVideo();
     }
 
     void GuiManager::dismissStartupOverlay() {

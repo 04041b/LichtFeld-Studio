@@ -88,6 +88,7 @@ namespace lfs::vis {
 
             // State queries
             bool needsAnimationFrame() const;
+            [[nodiscard]] bool isViewportExportLocked() const;
 
             // Window visibility
             void showWindow(const std::string& name, bool show = true);
