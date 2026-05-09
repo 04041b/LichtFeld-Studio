@@ -57,7 +57,7 @@
 }
 
 .asset-search-icon {
-    font-size: 10dp;
+    font-size: 12dp;
     color: #a9a093;
     margin-right: 6dp;
 }
@@ -67,7 +67,7 @@
     background-color: transparent;
     border-width: 0;
     color: #d8d0c3;
-    font-size: 11dp;
+    font-size: 12dp;
     padding: 0 0 0 6dp;
 }
 
@@ -85,7 +85,7 @@
     border-width: 1dp;
     border-color: #514a42;
     color: #d8d0c3;
-    font-size: 11dp;
+    font-size: 12dp;
     padding: 4dp 10dp;
     border-radius: 4dp;
     cursor: pointer;
@@ -108,7 +108,7 @@
 
 .asset-view-button {
     color: #a9a093;
-    font-size: 10dp;
+    font-size: 12dp;
 }
 
 .asset-view-button.is-active {
@@ -129,7 +129,7 @@
     border-width: 1dp;
     border-color: #6ba08d;
     color: #1a1a1a;
-    font-size: 11dp;
+    font-size: 12dp;
     padding: 4dp 10dp;
     border-radius: 4dp;
     cursor: pointer;
@@ -161,7 +161,7 @@
 
 .asset-import-menu-item {
     padding: 6dp 12dp;
-    font-size: 11dp;
+    font-size: 12dp;
     color: #d8d0c3;
     cursor: pointer;
 }
@@ -179,7 +179,7 @@
     background-color: #24221f;
     border-bottom-width: 1dp;
     border-bottom-color: #3c3630;
-    font-size: 11dp;
+    font-size: 12dp;
     color: #a9a093;
 }
 
@@ -230,11 +230,11 @@
 
 .asset-sidebar-title,
 .asset-info-section-title {
-    font-size: 9dp;
+    font-size: 12dp;
     font-weight: bold;
     color: #a9a093;
     margin-bottom: 8dp;
-    letter-spacing: 0.5dp;
+    letter-spacing: 0.2dp;
 }
 
 .asset-filter-row {
@@ -257,7 +257,7 @@
 }
 
 .asset-row-label {
-    font-size: 11dp;
+    font-size: 12dp;
     color: #d8d0c3;
 }
 
@@ -266,7 +266,7 @@
 }
 
 .asset-filter-hint {
-    font-size: 9dp;
+    font-size: 12dp;
     color: #7a7268;
     margin-bottom: 6dp;
 }
@@ -295,12 +295,12 @@
 
 .asset-filter-checkbox-row .asset-row-label {
     flex: 1;
-    font-size: 11dp;
+    font-size: 12dp;
     color: #d8d0c3;
 }
 
 .asset-row-count {
-    font-size: 10dp;
+    font-size: 12dp;
     color: #a9a093;
 }
 
@@ -379,7 +379,7 @@
 }
 
 .asset-gallery-subtitle {
-    font-size: 10dp;
+    font-size: 12dp;
     color: #a9a093;
     display: block;
     margin-top: 2dp;
@@ -487,7 +487,7 @@
     border-color: #7fb9a5;
     border-radius: 3dp;
     color: #7fb9a5;
-    font-size: 10dp;
+    font-size: 12dp;
     text-align: center;
     line-height: 14dp;
 }
@@ -498,7 +498,7 @@
 }
 
 .asset-pill {
-    font-size: 9dp;
+    font-size: 12dp;
     font-weight: bold;
     padding: 2dp 6dp;
     border-radius: 3dp;
@@ -546,7 +546,7 @@
 .asset-card-context,
 .asset-card-subtitle,
 .asset-list-secondary {
-    font-size: 9dp;
+    font-size: 12dp;
     color: #a9a093;
 }
 
@@ -597,7 +597,7 @@
     display: flex;
     flex-direction: column;
     gap: 2dp;
-    font-size: 10dp;
+    font-size: 12dp;
     color: #a9a093;
 }
 
@@ -610,7 +610,7 @@
 }
 
 .asset-card-tag {
-    font-size: 9dp;
+    font-size: 12dp;
     color: #a9a093;
     background-color: #38342f;
     padding: 2dp 6dp;
@@ -629,7 +629,7 @@
 
 .asset-card-button {
     flex: 1;
-    font-size: 9dp;
+    font-size: 12dp;
     padding: 3dp 6dp;
 }
 
@@ -687,7 +687,7 @@
 
 .asset-dropdown-item {
     padding: 8dp 12dp;
-    font-size: 11dp;
+    font-size: 12dp;
     color: #d8d0c3;
     cursor: pointer;
     border-bottom-width: 1dp;
@@ -802,7 +802,7 @@
     border-radius: 4dp;
     background-color: #2e2b27;
     color: #a9a093;
-    font-size: 10dp;
+    font-size: 12dp;
     font-weight: 600;
 }
 
@@ -814,7 +814,7 @@
     background-color: #302d29;
     color: #d8d0c3;
     cursor: pointer;
-    font-size: 10dp;
+    font-size: 12dp;
 }
 
 .asset-list-name,
@@ -907,7 +907,7 @@
     flex: 1;
     text-align: center;
     padding: 8dp 4dp;
-    font-size: 11dp;
+    font-size: 12dp;
     color: #a9a093;
     cursor: pointer;
     border-bottom-width: 2dp;
@@ -955,7 +955,7 @@
     width: 110dp;
     min-width: 110dp;
     color: #a9a093;
-    font-size: 10dp;
+    font-size: 12dp;
 }
 
 .parameter-value {
@@ -963,7 +963,7 @@
     min-width: 0;
     text-align: left;
     color: #f0ebe2;
-    font-size: 10dp;
+    font-size: 12dp;
     white-space: normal;
     word-break: break-word;
 }
@@ -990,14 +990,14 @@
 
 .asset-run-name {
     color: #f0ebe2;
-    font-size: 10dp;
+    font-size: 12dp;
     font-weight: 600;
 }
 
 .asset-run-status,
 .asset-run-summary {
     color: #a9a093;
-    font-size: 9dp;
+    font-size: 12dp;
 }
 
 .asset-info-warning {
@@ -1035,7 +1035,7 @@
 }
 
 .asset-tag-remove {
-    font-size: 9dp;
+    font-size: 12dp;
     padding: 2dp 6dp;
 }
 
@@ -1071,7 +1071,7 @@
 
 .asset-info-empty-text {
     color: #a9a093;
-    font-size: 11dp;
+    font-size: 12dp;
 }
 
 #asset-popup-footer {

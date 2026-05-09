@@ -143,8 +143,8 @@ body {
     position: absolute;
     bottom: -1dp;
     right: 0;
-    font-size: 5dp;
-    line-height: 7dp;
+    font-size: 12dp;
+    line-height: 12dp;
     color: rgba(200, 210, 230, 140);
 }
 
@@ -160,12 +160,12 @@ body {
 }
 
 .transport-label {
-    font-size: 10dp;
+    font-size: 12dp;
     white-space: nowrap;
 }
 
 .transport-info {
-    font-size: 10dp;
+    font-size: 12dp;
     opacity: 0.6;
     flex-shrink: 0;
 }
@@ -200,7 +200,7 @@ body {
     border-color: #45475a;
     border-radius: 6dp;
     font-family: "JetBrains Mono";
-    font-size: 11dp;
+    font-size: 12dp;
     cursor: ew-resize;
     transition: border-color 0.12s quadratic-out, background-color 0.12s quadratic-out;
 }
@@ -233,7 +233,7 @@ body {
     width: 100%;
     text-align: right;
     font-family: "JetBrains Mono";
-    font-size: 11dp;
+    font-size: 12dp;
     color: #cdd6f4;
 }
 
@@ -285,18 +285,18 @@ body {
 }
 
 .speed-val {
-    font-size: 11dp;
+    font-size: 12dp;
     font-weight: bold;
 }
 
 .speed-text {
-    font-size: 10dp;
+    font-size: 12dp;
     opacity: 0.5;
     margin-left: 3dp;
 }
 
 .dropdown-arrow {
-    font-size: 6dp;
+    font-size: 12dp;
     opacity: 0.4;
     margin-left: 2dp;
 }
@@ -375,7 +375,7 @@ body {
     display: block;
     position: absolute;
     top: 0;
-    font-size: 11dp;
+    font-size: 12dp;
     color: rgba(200, 210, 230, 220);
 }
 
@@ -407,7 +407,7 @@ body {
     width: 100%;
     margin-top: -6dp;
     text-align: center;
-    font-size: 10dp;
+    font-size: 12dp;
 }
 
 #keyframes {
@@ -475,7 +475,7 @@ body {
 }
 
 #current-time {
-    font-size: 11dp;
+    font-size: 12dp;
 }
 
 #duration-field {
@@ -505,7 +505,7 @@ body {
 #duration,
 #duration-input {
     font-family: "JetBrains Mono";
-    font-size: 11dp;
+    font-size: 12dp;
     color: #cdd6f4;
 }
 
@@ -858,10 +858,10 @@ body {
 .timeline-tooltip-line {
     display: block;
     white-space: nowrap;
-    font-size: 10dp;
+    font-size: 12dp;
 }
 
 .timeline-tooltip-line.title {
-    font-size: 11dp;
+    font-size: 12dp;
     margin-bottom: 2dp;
 }

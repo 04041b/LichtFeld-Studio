@@ -9,14 +9,14 @@
 }
 
 .is-section-title {
-    font-size: 10dp;
+    font-size: 12dp;
     font-weight: bold;
     margin-bottom: 2dp;
 }
 
 .is-hint {
     display: block;
-    font-size: 11dp;
+    font-size: 12dp;
     margin-bottom: 4dp;
 }
 
@@ -29,7 +29,7 @@
 
 .is-label {
     min-width: 100dp;
-    font-size: 10dp;
+    font-size: 12dp;
 }
 
 .is-select {
@@ -46,7 +46,7 @@
 
 .is-binding-section {
     display: block;
-    font-size: 11dp;
+    font-size: 12dp;
     font-weight: bold;
     padding: 3dp 4dp;
     margin-top: 4dp;
@@ -61,20 +61,20 @@
 
 .is-action-name {
     width: 160dp;
-    font-size: 10dp;
+    font-size: 12dp;
     flex-shrink: 0;
 }
 
 .is-binding-desc {
     flex: 1;
-    font-size: 10dp;
+    font-size: 12dp;
     min-width: 0;
 }
 
 .is-rebind-btn {
     flex-shrink: 0;
     min-width: 60dp;
-    font-size: 11dp;
+    font-size: 12dp;
     padding: 1dp 6dp;
 }
 
@@ -129,7 +129,7 @@
 
 .is-conflict-message {
     display: block;
-    font-size: 11dp;
+    font-size: 12dp;
     margin-bottom: 8dp;
 }
 
