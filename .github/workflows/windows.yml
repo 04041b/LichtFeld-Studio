@@ -158,4 +158,3 @@ jobs:
           if-no-files-found: error
           path: |
             build/LichtFeld-Studio.exe
-            build/${{ matrix.build_type }}/LichtFeld-Studio.exe
