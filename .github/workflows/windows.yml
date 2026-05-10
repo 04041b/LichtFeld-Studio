@@ -150,3 +150,12 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           set PATH=%CD%\build;%CD%\build\vcpkg_installed\x64-windows\bin;%PATH%
           cmake --build build -j %NUMBER_OF_PROCESSORS%
+
+      - name: Upload built executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: LichtFeld-Studio-${{ matrix.build_type }}-exe
+          if-no-files-found: error
+          path: |
+            build/LichtFeld-Studio.exe
+            build/${{ matrix.build_type }}/LichtFeld-Studio.exe
