@@ -164,4 +164,3 @@ jobs:
           path: |
             .
             !.git/**
-            !.git
