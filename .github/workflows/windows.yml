@@ -159,7 +159,7 @@ jobs:
       - name: Upload workspace bundle
         uses: actions/upload-artifact@v4
         with:
-          name: LichtFeld-Studio-${{ matrix.build_type }}-workspace
+          name: LichtFeld-Studio-windows-${{ matrix.build_type }}-workspace
           if-no-files-found: error
           path: |
             .
