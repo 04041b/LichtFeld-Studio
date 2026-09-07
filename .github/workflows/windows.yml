@@ -15,11 +15,9 @@ on:
 
 jobs:
   windows-preflight:
-    if: github.repository == 'MrNeRF/LichtFeld-Studio' || github.event.pull_request.base.repo.full_name == 'MrNeRF/LichtFeld-Studio'
     uses: ./.github/workflows/windows-build-preflight.yml
 
   test-plugin-venv:
-    if: github.repository == 'MrNeRF/LichtFeld-Studio' || github.event.pull_request.base.repo.full_name == 'MrNeRF/LichtFeld-Studio'
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -90,7 +88,6 @@ jobs:
 
   build-windows:
     needs: windows-preflight
-    if: github.repository == 'MrNeRF/LichtFeld-Studio' || github.event.pull_request.base.repo.full_name == 'MrNeRF/LichtFeld-Studio'
     runs-on: windows-2022
     strategy:
       fail-fast: false
