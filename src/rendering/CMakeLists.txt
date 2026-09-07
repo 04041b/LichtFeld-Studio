@@ -10,9 +10,10 @@ find_package(glslang CONFIG REQUIRED)
 set(RENDERING_TENSOR_SOURCES
         cuda_vulkan_interop.cpp
         cuda_vulkan_interop.cu
-        gs_rasterizer_tensor.cpp
+        selection_ops.cu
         raster_rendering_engine.cpp
-        cuda_interaction_kernels.cu
+        export_post_process.cpp
+        export_post_process.cu
         point_cloud_raster.cu
         mesh2splat.cpp
         screen_overlay_renderer.cpp
@@ -24,16 +25,17 @@ target_link_libraries(lfs_rendering_tensor
         PUBLIC
         lfs_core
         PRIVATE
-        lfs_rasterizer
         CUDA::cudart
         glm::glm
         Vulkan::Vulkan
         glslang::glslang
         glslang::SPIRV
         glslang::glslang-default-resource-limits
-        OpenImageIO::OpenImageIO
         spdlog::spdlog
         TBB::tbb
+        # Phase 7C-P3: mesh2splat submitAndWait uses wait_fence_bounded
+        # (implemented in lfs_vulkan_rasterizer's vulkan_wait.cpp).
+        lfs_vulkan_rasterizer
 )
 
 target_include_directories(lfs_rendering_tensor

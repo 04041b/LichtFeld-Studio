@@ -1,10 +1,10 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "core/splat_data.hpp"
-#include "core/tensor.hpp"
 #include "internal/viewport.hpp"
 #include "rendering/rendering.hpp"
+#include "visualizer/rendering/rendering_types.hpp"
+#include "visualizer/rendering/viewport_request_builder.hpp"
 
 #include <gtest/gtest.h>
 
@@ -20,179 +20,6 @@ namespace {
         bool orthographic = false;
         float ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
     };
-
-    lfs::rendering::FrameView makeFrameView(const TestRasterRequest& request) {
-        return lfs::rendering::FrameView{
-            .rotation = request.view_rotation,
-            .translation = request.view_translation,
-            .size = request.viewport_size,
-            .focal_length_mm = request.focal_length_mm,
-            .far_plane = request.far_plane,
-            .orthographic = request.orthographic,
-            .ortho_scale = request.ortho_scale,
-            .background_color = request.background_color};
-    }
-
-    std::unique_ptr<lfs::core::SplatData> makeSingleTestSplat(const glm::vec3& mean) {
-        using lfs::core::DataType;
-        using lfs::core::Device;
-        using lfs::core::Tensor;
-
-        auto means = Tensor::from_vector({mean.x, mean.y, mean.z}, {size_t{1}, size_t{3}}, Device::CUDA).to(DataType::Float32);
-        auto sh0 = Tensor::from_vector(
-                       {0.0f, 0.0f, 0.0f},
-                       {size_t{1}, size_t{1}, size_t{3}},
-                       Device::CUDA)
-                       .to(DataType::Float32);
-        auto shN = Tensor::zeros({size_t{1}, size_t{0}, size_t{3}}, Device::CUDA, DataType::Float32);
-        auto scaling = Tensor::from_vector(
-                           {-2.0f, -2.0f, -2.0f},
-                           {size_t{1}, size_t{3}},
-                           Device::CUDA)
-                           .to(DataType::Float32);
-        auto rotation = Tensor::from_vector(
-                            {1.0f, 0.0f, 0.0f, 0.0f},
-                            {size_t{1}, size_t{4}},
-                            Device::CUDA)
-                            .to(DataType::Float32);
-        auto opacity = Tensor::from_vector(
-                           {8.0f},
-                           {size_t{1}},
-                           Device::CUDA)
-                           .to(DataType::Float32);
-
-        return std::make_unique<lfs::core::SplatData>(
-            0,
-            std::move(means),
-            std::move(sh0),
-            std::move(shN),
-            std::move(scaling),
-            std::move(rotation),
-            std::move(opacity),
-            1.0f);
-    }
-
-    glm::vec2 renderCentroidForPoint(const glm::vec3& local_point,
-                                     const TestRasterRequest& request,
-                                     const std::vector<glm::mat4>& model_transforms = {}) {
-        auto engine = lfs::rendering::RenderingEngine::createRasterOnly();
-        const auto init_result = engine->initializeRasterOnly();
-        EXPECT_TRUE(init_result.has_value()) << init_result.error();
-        if (!init_result) {
-            return {-1.0f, -1.0f};
-        }
-        const auto splat = makeSingleTestSplat(local_point);
-
-        lfs::rendering::ViewportRenderRequest configured_request{
-            .frame_view = makeFrameView(request),
-            .sh_degree = 0,
-            .scene = {.model_transforms = model_transforms.empty() ? nullptr : &model_transforms}};
-
-        const auto result = engine->renderGaussiansImage(*splat, configured_request);
-        EXPECT_TRUE(result.has_value()) << result.error();
-        if (!result) {
-            return {-1.0f, -1.0f};
-        }
-
-        auto image = result->image->cpu().contiguous();
-        EXPECT_EQ(image.ndim(), 3);
-        EXPECT_EQ(image.size(0), size_t{3});
-        if (image.ndim() != 3 || image.size(0) != size_t{3}) {
-            return {-1.0f, -1.0f};
-        }
-
-        auto acc = image.accessor<float, 3>();
-
-        double weight_sum = 0.0;
-        double weighted_x = 0.0;
-        double weighted_y = 0.0;
-        const int height = static_cast<int>(image.size(1));
-        const int width = static_cast<int>(image.size(2));
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                const float r = acc(0, y, x);
-                const float g = acc(1, y, x);
-                const float b = acc(2, y, x);
-                const double weight = static_cast<double>(r + g + b);
-                weight_sum += weight;
-                weighted_x += weight * static_cast<double>(x);
-                weighted_y += weight * static_cast<double>(y);
-            }
-        }
-
-        EXPECT_GT(weight_sum, 0.0);
-        return {
-            static_cast<float>(weighted_x / weight_sum),
-            static_cast<float>(weighted_y / weight_sum),
-        };
-    }
-
-    std::optional<glm::vec2> renderScreenPositionForPoint(
-        const glm::vec3& local_point,
-        const TestRasterRequest& request,
-        const std::vector<glm::mat4>& model_transforms = {}) {
-        auto engine = lfs::rendering::RenderingEngine::createRasterOnly();
-        const auto init_result = engine->initializeRasterOnly();
-        EXPECT_TRUE(init_result.has_value()) << init_result.error();
-        if (!init_result) {
-            return std::nullopt;
-        }
-        const auto splat = makeSingleTestSplat(local_point);
-
-        const lfs::rendering::ScreenPositionRenderRequest configured_request{
-            .frame_view = makeFrameView(request),
-            .scene = {.model_transforms = model_transforms.empty() ? nullptr : &model_transforms}};
-
-        const auto result = engine->renderGaussianScreenPositions(*splat, configured_request);
-        EXPECT_TRUE(result.has_value()) << result.error();
-        if (!result) {
-            return std::nullopt;
-        }
-
-        auto screen_positions = (*result)->cpu().contiguous();
-        EXPECT_EQ(screen_positions.ndim(), 2);
-        EXPECT_EQ(screen_positions.size(0), size_t{1});
-        EXPECT_EQ(screen_positions.size(1), size_t{2});
-        if (screen_positions.ndim() != 2 || screen_positions.size(0) != size_t{1} || screen_positions.size(1) != size_t{2}) {
-            return std::nullopt;
-        }
-
-        auto acc = screen_positions.accessor<float, 2>();
-        return glm::vec2(acc(0, 0), acc(0, 1));
-    }
-
-    bool previewSelectionHitsCursorAtWindowPosition(
-        const glm::vec3& local_point,
-        const TestRasterRequest& request,
-        const glm::vec2& cursor,
-        const float) {
-        auto engine = lfs::rendering::RenderingEngine::createRasterOnly();
-        const auto init_result = engine->initializeRasterOnly();
-        EXPECT_TRUE(init_result.has_value()) << init_result.error();
-        if (!init_result) {
-            return false;
-        }
-        const auto splat = makeSingleTestSplat(local_point);
-
-        const lfs::rendering::HoveredGaussianQueryRequest configured_request{
-            .frame_view = makeFrameView(request),
-            .cursor = cursor};
-        const auto result = engine->queryHoveredGaussianId(*splat, configured_request);
-        EXPECT_TRUE(result.has_value()) << result.error();
-        if (!result) {
-            return false;
-        }
-
-        return result->has_value() && **result == 0;
-    }
-
-    glm::vec2 tensorCentroidToWindowCoords(const glm::vec2& centroid,
-                                           const TestRasterRequest& request) {
-        return {
-            centroid.x,
-            static_cast<float>(request.viewport_size.y) - centroid.y,
-        };
-    }
 
     TestRasterRequest makeTestRasterRequest() {
         TestRasterRequest request;
@@ -246,6 +73,72 @@ TEST(ViewportTest, DefaultCameraStartsAboveWorldYAxis) {
     Viewport viewport(100, 100);
 
     EXPECT_GT(viewport.camera.t.y, 0.0f);
+}
+
+TEST(ViewportTest, PlyComparisonPanelLayoutKeepsMarginWithinCachedRects) {
+    constexpr int width = 1000;
+    constexpr float cached_split = 0.5f;
+    const auto layouts = lfs::vis::makePlyComparisonPanelLayouts(width, cached_split);
+
+    EXPECT_EQ(layouts[0].panel.x, 0);
+    EXPECT_EQ(layouts[0].panel.width, 625);
+    EXPECT_EQ(layouts[1].panel.x, 375);
+    EXPECT_EQ(layouts[1].panel.width, 625);
+    EXPECT_NEAR(layouts[0].texcoord_scale.x, 1.6f, 1e-6f);
+    EXPECT_NEAR(layouts[1].texcoord_scale.x, 1.6f, 1e-6f);
+    EXPECT_NEAR(layouts[1].texcoord_offset.x, -0.6f, 1e-6f);
+    EXPECT_NEAR(0.5f * layouts[0].texcoord_scale.x + layouts[0].texcoord_offset.x, 0.8f, 1e-6f);
+    EXPECT_NEAR(0.5f * layouts[1].texcoord_scale.x + layouts[1].texcoord_offset.x, 0.2f, 1e-6f);
+
+    EXPECT_TRUE(lfs::vis::plyComparisonSplitterWithinMargin(width, cached_split, 0.6f));
+    EXPECT_TRUE(lfs::vis::plyComparisonSplitterWithinMargin(width, cached_split, 0.4f));
+    EXPECT_FALSE(lfs::vis::plyComparisonSplitterWithinMargin(width, cached_split, 0.7f));
+    EXPECT_EQ(layouts[0].panel.width, 625);
+    EXPECT_EQ(layouts[1].panel.width, 625);
+}
+
+TEST(ViewportTest, PlyComparisonClippedRequestKeepsFullViewportCamera) {
+    constexpr glm::ivec2 full_size{1000, 600};
+    constexpr float split_position = 0.5f;
+    Viewport viewport(full_size.x, full_size.y);
+    lfs::vis::RenderSettings settings;
+    settings.focal_length_mm = 52.0f;
+    const lfs::vis::FrameContext ctx{
+        .viewport = viewport,
+        .settings = settings,
+        .render_size = full_size,
+    };
+
+    const auto full_request = lfs::vis::buildViewportRenderRequest(ctx, full_size);
+    const auto layouts = lfs::vis::makePlyComparisonPanelLayouts(full_size.x, split_position);
+    const auto& left_layout = layouts[0].panel;
+    const auto clipped_request = lfs::vis::buildViewportRenderRequest(
+        ctx,
+        {left_layout.width, full_size.y},
+        &viewport,
+        lfs::vis::SplitViewPanelId::Left,
+        {left_layout.x, 0},
+        full_size);
+
+    EXPECT_EQ(clipped_request.frame_view.size, glm::ivec2(left_layout.width, full_size.y));
+    EXPECT_EQ(clipped_request.frame_view.subregion_origin, glm::ivec2(left_layout.x, 0));
+    EXPECT_EQ(clipped_request.frame_view.subregion_full_size, full_size);
+    EXPECT_EQ(clipped_request.frame_view.cameraSize(), full_request.frame_view.cameraSize());
+
+    const auto full_intrinsics = full_request.frame_view.getCameraIntrinsics();
+    const auto clipped_intrinsics = clipped_request.frame_view.getCameraIntrinsics();
+    EXPECT_FLOAT_EQ(clipped_intrinsics.focal_x, full_intrinsics.focal_x);
+    EXPECT_FLOAT_EQ(clipped_intrinsics.focal_y, full_intrinsics.focal_y);
+    EXPECT_FLOAT_EQ(clipped_intrinsics.center_x, full_intrinsics.center_x);
+    EXPECT_FLOAT_EQ(clipped_intrinsics.center_y, full_intrinsics.center_y);
+
+    const auto full_projection = full_request.frame_view.getProjectionMatrix();
+    const auto clipped_projection = clipped_request.frame_view.getProjectionMatrix();
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            EXPECT_FLOAT_EQ(clipped_projection[column][row], full_projection[column][row]);
+        }
+    }
 }
 
 TEST(ViewportTest, UnprojectPixelDependsOnScreenPixel) {
@@ -318,13 +211,25 @@ TEST(ViewportTest, WasdAdvanceSupportsFlatAdditionalSpeedInVisualizerSpace) {
     viewport.camera.t = glm::vec3(0.0f);
     viewport.camera.pivot = glm::vec3(0.0f);
 
-    viewport.camera.advance_forward(1.0f, 20.0f);
+    constexpr float dt = 0.1f;
+    constexpr float bonus = 20.0f;
+    const float base_speed = viewport.camera.getWasdSpeed();
+    for (int i = 0; i < 100; ++i)
+        viewport.camera.advanceWasd(dt, true, false, false, false, false, false, bonus);
 
-    EXPECT_FLOAT_EQ(viewport.camera.getWasdSpeed(), 6.0f);
-    EXPECT_NEAR(viewport.camera.t.x, 0.0f, 1e-5f);
-    EXPECT_NEAR(viewport.camera.t.y, 0.0f, 1e-5f);
-    EXPECT_NEAR(viewport.camera.t.z, -26.0f, 1e-5f);
-    EXPECT_NEAR(viewport.camera.pivot.z, -26.0f, 1e-5f);
+    const glm::vec3 t_before = viewport.camera.t;
+    const glm::vec3 pivot_before = viewport.camera.pivot;
+    viewport.camera.advanceWasd(dt, true, false, false, false, false, false, bonus);
+    const glm::vec3 t_step = viewport.camera.t - t_before;
+    const glm::vec3 pivot_step = viewport.camera.pivot - pivot_before;
+
+    // Once the inertial velocity saturates, a settled step advances along -Z at
+    // (wasdSpeed + bonus), confirming the bonus is additive, not multiplicative.
+    EXPECT_FLOAT_EQ(viewport.camera.getWasdSpeed(), base_speed);
+    EXPECT_NEAR(t_step.x, 0.0f, 1e-5f);
+    EXPECT_NEAR(t_step.y, 0.0f, 1e-5f);
+    EXPECT_NEAR(t_step.z, -(base_speed + bonus) * dt, 1e-4f);
+    EXPECT_NEAR(glm::length(pivot_step - t_step), 0.0f, 1e-5f);
 }
 
 TEST(ViewportTest, OrbitDraggingRightMovesCameraLeftAroundPivot) {
@@ -443,113 +348,6 @@ TEST(ViewportTest, PanDraggingMovesProjectedContentWithCursorInVisualizerSpace) 
     EXPECT_LT(after->y, before->y);
 }
 
-TEST(ViewportTest, GaussianRasterSourceMatchesVisualizerLeftRightConvention) {
-    const auto request = makeTestRasterRequest();
-    const glm::vec2 center = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(glm::vec3(0.0f, 0.0f, -5.0f), request), request);
-    const glm::vec2 right = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(glm::vec3(1.0f, 0.0f, -5.0f), request), request);
-    const glm::vec2 left = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(glm::vec3(-1.0f, 0.0f, -5.0f), request), request);
-
-    EXPECT_GT(right.x, center.x);
-    EXPECT_LT(left.x, center.x);
-}
-
-TEST(ViewportTest, GaussianRasterSourceMatchesVisualizerUpDownConvention) {
-    const auto request = makeTestRasterRequest();
-    const glm::vec2 center = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(glm::vec3(0.0f, 0.0f, -5.0f), request), request);
-    const glm::vec2 up = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(glm::vec3(0.0f, 1.0f, -5.0f), request), request);
-    const glm::vec2 down = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(glm::vec3(0.0f, -1.0f, -5.0f), request), request);
-
-    EXPECT_LT(up.y, center.y);
-    EXPECT_GT(down.y, center.y);
-}
-
-TEST(ViewportTest, GaussianScreenPositionOutputUsesWindowCoordinates) {
-    const auto request = makeTestRasterRequest();
-    const glm::vec3 world_point(0.35f, 0.75f, -5.0f);
-
-    const auto expected = lfs::rendering::projectWorldPoint(
-        request.view_rotation,
-        request.view_translation,
-        request.viewport_size,
-        world_point,
-        request.focal_length_mm);
-    ASSERT_TRUE(expected.has_value());
-
-    const auto actual = renderScreenPositionForPoint(world_point, request);
-    ASSERT_TRUE(actual.has_value());
-    EXPECT_NEAR(actual->x, expected->x, 1e-2f);
-    EXPECT_NEAR(actual->y, expected->y, 1e-2f);
-}
-
-TEST(ViewportTest, GaussianPreviewSelectionUsesWindowCursorCoordinates) {
-    const auto request = makeTestRasterRequest();
-    const glm::vec3 world_point(0.25f, 0.75f, -5.0f);
-
-    const auto projected = lfs::rendering::projectWorldPoint(
-        request.view_rotation,
-        request.view_translation,
-        request.viewport_size,
-        world_point,
-        request.focal_length_mm);
-    ASSERT_TRUE(projected.has_value());
-
-    EXPECT_TRUE(previewSelectionHitsCursorAtWindowPosition(world_point, request, *projected, 4.0f));
-
-    const glm::vec2 mirrored_y(
-        projected->x,
-        static_cast<float>(request.viewport_size.y) - projected->y);
-    EXPECT_FALSE(previewSelectionHitsCursorAtWindowPosition(world_point, request, mirrored_y, 4.0f));
-}
-
-TEST(ViewportTest, GaussianRasterMatchesVisualizerProjectionWhenYawed) {
-    auto request = makeTestRasterRequest();
-    request.view_rotation = lfs::rendering::makeVisualizerLookAtRotation(
-        glm::vec3(0.0f, 0.0f, 0.0f),
-        glm::vec3(1.0f, 0.0f, -5.0f));
-
-    const glm::vec3 world_point(0.0f, 0.25f, -5.0f);
-    const auto expected = lfs::rendering::projectWorldPoint(
-        request.view_rotation,
-        request.view_translation,
-        request.viewport_size,
-        world_point,
-        request.focal_length_mm);
-    ASSERT_TRUE(expected.has_value());
-
-    const glm::vec2 actual = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(world_point, request), request);
-    EXPECT_NEAR(actual.x, expected->x, 2.0f);
-    EXPECT_NEAR(actual.y, expected->y, 2.0f);
-}
-
-TEST(ViewportTest, GaussianRasterMatchesVisualizerProjectionWithModelTransform) {
-    const auto request = makeTestRasterRequest();
-    const glm::vec3 local_point(0.0f, 0.0f, -5.0f);
-    const glm::mat4 model_transform =
-        glm::translate(glm::mat4(1.0f), glm::vec3(0.4f, 0.25f, 0.0f)) *
-        glm::rotate(glm::mat4(1.0f), glm::radians(10.0f), glm::normalize(glm::vec3(0.0f, 1.0f, 0.0f)));
-    const glm::vec3 world_point = glm::vec3(model_transform * glm::vec4(local_point, 1.0f));
-
-    const auto expected = lfs::rendering::projectWorldPoint(
-        request.view_rotation,
-        request.view_translation,
-        request.viewport_size,
-        world_point,
-        request.focal_length_mm);
-    ASSERT_TRUE(expected.has_value());
-
-    const glm::vec2 actual = tensorCentroidToWindowCoords(
-        renderCentroidForPoint(local_point, request, {model_transform}), request);
-    EXPECT_NEAR(actual.x, expected->x, 2.0f);
-    EXPECT_NEAR(actual.y, expected->y, 2.0f);
-}
-
 TEST(ViewportTest, ClipSpaceMatrixProjectionMatchesVisualizerProjectionWhenYawed) {
     const auto request = makeTestRasterRequest();
     const glm::mat3 rotation = lfs::rendering::makeVisualizerLookAtRotation(
@@ -594,4 +392,173 @@ TEST(ViewportTest, OrthographicProjectionMatchesClipSpaceAndIgnoresDepth) {
     EXPECT_NEAR(near_projection->y, far_projection->y, 1e-4f);
     EXPECT_NEAR(matrix_projection->x, near_projection->x, 1e-3f);
     EXPECT_NEAR(matrix_projection->y, near_projection->y, 1e-3f);
+}
+
+TEST(ViewportTest, OrthographicUnprojectMatchesProjectedWorldPoint) {
+    Viewport viewport(128, 128);
+    viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
+        glm::vec3(1.0f, 0.5f, 2.0f),
+        glm::vec3(1.0f, 0.5f, -3.0f));
+    viewport.camera.t = glm::vec3(1.0f, 0.5f, 2.0f);
+    constexpr float ortho_scale = 75.0f;
+    const glm::vec3 world_point(1.5f, 0.8f, -4.0f);
+
+    const auto projected = lfs::rendering::projectWorldPoint(
+        viewport.camera.R,
+        viewport.camera.t,
+        viewport.windowSize,
+        world_point,
+        lfs::rendering::DEFAULT_FOCAL_LENGTH_MM,
+        true,
+        ortho_scale);
+    ASSERT_TRUE(projected.has_value());
+
+    const glm::vec3 view = glm::transpose(viewport.camera.R) * (world_point - viewport.camera.t);
+    const glm::vec3 unprojected = viewport.unprojectPixel(
+        projected->x,
+        projected->y,
+        -view.z,
+        lfs::rendering::DEFAULT_FOCAL_LENGTH_MM,
+        true,
+        ortho_scale);
+
+    ASSERT_TRUE(Viewport::isValidWorldPosition(unprojected));
+    EXPECT_NEAR(unprojected.x, world_point.x, 1e-4f);
+    EXPECT_NEAR(unprojected.y, world_point.y, 1e-4f);
+    EXPECT_NEAR(unprojected.z, world_point.z, 1e-4f);
+}
+
+TEST(ViewportTest, OrthographicUnprojectRejectsInvalidScale) {
+    Viewport viewport(128, 128);
+
+    const glm::vec3 invalid = viewport.unprojectPixel(
+        64.0f,
+        64.0f,
+        10.0f,
+        lfs::rendering::DEFAULT_FOCAL_LENGTH_MM,
+        true,
+        0.0f);
+
+    EXPECT_FALSE(Viewport::isValidWorldPosition(invalid));
+}
+
+namespace {
+    constexpr float kDroneDt = 1.0f / 60.0f;
+
+    void expectOrthonormal(const glm::mat3& R) {
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_NEAR(glm::length(R[i]), 1.0f, 1e-5f);
+            for (int j = i + 1; j < 3; ++j) {
+                EXPECT_NEAR(glm::dot(R[i], R[j]), 0.0f, 1e-5f);
+            }
+        }
+    }
+} // namespace
+
+TEST(ViewportTest, DroneBrakesToRestFromForwardFlight) {
+    Viewport viewport(100, 100);
+    viewport.camera.enterDrone();
+
+    for (int i = 0; i < 60; ++i)
+        viewport.camera.advanceDrone(kDroneDt, true, false, false, false, false, false);
+    EXPECT_TRUE(viewport.camera.hasDroneMotion());
+
+    int settle_steps = 0;
+    while (viewport.camera.hasDroneMotion() && settle_steps < 300) {
+        viewport.camera.advanceDrone(kDroneDt, false, false, false, false, false, false);
+        ++settle_steps;
+    }
+    EXPECT_FALSE(viewport.camera.hasDroneMotion());
+
+    const glm::vec3 t_at_rest = viewport.camera.t;
+    const glm::mat3 R_at_rest = viewport.camera.R;
+    viewport.camera.advanceDrone(kDroneDt, false, false, false, false, false, false);
+    EXPECT_EQ(viewport.camera.t, t_at_rest);
+    EXPECT_EQ(viewport.camera.R, R_at_rest);
+}
+
+TEST(ViewportTest, DroneHorizontalFlightIgnoresGimbalPitch) {
+    Viewport viewport(100, 100);
+    viewport.camera.t = glm::vec3(0.0f, 10.0f, 0.0f);
+    viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
+        viewport.camera.t, viewport.camera.t + glm::normalize(glm::vec3(0.0f, -1.0f, -1.0f)));
+    viewport.camera.enterDrone();
+
+    for (int i = 0; i < 120; ++i) {
+        viewport.camera.advanceDrone(kDroneDt, true, false, false, false, false, false);
+        EXPECT_NEAR(viewport.camera.t.y, 10.0f, 1e-4f);
+    }
+    EXPECT_LT(viewport.camera.t.z, -0.5f);
+}
+
+TEST(ViewportTest, DroneClimbIsPureVertical) {
+    Viewport viewport(100, 100);
+    viewport.camera.enterDrone();
+    const glm::vec3 t0 = viewport.camera.t;
+
+    for (int i = 0; i < 120; ++i)
+        viewport.camera.advanceDrone(kDroneDt, false, false, false, false, true, false);
+
+    EXPECT_NEAR(viewport.camera.t.x, t0.x, 1e-4f);
+    EXPECT_NEAR(viewport.camera.t.z, t0.z, 1e-4f);
+    EXPECT_GT(viewport.camera.t.y, t0.y + 0.5f);
+}
+
+TEST(ViewportTest, DroneNoRollAfterEnterExit) {
+    Viewport viewport(100, 100);
+    viewport.camera.enterDrone();
+    viewport.camera.initScreenPos(glm::vec2(0.0f));
+    viewport.camera.droneLook(glm::vec2(150.0f, -80.0f));
+
+    bool saw_bank = false;
+    for (int i = 0; i < 90; ++i) {
+        viewport.camera.advanceDrone(kDroneDt, true, false, false, true, false, false);
+        saw_bank = saw_bank || std::abs(viewport.camera.R[0].y) > 0.01f;
+    }
+    EXPECT_TRUE(saw_bank);
+
+    viewport.camera.finishDrone();
+    EXPECT_FALSE(viewport.camera.hasDroneMotion());
+    EXPECT_NEAR(viewport.camera.R[0].y, 0.0f, 1e-5f);
+    expectOrthonormal(viewport.camera.R);
+}
+
+TEST(ViewportTest, DroneResyncsAfterExternalRotation) {
+    Viewport viewport(100, 100);
+    viewport.camera.enterDrone();
+    for (int i = 0; i < 60; ++i)
+        viewport.camera.advanceDrone(kDroneDt, true, false, false, false, false, false);
+
+    viewport.camera.setAxisAlignedView(0, false);
+    EXPECT_FALSE(viewport.camera.hasDroneMotion());
+
+    const glm::vec3 t_after_view = viewport.camera.t;
+    viewport.camera.advanceDrone(kDroneDt, false, false, false, false, false, false);
+
+    EXPECT_EQ(viewport.camera.t, t_after_view);
+    const glm::vec3 forward = lfs::rendering::cameraForward(viewport.camera.R);
+    EXPECT_NEAR(forward.x, -1.0f, 1e-4f);
+    EXPECT_NEAR(forward.y, 0.0f, 1e-4f);
+    EXPECT_NEAR(forward.z, 0.0f, 1e-4f);
+    expectOrthonormal(viewport.camera.R);
+    for (int col = 0; col < 3; ++col)
+        for (int row = 0; row < 3; ++row)
+            EXPECT_TRUE(std::isfinite(viewport.camera.R[col][row]));
+}
+
+TEST(ViewportTest, DroneBanksIntoYawTurnWhileFlyingForward) {
+    Viewport viewport(100, 100);
+    viewport.camera.enterDrone();
+    for (int i = 0; i < 90; ++i)
+        viewport.camera.advanceDrone(kDroneDt, true, false, false, false, false, false);
+
+    viewport.camera.initScreenPos(glm::vec2(0.0f));
+    viewport.camera.droneLook(glm::vec2(-400.0f, 0.0f));
+
+    float max_left_bank = 0.0f;
+    for (int i = 0; i < 30; ++i) {
+        viewport.camera.advanceDrone(kDroneDt, true, false, false, false, false, false);
+        max_left_bank = std::max(max_left_bank, viewport.camera.R[0].y);
+    }
+    EXPECT_GT(max_left_bank, 0.05f);
 }

@@ -4,126 +4,493 @@
 
 #pragma once
 
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
+#include "adam_api.h"
+#include "lfs/core/warp_reduce.cuh"
+#include "lfs/training/joint_adam_codec.cuh"
+#include "lfs/training/mean_step_scale.cuh"
+#include "lfs/training/screen_share.cuh"
+
+#include <cstdint>
 
 namespace fast_lfs::optimizer::kernels::adam {
 
-    // Vectorized Adam kernel using float4 for better memory throughput
-    __global__ void adam_step_vectorized_cu(
+    // Non-fused joint Adam step for contiguous [n_prims, n_attr] params.
+    // Grid = ceil(n_prims/256), block = 256 so blockIdx.x == bounds block index
+    // (matches fused preprocess_backward / joint_adam::kBlockSizeDevice).
+    // Frozen / crop-damped rows with zero lr skip the Adam update but still
+    // re-encode under the new block bounds (same as fused adam_step_row_joint).
+    template <int BITS>
+    __global__ void adam_step_joint_contiguous_cu(
         float* param,
-        float* exp_avg,
-        float* exp_avg_sq,
+        uint8_t* packed,
+        float* bounds, // float4 per 256-splat block
         const float* param_grad,
-        const int n_elements,
+        const bool* frozen_mask,
+        const int frozen_mask_size,
+        const float frozen_lr_scale,
+        const bool* crop_damping_mask,
+        const int crop_damping_mask_size,
+        const float cropbox_lr_scale,
+        const int n_prims,
+        const int n_attr,
         const float lr,
         const float beta1,
         const float beta2,
         const float eps,
         const float bias_correction1_rcp,
-        const float bias_correction2_sqrt_rcp) {
+        const float bias_correction2_sqrt_rcp,
+        const float* mean_step_scale_raw,
+        const int mean_step_scale_n,
+        const float mean_step_median_extent,
+        const float mean_step_r_min,
+        const float mean_step_r_max,
+        const bool* mean_step_far_mask,
+        const int mean_step_far_mask_n,
+        const float* screen_share_max,
+        const int screen_share_n,
+        const float screen_share_limit,
+        const float screen_share_penalty) {
+        using C = lfs::training::joint_adam::DeviceCodec<BITS>;
+        constexpr float kInf = 1e30f;
+        constexpr int kBS = lfs::training::joint_adam::kBlockSizeDevice;
 
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int prim = static_cast<int>(blockIdx.x) * kBS + static_cast<int>(threadIdx.x);
+        const bool in_range = prim < n_prims && n_attr > 0;
 
-        // Early exit if beyond range
-        if (idx * 4 >= n_elements)
-            return;
+        float row_lr = lr;
+        bool apply_step = in_range;
+        if (in_range && frozen_mask != nullptr && prim < frozen_mask_size && frozen_mask[prim]) {
+            if (frozen_lr_scale == 0.0f)
+                apply_step = false;
+            else
+                row_lr *= frozen_lr_scale;
+        }
+        if (in_range && crop_damping_mask != nullptr && prim < crop_damping_mask_size &&
+            crop_damping_mask[prim]) {
+            if (cropbox_lr_scale == 0.0f)
+                apply_step = false;
+            else
+                row_lr *= cropbox_lr_scale;
+        }
+        if (in_range && mean_step_scale_raw != nullptr &&
+            mean_step_far_mask != nullptr && prim < mean_step_far_mask_n &&
+            mean_step_far_mask[prim]) {
+            const int sb = prim * 3;
+            if (sb + 2 < mean_step_scale_n) {
+                row_lr *= lfs::training::per_splat_mean_step_ratio(
+                    mean_step_scale_raw[sb],
+                    mean_step_scale_raw[sb + 1],
+                    mean_step_scale_raw[sb + 2],
+                    mean_step_median_extent,
+                    mean_step_r_min,
+                    mean_step_r_max);
+            }
+        }
+        const int bidx = static_cast<int>(blockIdx.x);
+        const float4 old_mm = (bounds != nullptr)
+                                  ? *reinterpret_cast<const float4*>(bounds + 4 * bidx)
+                                  : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
+        // Means/scale/rot/opacity/sh0 attrs are small (≤4); sh0 is 3.
+        constexpr int kMaxAttr = 16;
+        float us_u[kMaxAttr];
+        float us_s[kMaxAttr];
+        float local_u_min = kInf, local_u_max = -kInf;
+        float local_s_min = kInf, local_s_max = -kInf;
+        const int row = in_range ? min(n_attr, kMaxAttr) : 0;
+        const float step_size = row_lr * bias_correction1_rcp;
         const float beta1_comp = 1.0f - beta1;
         const float beta2_comp = 1.0f - beta2;
-        const float step_size = lr * bias_correction1_rcp;
 
-        const int base_idx = idx * 4;
-        const int remaining = n_elements - base_idx;
-
-        // Process up to 4 elements per thread
-        if (remaining >= 4) {
-            // Vectorized path: load/store 4 elements at once (128-bit transactions)
-            float4 grad4 = *reinterpret_cast<const float4*>(param_grad + base_idx);
-            float4 m1_4 = *reinterpret_cast<float4*>(exp_avg + base_idx);
-            float4 m2_4 = *reinterpret_cast<float4*>(exp_avg_sq + base_idx);
-            float4 p4 = *reinterpret_cast<float4*>(param + base_idx);
-
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                float grad = reinterpret_cast<float*>(&grad4)[i];
-                float m1 = reinterpret_cast<float*>(&m1_4)[i];
-                float m2 = reinterpret_cast<float*>(&m2_4)[i];
-                float p = reinterpret_cast<float*>(&p4)[i];
-
-                m1 = beta1 * m1 + beta1_comp * grad;
-                m2 = beta2 * m2 + beta2_comp * grad * grad;
-                p -= step_size * m1 / (sqrtf(m2) * bias_correction2_sqrt_rcp + eps);
-
-                reinterpret_cast<float*>(&m1_4)[i] = m1;
-                reinterpret_cast<float*>(&m2_4)[i] = m2;
-                reinterpret_cast<float*>(&p4)[i] = p;
+        if (in_range) {
+            for (int i = 0; i < row; ++i) {
+                const int64_t cell = static_cast<int64_t>(prim) * n_attr + i;
+                const float2 mv = C::decode_g1g2(packed, cell, old_mm);
+                float m = mv.x;
+                float v = mv.y;
+                if (apply_step) {
+                    float grad = param_grad[static_cast<int64_t>(prim) * n_attr + i];
+                    if (screen_share_max != nullptr && prim < screen_share_n) {
+                        grad += lfs::training::screen_share_hinge_extra_grad(
+                            screen_share_max[prim], screen_share_limit, screen_share_penalty,
+                            mv.y, bias_correction2_sqrt_rcp, eps);
+                    }
+                    m = beta1 * mv.x + beta1_comp * grad;
+                    v = beta2 * mv.y + beta2_comp * grad * grad;
+                    const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
+                    param[static_cast<int64_t>(prim) * n_attr + i] -= step_size * m / denom;
+                }
+                const float2 prim_us = C::g1g2_to_us(m, v);
+                us_u[i] = prim_us.x;
+                us_s[i] = prim_us.y;
+                local_u_min = fminf(local_u_min, prim_us.x);
+                local_u_max = fmaxf(local_u_max, prim_us.x);
+                local_s_min = fminf(local_s_min, prim_us.y);
+                local_s_max = fmaxf(local_s_max, prim_us.y);
             }
+        }
 
-            *reinterpret_cast<float4*>(exp_avg + base_idx) = m1_4;
-            *reinterpret_cast<float4*>(exp_avg_sq + base_idx) = m2_4;
-            *reinterpret_cast<float4*>(param + base_idx) = p4;
-        } else {
-// Scalar path for tail elements (1-3 remaining elements)
-#pragma unroll
-            for (int i = 0; i < remaining; i++) {
-                const int elem_idx = base_idx + i;
-                const float grad = param_grad[elem_idx];
-                const float m1 = beta1 * exp_avg[elem_idx] + beta1_comp * grad;
-                const float m2 = beta2 * exp_avg_sq[elem_idx] + beta2_comp * grad * grad;
-                param[elem_idx] -= step_size * m1 / (sqrtf(m2) * bias_correction2_sqrt_rcp + eps);
-                exp_avg[elem_idx] = m1;
-                exp_avg_sq[elem_idx] = m2;
+        const float4 red = lfs::core::warp_ops::block_reduce_min4(
+            make_float4(local_u_min, -local_u_max, local_s_min, -local_s_max));
+        const float u_min = red.x;
+        const float u_max = -red.y;
+        const float s_min = red.z;
+        const float s_max = -red.w;
+
+        __shared__ float4 sm_bounds;
+        if (threadIdx.x == 0) {
+            float4 nb;
+            if (u_min > u_max) {
+                nb = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            } else {
+                nb = make_float4(u_min, u_max, s_min, s_max);
+            }
+            sm_bounds = nb;
+            if (bounds != nullptr) {
+                *reinterpret_cast<float4*>(bounds + 4 * bidx) = nb;
+            }
+        }
+        __syncthreads();
+        const float4 new_mm = sm_bounds;
+        const float inv_u = 1.0f / fmaxf(new_mm.y - new_mm.x, lfs::training::joint_adam::kEpsDevice);
+        const float inv_s = 1.0f / fmaxf(new_mm.w - new_mm.z, lfs::training::joint_adam::kEpsDevice);
+
+        if (in_range) {
+            for (int i = 0; i < row; ++i) {
+                C::encode_us(packed, static_cast<int64_t>(prim) * n_attr + i,
+                             us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s);
             }
         }
     }
 
-    // Original scalar kernel (kept for compatibility)
-    // based on https://github.com/pytorch/pytorch/blob/9d32aa9789fc0ef0cad01a788157ecc2121db810/torch/csrc/api/src/optim/adam.cpp#L72-L142
-    __global__ void adam_step_cu(
-        float* param,
-        float* exp_avg,
-        float* exp_avg_sq,
-        const float* param_grad,
-        const int n_elements,
-        const float lr,
+    template <int BITS>
+    __global__ void adam_step_joint_contiguous_batched_cu(
+        const JointContiguousBatchEntry* table,
+        const int n_entries,
+        const bool* frozen_mask,
+        const int frozen_mask_size,
+        const float frozen_lr_scale,
+        const bool* crop_damping_mask,
+        const int crop_damping_mask_size,
+        const float cropbox_lr_scale,
         const float beta1,
         const float beta2,
         const float eps,
-        const float bias_correction1_rcp,
-        const float bias_correction2_sqrt_rcp) {
-        auto idx = cg::this_grid().thread_rank();
-        if (idx >= n_elements)
+        const float* mean_step_scale_raw,
+        const int mean_step_scale_n,
+        const float mean_step_median_extent,
+        const float mean_step_r_min,
+        const float mean_step_r_max,
+        const bool* mean_step_far_mask,
+        const int mean_step_far_mask_n,
+        const float* screen_share_max,
+        const int screen_share_n,
+        const float screen_share_limit,
+        const float screen_share_penalty) {
+        using C = lfs::training::joint_adam::DeviceCodec<BITS>;
+        constexpr float kInf = 1e30f;
+        constexpr int kBS = lfs::training::joint_adam::kBlockSizeDevice;
+        constexpr int kMaxAttr = 16;
+
+        const int e = static_cast<int>(blockIdx.y);
+        if (e >= n_entries || table == nullptr) {
             return;
-        const float grad = param_grad[idx];
-        const float moment1 = beta1 * exp_avg[idx] + (1.0f - beta1) * grad;
-        const float moment2 = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * grad * grad;
-        const float denom = sqrtf(moment2) * bias_correction2_sqrt_rcp + eps;
-        const float step_size = lr * bias_correction1_rcp;
-        param[idx] -= step_size * moment1 / denom;
-        exp_avg[idx] = moment1;
-        exp_avg_sq[idx] = moment2;
+        }
+        const JointContiguousBatchEntry ent = table[e];
+        float* const param = ent.param;
+        uint8_t* const packed = ent.packed;
+        float* const bounds = ent.bounds;
+        const float* const param_grad = ent.grad;
+        const int n_prims = ent.n_prims;
+        const int n_attr = ent.n_attr;
+        const float lr = ent.lr;
+        const float bias_correction1_rcp = ent.bias_correction1_rcp;
+        const float bias_correction2_sqrt_rcp = ent.bias_correction2_sqrt_rcp;
+
+        const int prim = static_cast<int>(blockIdx.x) * kBS + static_cast<int>(threadIdx.x);
+        const bool in_range = prim < n_prims && n_attr > 0;
+
+        float row_lr = lr;
+        bool apply_step = in_range;
+        if (in_range && frozen_mask != nullptr && prim < frozen_mask_size && frozen_mask[prim]) {
+            if (frozen_lr_scale == 0.0f)
+                apply_step = false;
+            else
+                row_lr *= frozen_lr_scale;
+        }
+        if (in_range && crop_damping_mask != nullptr && prim < crop_damping_mask_size &&
+            crop_damping_mask[prim]) {
+            if (cropbox_lr_scale == 0.0f)
+                apply_step = false;
+            else
+                row_lr *= cropbox_lr_scale;
+        }
+        if (ent.apply_mean_step && mean_step_scale_raw != nullptr &&
+            mean_step_far_mask != nullptr && prim < mean_step_far_mask_n &&
+            mean_step_far_mask[prim]) {
+            const int sb = prim * 3;
+            if (sb + 2 < mean_step_scale_n) {
+                row_lr *= lfs::training::per_splat_mean_step_ratio(
+                    mean_step_scale_raw[sb],
+                    mean_step_scale_raw[sb + 1],
+                    mean_step_scale_raw[sb + 2],
+                    mean_step_median_extent,
+                    mean_step_r_min,
+                    mean_step_r_max);
+            }
+        }
+
+        const int bidx = static_cast<int>(blockIdx.x);
+        const float4 old_mm = (bounds != nullptr)
+                                  ? *reinterpret_cast<const float4*>(bounds + 4 * bidx)
+                                  : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+        float us_u[kMaxAttr];
+        float us_s[kMaxAttr];
+        float local_u_min = kInf, local_u_max = -kInf;
+        float local_s_min = kInf, local_s_max = -kInf;
+        const int row = in_range ? min(n_attr, kMaxAttr) : 0;
+        const float step_size = row_lr * bias_correction1_rcp;
+        const float beta1_comp = 1.0f - beta1;
+        const float beta2_comp = 1.0f - beta2;
+
+        if (in_range) {
+            for (int i = 0; i < row; ++i) {
+                const int64_t cell = static_cast<int64_t>(prim) * n_attr + i;
+                const float2 mv = C::decode_g1g2(packed, cell, old_mm);
+                float m = mv.x;
+                float v = mv.y;
+                if (apply_step) {
+                    float grad = param_grad[static_cast<int64_t>(prim) * n_attr + i];
+                    if (ent.apply_screen_share && screen_share_max != nullptr &&
+                        prim < screen_share_n) {
+                        grad += lfs::training::screen_share_hinge_extra_grad(
+                            screen_share_max[prim], screen_share_limit, screen_share_penalty,
+                            mv.y, bias_correction2_sqrt_rcp, eps);
+                    }
+                    m = beta1 * mv.x + beta1_comp * grad;
+                    v = beta2 * mv.y + beta2_comp * grad * grad;
+                    const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
+                    param[static_cast<int64_t>(prim) * n_attr + i] -= step_size * m / denom;
+                }
+                const float2 prim_us = C::g1g2_to_us(m, v);
+                us_u[i] = prim_us.x;
+                us_s[i] = prim_us.y;
+                local_u_min = fminf(local_u_min, prim_us.x);
+                local_u_max = fmaxf(local_u_max, prim_us.x);
+                local_s_min = fminf(local_s_min, prim_us.y);
+                local_s_max = fmaxf(local_s_max, prim_us.y);
+            }
+        }
+
+        const float4 red = lfs::core::warp_ops::block_reduce_min4(
+            make_float4(local_u_min, -local_u_max, local_s_min, -local_s_max));
+        const float u_min = red.x;
+        const float u_max = -red.y;
+        const float s_min = red.z;
+        const float s_max = -red.w;
+
+        __shared__ float4 sm_bounds;
+        if (threadIdx.x == 0) {
+            float4 nb;
+            if (u_min > u_max) {
+                nb = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            } else {
+                nb = make_float4(u_min, u_max, s_min, s_max);
+            }
+            sm_bounds = nb;
+            if (bounds != nullptr) {
+                *reinterpret_cast<float4*>(bounds + 4 * bidx) = nb;
+            }
+        }
+        __syncthreads();
+        const float4 new_mm = sm_bounds;
+        const float inv_u = 1.0f / fmaxf(new_mm.y - new_mm.x, lfs::training::joint_adam::kEpsDevice);
+        const float inv_s = 1.0f / fmaxf(new_mm.w - new_mm.z, lfs::training::joint_adam::kEpsDevice);
+
+        if (in_range) {
+            for (int i = 0; i < row; ++i) {
+                C::encode_us(packed, static_cast<int64_t>(prim) * n_attr + i,
+                             us_u[i], us_s[i], new_mm.x, new_mm.z, inv_u, inv_s);
+            }
+        }
     }
 
-    // Batched kernel to zero out specific rows (for MCMC relocation)
-    // Much faster than element-by-element indexing on CPU
-    __global__ void zero_rows_cu(
-        float* tensor,
+    // Expand block bounds to include (u,log_s)=(0,0) so encode_us(0,0) is
+    // representable. Raw zero codes under bounds that exclude 0 decode to the
+    // block minimum, not (m,v)=(0,0).
+    __device__ __forceinline__ float4 joint_expand_bounds_include_zero(const float4 mm) {
+        return make_float4(fminf(mm.x, 0.0f), fmaxf(mm.y, 0.0f),
+                           fminf(mm.z, 0.0f), fmaxf(mm.w, 0.0f));
+    }
+
+    __device__ __forceinline__ bool joint_bounds_equal(const float4 a, const float4 b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+    }
+
+    __global__ void joint_encode_zero_mark_cu(
+        uint8_t* flags,
+        uint8_t* block_touched,
         const int64_t* indices,
         const int n_indices,
-        const int row_size) {
-
+        const int n_prims) {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n_indices)
             return;
+        const int64_t prim = indices[idx];
+        if (prim < 0 || prim >= static_cast<int64_t>(n_prims))
+            return;
+        flags[prim] = 1;
+        const int bidx = static_cast<int>(prim / lfs::training::joint_adam::kBlockSizeDevice);
+        const unsigned int word = static_cast<unsigned int>(bidx) >> 2;
+        const unsigned int shift = (static_cast<unsigned int>(bidx) & 3u) * 8u;
+        atomicOr(reinterpret_cast<unsigned int*>(block_touched) + word, 1u << shift);
+    }
 
-        const int64_t row_idx = indices[idx];
-        const int64_t row_start = row_idx * static_cast<int64_t>(row_size);
+    // Each thread owns primitive p = blockIdx.x * 256 + threadIdx.x and only
+    // that primitive's cells; no cross-thread overlap on packed data.
+    template <int BITS>
+    __global__ void joint_encode_zero_rows_cu(
+        uint8_t* packed,
+        float* bounds,
+        const uint8_t* flags,
+        const uint8_t* block_touched,
+        const int n_attr,
+        const int n_prims) {
+        using C = lfs::training::joint_adam::DeviceCodec<BITS>;
+        constexpr int kBS = lfs::training::joint_adam::kBlockSizeDevice;
+        const int bidx = static_cast<int>(blockIdx.x);
+        if (!block_touched[bidx])
+            return;
 
-// Zero out the entire row
-#pragma unroll 4
-        for (int i = 0; i < row_size; i++) {
-            tensor[row_start + i] = 0.0f;
+        const int t = static_cast<int>(threadIdx.x);
+        const int p = bidx * kBS + t;
+        const bool valid = p < n_prims;
+
+        __shared__ float4 sm_old;
+        __shared__ float4 sm_new;
+        if (t == 0) {
+            const float4 old_mm = *reinterpret_cast<const float4*>(bounds + 4 * bidx);
+            sm_old = old_mm;
+            sm_new = joint_expand_bounds_include_zero(old_mm);
+        }
+        __syncthreads();
+
+        const float4 old_mm = sm_old;
+        const float4 new_mm = sm_new;
+        if (!joint_bounds_equal(old_mm, new_mm) && valid) {
+            for (int a = 0; a < n_attr; ++a) {
+                const int64_t cell = static_cast<int64_t>(p) * n_attr + a;
+                const float2 us = C::decode_us(packed, cell, old_mm);
+                C::encode_us(packed, cell, us.x, us.y, new_mm);
+            }
+        }
+        __syncthreads();
+
+        if (valid && flags[p] != 0) {
+            for (int a = 0; a < n_attr; ++a) {
+                const int64_t cell = static_cast<int64_t>(p) * n_attr + a;
+                C::encode_us(packed, cell, 0.0f, 0.0f, new_mm);
+            }
+        }
+        if (t == 0) {
+            *reinterpret_cast<float4*>(bounds + 4 * bidx) = new_mm;
+        }
+    }
+
+    // Each thread owns primitive p = blockIdx.x * 256 + threadIdx.x and only
+    // that primitive's swizzled shN cells; no cross-thread overlap on packed data.
+    template <int BITS>
+    __global__ void joint_encode_zero_shN_cu(
+        uint8_t* packed,
+        float* bounds,
+        const uint8_t* flags,
+        const uint8_t* block_touched,
+        const int slots_per_primitive,
+        const int n_prims) {
+        using C = lfs::training::joint_adam::DeviceCodec<BITS>;
+        constexpr int kBS = lfs::training::joint_adam::kBlockSizeDevice;
+        constexpr uint32_t R = 32u;
+        const int bidx = static_cast<int>(blockIdx.x);
+        if (!block_touched[bidx])
+            return;
+
+        const int t = static_cast<int>(threadIdx.x);
+        const int p = bidx * kBS + t;
+        const bool valid = p < n_prims;
+        const uint32_t slots = static_cast<uint32_t>(slots_per_primitive);
+
+        auto sh_cell = [&](const uint32_t prim, const uint32_t k, const int c) -> int64_t {
+            const uint32_t slot = (prim / R) * (slots * R) + k * R + (prim % R);
+            return static_cast<int64_t>(slot) * 4 + c;
+        };
+
+        __shared__ float4 sm_old;
+        __shared__ float4 sm_new;
+        if (t == 0) {
+            const float4 old_mm = *reinterpret_cast<const float4*>(bounds + 4 * bidx);
+            sm_old = old_mm;
+            sm_new = joint_expand_bounds_include_zero(old_mm);
+        }
+        __syncthreads();
+
+        const float4 old_mm = sm_old;
+        const float4 new_mm = sm_new;
+        if (!joint_bounds_equal(old_mm, new_mm) && valid && slots > 0u) {
+            for (uint32_t k = 0; k < slots; ++k) {
+                for (int c = 0; c < 4; ++c) {
+                    const int64_t cell = sh_cell(static_cast<uint32_t>(p), k, c);
+                    const float2 us = C::decode_us(packed, cell, old_mm);
+                    C::encode_us(packed, cell, us.x, us.y, new_mm);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (valid && flags[p] != 0 && slots > 0u) {
+            for (uint32_t k = 0; k < slots; ++k) {
+                for (int c = 0; c < 4; ++c) {
+                    C::encode_us(packed, sh_cell(static_cast<uint32_t>(p), k, c),
+                                 0.0f, 0.0f, new_mm);
+                }
+            }
+        }
+        if (t == 0) {
+            *reinterpret_cast<float4*>(bounds + 4 * bidx) = new_mm;
+        }
+    }
+
+    // after raw gather of packed codes across blocks, re-encode each new
+    // row under its destination block bounds (decode under source bounds).
+    template <int BITS>
+    __global__ void joint_transcode_gathered_rows_cu(
+        uint8_t* packed,
+        const float* bounds,
+        const int64_t* indices,
+        const int n_new,
+        const int old_N,
+        const int n_attr) {
+        using C = lfs::training::joint_adam::DeviceCodec<BITS>;
+        const int k = blockIdx.x * blockDim.x + threadIdx.x;
+        if (k >= n_new)
+            return;
+        const int64_t src = indices[k];
+        const int64_t dst = static_cast<int64_t>(old_N) + k;
+        if (src < 0)
+            return;
+        const float4 src_mm = *reinterpret_cast<const float4*>(bounds + 4 * static_cast<int>(src / 256));
+        const float4 dst_mm = *reinterpret_cast<const float4*>(bounds + 4 * static_cast<int>(dst / 256));
+        // Same block + identical bounds: codes already correct after raw gather.
+        if (src_mm.x == dst_mm.x && src_mm.y == dst_mm.y &&
+            src_mm.z == dst_mm.z && src_mm.w == dst_mm.w &&
+            (src / 256) == (dst / 256)) {
+            return;
+        }
+        for (int a = 0; a < n_attr; ++a) {
+            // Raw gather left src codes at dst; decode with src bounds, encode with dst.
+            const int64_t dst_cell = dst * n_attr + a;
+            const float2 us = C::decode_us(packed, dst_cell, src_mm);
+            C::encode_us(packed, dst_cell, us.x, us.y, dst_mm);
         }
     }
 

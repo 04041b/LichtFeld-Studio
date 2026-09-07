@@ -4,13 +4,14 @@
 
 #pragma once
 
+#include "core/export.hpp"
 #include "tool_base.hpp"
 #include <algorithm>
 #include <glm/glm.hpp>
 
 namespace lfs::vis::tools {
 
-    class SelectionTool : public ToolBase {
+    class LFS_VIS_API SelectionTool : public ToolBase {
     public:
         SelectionTool();
         ~SelectionTool() override = default;
@@ -30,7 +31,11 @@ namespace lfs::vis::tools {
 
         // Depth filter
         [[nodiscard]] bool isDepthFilterEnabled() const { return depth_filter_enabled_; }
+        [[nodiscard]] float getDepthNear() const { return depth_near_; }
+        [[nodiscard]] float getDepthFar() const { return depth_far_; }
+        [[nodiscard]] float getDepthFrustumHalfWidth() const { return frustum_half_width_; }
         void setDepthFilterEnabled(bool enabled);
+        void setDepthFilterRange(bool enabled, float depth_near, float depth_far, float frustum_half_width);
         void toggleDepthFilter() { setDepthFilterEnabled(!depth_filter_enabled_); }
         void adjustDepthFar(float scale);
         void syncDepthFilterToCamera(const Viewport& viewport);
@@ -39,18 +44,32 @@ namespace lfs::vis::tools {
         [[nodiscard]] bool isCropFilterEnabled() const { return crop_filter_enabled_; }
         void setCropFilterEnabled(bool enabled);
         void toggleCropFilter() { setCropFilterEnabled(!crop_filter_enabled_); }
+        [[nodiscard]] bool restrictToSelectedNodes() const {
+            return restrict_to_selected_nodes_;
+        }
+        // Project restore runs after VIEW render state has been staged. Set
+        // preference owners without recomputing the saved depth transform from
+        // the current camera or emitting an in-progress tool gesture.
+        void restoreProjectPreferences(
+            float brush_radius,
+            bool crop_filter,
+            bool depth_filter,
+            bool restrict_to_selected_nodes) {
+            setBrushRadius(brush_radius);
+            crop_filter_enabled_ = crop_filter;
+            depth_filter_enabled_ = depth_filter;
+            restrict_to_selected_nodes_ =
+                restrict_to_selected_nodes;
+            armPreserveRestoredRenderState();
+        }
+        void armPreserveRestoredRenderState() {
+            preserve_restored_render_state_ = true;
+        }
 
     protected:
         void onEnabledChanged(bool enabled) override;
 
     private:
-        struct RenderModeSnapshot {
-            bool valid = false;
-            bool point_cloud_mode = false;
-            bool show_rings = false;
-            bool show_center_markers = false;
-        };
-
         glm::vec2 last_mouse_pos_{0.0f};
         float brush_radius_ = 20.0f;
         const ToolContext* tool_context_ = nullptr;
@@ -60,19 +79,19 @@ namespace lfs::vis::tools {
         float depth_near_ = 0.0f;
         float depth_far_ = DEFAULT_DEPTH_FAR;
         float frustum_half_width_ = DEFAULT_FRUSTUM_HALF_WIDTH;
-        RenderModeSnapshot depth_filter_render_mode_snapshot_;
 
         // Crop filter
         bool crop_filter_enabled_ = false;
+        bool restrict_to_selected_nodes_ = true;
+        bool preserve_restored_render_state_ = false;
 
         static constexpr float DEPTH_MIN = 0.01f;
         static constexpr float DEPTH_MAX = 1000.0f;
-        static constexpr float DEFAULT_DEPTH_FAR = 5.3f;
+        static constexpr float DEFAULT_DEPTH_FAR = 6.0f;
         static constexpr float DEFAULT_FRUSTUM_HALF_WIDTH = 1.35f;
 
         void applySelectionFilterSettings(const ToolContext& ctx) const;
         void clearSelectionRenderState(const ToolContext& ctx) const;
-        void syncDepthFilterRenderMode(const ToolContext& ctx);
     };
 
 } // namespace lfs::vis::tools

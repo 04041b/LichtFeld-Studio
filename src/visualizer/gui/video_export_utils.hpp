@@ -25,6 +25,7 @@ namespace lfs::vis::gui {
 
     struct VideoExportMeshSnapshot {
         std::shared_ptr<lfs::core::MeshData> mesh;
+        lfs::core::NodeId node_id = lfs::core::NULL_NODE;
         glm::mat4 transform{1.0f};
         bool is_selected = false;
     };
@@ -32,6 +33,7 @@ namespace lfs::vis::gui {
     struct VideoExportCropBoxSnapshot {
         bool has_data = false;
         lfs::core::NodeId node_id = lfs::core::NULL_NODE;
+        lfs::core::NodeId parent_splat_id = lfs::core::NULL_NODE;
         int parent_node_index = -1;
         lfs::core::CropBoxData data;
         glm::mat4 world_transform{1.0f};
@@ -39,6 +41,7 @@ namespace lfs::vis::gui {
 
     struct VideoExportEllipsoidSnapshot {
         lfs::core::NodeId node_id = lfs::core::NULL_NODE;
+        lfs::core::NodeId parent_splat_id = lfs::core::NULL_NODE;
         int parent_node_index = -1;
         lfs::core::EllipsoidData data;
         glm::mat4 world_transform{1.0f};
@@ -67,6 +70,10 @@ namespace lfs::vis::gui {
 
     LFS_VIS_API std::expected<VideoExportSceneSnapshot, std::string> captureVideoExportSceneSnapshot(
         const lfs::vis::SceneManager& scene_manager);
+
+    LFS_VIS_API void refreshVideoExportMeshTransforms(
+        VideoExportSceneSnapshot& snapshot,
+        const lfs::core::Scene& scene);
 
     LFS_VIS_API std::expected<lfs::io::video::VideoExportOptions, std::string> validateVideoExportOptions(
         lfs::io::video::VideoExportOptions options);

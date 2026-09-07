@@ -4,18 +4,77 @@
 #include "sequencer_controller.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <nlohmann/json.hpp>
 
 namespace lfs::vis {
 
+    std::expected<core::NodeId, PlySequenceResolveError> resolvePlySequenceNode(
+        const core::Scene& scene,
+        const core::Uuid& node_uuid,
+        const std::string_view node_name) {
+        if (!node_uuid.is_nil()) {
+            const auto node_id = scene.getNodeIdByUuid(node_uuid);
+            if (node_id == core::NULL_NODE) {
+                return std::unexpected(PlySequenceResolveError{
+                    .code = PlySequenceResolveErrorCode::UUID_NOT_FOUND,
+                    .message = "PLY sequence node UUID " + node_uuid.to_string() +
+                               " does not resolve",
+                });
+            }
+            return node_id;
+        }
+
+        if (node_name.empty()) {
+            return std::unexpected(PlySequenceResolveError{
+                .code = PlySequenceResolveErrorCode::LEGACY_NAME_NOT_FOUND,
+                .message = "PLY sequence node has neither UUID nor display label",
+            });
+        }
+        const auto node_id = scene.getNodeIdByName(std::string(node_name));
+        if (node_id == core::NULL_NODE) {
+            return std::unexpected(PlySequenceResolveError{
+                .code = PlySequenceResolveErrorCode::LEGACY_NAME_NOT_FOUND,
+                .message = "PLY sequence node label '" + std::string(node_name) +
+                           "' does not resolve",
+            });
+        }
+        return node_id;
+    }
+
     namespace {
         constexpr float KEYFRAME_SEEK_EPS = 1e-4f;
+
+        [[nodiscard]] float clampSequenceFps(const float fps) {
+            return std::clamp(std::isfinite(fps) ? fps : DEFAULT_SEQUENCE_FPS,
+                              MIN_SEQUENCE_FPS,
+                              MAX_SEQUENCE_FPS);
+        }
+
+        [[nodiscard]] bool hasTimelineCameraContent(const sequencer::Timeline& timeline) {
+            return timeline.realKeyframeCount() > 0 || timeline.hasAnimationClip();
+        }
     } // namespace
 
+    bool SequencerController::hasPlayableContent() const {
+        return hasTimelineCameraContent(timeline_) || hasPlySequence();
+    }
+
+    float SequencerController::playbackStartTime() const {
+        return (hasPlySequence() || timeline_.hasAnimationClip()) ? 0.0f : timeline_.startTime();
+    }
+
     void SequencerController::play() {
-        if (timeline_.empty())
+        if (!hasPlayableContent())
             return;
+        const float end = timeline_.clipDuration();
+        if (state_ == PlaybackState::PAUSED && loop_mode_ == LoopMode::ONCE &&
+            end > 0.0f && playhead_ >= end - KEYFRAME_SEEK_EPS) {
+            playhead_ = playbackStartTime();
+            reverse_direction_ = false;
+        }
         if (state_ == PlaybackState::STOPPED) {
-            playhead_ = timeline_.startTime();
+            playhead_ = playbackStartTime();
             reverse_direction_ = false;
         }
         state_ = PlaybackState::PLAYING;
@@ -29,7 +88,7 @@ namespace lfs::vis {
 
     void SequencerController::stop() {
         state_ = PlaybackState::STOPPED;
-        playhead_ = timeline_.startTime();
+        playhead_ = playbackStartTime();
         reverse_direction_ = false;
     }
 
@@ -42,8 +101,8 @@ namespace lfs::vis {
     }
 
     void SequencerController::seekToFirstKeyframe() {
-        if (!timeline_.empty()) {
-            playhead_ = timeline_.startTime();
+        if (hasPlayableContent()) {
+            playhead_ = playbackStartTime();
             if (state_ == PlaybackState::PLAYING) {
                 state_ = PlaybackState::PAUSED;
             }
@@ -51,8 +110,18 @@ namespace lfs::vis {
     }
 
     void SequencerController::seekToPreviousKeyframe() {
-        if (timeline_.empty())
+        if (!hasPlayableContent())
             return;
+
+        if (timeline_.realKeyframeCount() == 0 && hasPlySequence()) {
+            const auto current_frame = plySequenceFrameIndex(playhead_).value_or(0);
+            const size_t target_frame = current_frame > 0 ? current_frame - 1 : 0;
+            playhead_ = static_cast<float>(target_frame) / plySequenceFps();
+            if (state_ == PlaybackState::PLAYING) {
+                state_ = PlaybackState::PAUSED;
+            }
+            return;
+        }
 
         float target_time = timeline_.startTime();
         bool found_previous = false;
@@ -76,8 +145,21 @@ namespace lfs::vis {
     }
 
     void SequencerController::seekToNextKeyframe() {
-        if (timeline_.empty())
+        if (!hasPlayableContent())
             return;
+
+        if (timeline_.realKeyframeCount() == 0 && hasPlySequence()) {
+            const auto* const sequence = plySequence();
+            if (!sequence)
+                return;
+            const auto current_frame = plySequenceFrameIndex(playhead_).value_or(0);
+            const size_t target_frame = std::min(current_frame + 1, sequence->frames.size() - 1);
+            playhead_ = static_cast<float>(target_frame) / plySequenceFps();
+            if (state_ == PlaybackState::PLAYING) {
+                state_ = PlaybackState::PAUSED;
+            }
+            return;
+        }
 
         float target_time = timeline_.endTime();
         bool found_next = false;
@@ -102,8 +184,15 @@ namespace lfs::vis {
     }
 
     void SequencerController::seekToLastKeyframe() {
-        if (!timeline_.empty()) {
-            playhead_ = timeline_.realKeyframeCount() > 0 ? timeline_.realEndTime() : timeline_.endTime();
+        if (hasPlayableContent()) {
+            if (timeline_.realKeyframeCount() == 0 && hasPlySequence()) {
+                const auto* const sequence = plySequence();
+                if (!sequence)
+                    return;
+                playhead_ = static_cast<float>(sequence->frames.size() - 1) / plySequenceFps();
+            } else {
+                playhead_ = timeline_.realKeyframeCount() > 0 ? timeline_.realEndTime() : timeline_.endTime();
+            }
             if (state_ == PlaybackState::PLAYING) {
                 state_ = PlaybackState::PAUSED;
             }
@@ -151,11 +240,6 @@ namespace lfs::vis {
         return keyframe && keyframe->is_loop_point;
     }
 
-    bool SequencerController::isEditableKeyframe(const size_t index) const {
-        const auto* const keyframe = timeline_.getKeyframe(index);
-        return keyframe && !keyframe->is_loop_point;
-    }
-
     void SequencerController::removeLoopKeyframe() {
         for (size_t index = timeline_.size(); index-- > 0;) {
             const auto* const keyframe = timeline_.getKeyframe(index);
@@ -198,7 +282,7 @@ namespace lfs::vis {
     }
 
     bool SequencerController::update(const float delta_seconds) {
-        if (state_ != PlaybackState::PLAYING || timeline_.empty()) {
+        if (state_ != PlaybackState::PLAYING || !hasPlayableContent()) {
             return false;
         }
 
@@ -206,6 +290,11 @@ namespace lfs::vis {
         // the keyframe range, so non-loop modes naturally hold the last pose past the final
         // real keyframe until the clip end.
         const float end = timeline_.clipDuration();
+        if (end <= 0.0f) {
+            state_ = PlaybackState::STOPPED;
+            playhead_ = 0.0f;
+            return false;
+        }
         const float delta = delta_seconds * playback_speed_ * (reverse_direction_ ? -1.0f : 1.0f);
 
         playhead_ += delta;
@@ -222,20 +311,23 @@ namespace lfs::vis {
             break;
 
         case LoopMode::LOOP:
-            if (playhead_ >= end) {
-                playhead_ -= end;
-            } else if (playhead_ < 0.0f) {
+            playhead_ = std::fmod(playhead_, end);
+            if (playhead_ < 0.0f)
                 playhead_ += end;
-            }
             break;
 
         case LoopMode::PING_PONG:
-            if (playhead_ >= end) {
-                playhead_ = end - (playhead_ - end);
-                reverse_direction_ = true;
-            } else if (playhead_ < 0.0f) {
-                playhead_ = -playhead_;
-                reverse_direction_ = false;
+            if (const float period = end * 2.0f; period > 0.0f) {
+                float phase = std::fmod(playhead_, period);
+                if (phase < 0.0f)
+                    phase += period;
+                if (phase <= end) {
+                    playhead_ = phase;
+                    reverse_direction_ = false;
+                } else {
+                    playhead_ = period - phase;
+                    reverse_direction_ = true;
+                }
             }
             break;
         }
@@ -300,14 +392,6 @@ namespace lfs::vis {
         rebuildLoopKeyframe();
         markTimelineChanged();
         return true;
-    }
-
-    bool SequencerController::updateKeyframe(const size_t index, const glm::vec3& position,
-                                             const glm::quat& rotation, const float focal_length_mm) {
-        const auto* const keyframe = timeline_.getKeyframe(index);
-        if (!keyframe || keyframe->is_loop_point)
-            return false;
-        return updateKeyframeById(keyframe->id, position, rotation, focal_length_mm);
     }
 
     bool SequencerController::updateKeyframeById(const sequencer::KeyframeId id, const glm::vec3& position,
@@ -392,12 +476,17 @@ namespace lfs::vis {
     void SequencerController::clear() {
         stop();
         deselectKeyframe();
+        ply_sequence_.reset();
         timeline_.clear();
         markTimelineChanged();
     }
 
     bool SequencerController::saveToJson(const std::string& path) const {
         return timeline_.saveToJson(path);
+    }
+
+    nlohmann::json SequencerController::saveToJson() const {
+        return timeline_.saveToJson();
     }
 
     bool SequencerController::loadFromJson(const std::string& path) {
@@ -409,6 +498,96 @@ namespace lfs::vis {
         rebuildLoopKeyframe();
         markTimelineChanged();
         return true;
+    }
+
+    bool SequencerController::loadFromJson(
+        const nlohmann::json& json) {
+        stop();
+        deselectKeyframe();
+        if (!timeline_.loadFromJson(json))
+            return false;
+        rebuildLoopKeyframe();
+        markTimelineChanged();
+        return true;
+    }
+
+    void SequencerController::setPlySequence(std::filesystem::path directory,
+                                             std::string node_name,
+                                             std::vector<std::filesystem::path> paths,
+                                             std::vector<std::string> node_names,
+                                             const float fps,
+                                             core::Uuid node_uuid,
+                                             std::vector<core::Uuid> node_uuids) {
+        const size_t frame_count = std::min(paths.size(), node_names.size());
+        if (frame_count == 0) {
+            clearPlySequence();
+            return;
+        }
+
+        PlySequenceClip sequence;
+        sequence.directory = std::move(directory);
+        sequence.node_name = std::move(node_name);
+        sequence.node_uuid = node_uuid;
+        sequence.fps = clampSequenceFps(fps);
+        sequence.frames.reserve(frame_count);
+        for (size_t i = 0; i < frame_count; ++i) {
+            sequence.frames.push_back({
+                .path = std::move(paths[i]),
+                .node_name = std::move(node_names[i]),
+                .node_uuid = i < node_uuids.size() ? node_uuids[i] : core::Uuid{},
+            });
+        }
+
+        const bool preserve_timeline_duration = hasTimelineCameraContent(timeline_);
+        const float sequence_duration = sequence.duration();
+        ply_sequence_ = std::move(sequence);
+        timeline_.setClipDuration(preserve_timeline_duration
+                                      ? std::max(timeline_.clipDuration(), sequence_duration)
+                                      : sequence_duration);
+        state_ = PlaybackState::STOPPED;
+        playhead_ = 0.0f;
+        reverse_direction_ = false;
+        markTimelineChanged();
+    }
+
+    void SequencerController::clearPlySequence() {
+        if (!ply_sequence_)
+            return;
+
+        ply_sequence_.reset();
+        if (!hasTimelineCameraContent(timeline_))
+            timeline_.setClipDuration(sequencer::DEFAULT_CLIP_DURATION_SECONDS);
+        if (playhead_ > timeline_.clipDuration())
+            playhead_ = timeline_.clipDuration();
+        markTimelineChanged();
+    }
+
+    void SequencerController::setPlySequenceFps(const float fps) {
+        if (!ply_sequence_)
+            return;
+
+        const float clamped = clampSequenceFps(fps);
+        if (ply_sequence_->fps == clamped)
+            return;
+
+        ply_sequence_->fps = clamped;
+        const float sequence_duration = ply_sequence_->duration();
+        timeline_.setClipDuration(hasTimelineCameraContent(timeline_)
+                                      ? std::max(timeline_.clipDuration(), sequence_duration)
+                                      : sequence_duration);
+        if (playhead_ > timeline_.clipDuration())
+            playhead_ = timeline_.clipDuration();
+        markTimelineChanged();
+    }
+
+    std::optional<size_t> SequencerController::plySequenceFrameIndex(const float time) const {
+        const auto* const sequence = plySequence();
+        if (!sequence)
+            return std::nullopt;
+
+        const float frame_time = std::max(time, 0.0f) * sequence->fps;
+        const auto frame = static_cast<size_t>(std::floor(frame_time + 1e-4f));
+        return std::min(frame, sequence->frames.size() - 1);
     }
 
     bool SequencerController::selectKeyframe(const size_t index) {

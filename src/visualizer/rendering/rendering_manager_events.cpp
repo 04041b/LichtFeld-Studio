@@ -48,26 +48,36 @@ namespace lfs::vis {
     } // namespace
 
     void RenderingManager::setupEventHandlers() {
-        cmd::ToggleSplitView::when([this](const auto&) { handleToggleSplitView(); });
-        cmd::ToggleIndependentSplitView::when([this](const auto& event) { handleToggleIndependentSplitView(event); });
-        cmd::ToggleGTComparison::when([this](const auto&) { handleToggleGTComparison(); });
-        cmd::GoToCamView::when([this](const auto& event) { handleGoToCamView(event.cam_id); });
-        ui::SplitPositionChanged::when([this](const auto& event) { handleSplitPositionChanged(event.position); });
-        ui::RenderSettingsChanged::when([this](const auto& event) { handleRenderSettingsChanged(event); });
-        ui::WindowResized::when([this](const auto&) { handleWindowResized(); });
-        ui::GridSettingsChanged::when([this](const auto& event) { handleGridSettingsChanged(event); });
-        ui::NodeSelected::when([this](const auto&) { triggerSelectionFlash(); });
-        state::TrainingStarted::when([this](const auto&) { handleTrainingStarted(); });
-        state::TrainingCompleted::when([this](const auto&) { handleTrainingCompleted(); });
-        state::SceneLoaded::when([this](const auto&) { handleSceneLoaded(); });
-        state::SceneChanged::when([this](const auto& event) { handleSceneChanged(event.mutation_flags); });
-        state::SceneCleared::when([this](const auto&) { handleSceneCleared(); });
-        cmd::SetPLYVisibility::when([this](const auto&) { handlePLYVisibilityChanged(); });
-        state::PLYAdded::when([this](const auto&) { handlePLYAdded(); });
-        state::PLYRemoved::when([this](const auto&) { handlePLYRemoved(); });
-        ui::CropBoxChanged::when([this](const auto& event) { handleCropBoxChanged(event.enabled); });
-        ui::EllipsoidChanged::when([this](const auto& event) { handleEllipsoidChanged(event.enabled); });
-        ui::PointCloudModeChanged::when([this](const auto& event) { handlePointCloudModeChanged(event); });
+        event_handlers_.subscribe<cmd::ToggleSplitView>([this](const auto&) { handleToggleSplitView(); });
+        event_handlers_.subscribe<cmd::ToggleIndependentSplitView>(
+            [this](const auto& event) { handleToggleIndependentSplitView(event); });
+        event_handlers_.subscribe<cmd::ToggleGTComparison>([this](const auto&) { handleToggleGTComparison(); });
+        event_handlers_.subscribe<cmd::GoToCamView>([this](const auto& event) { handleGoToCamView(event.cam_id); });
+        event_handlers_.subscribe<ui::SplitPositionChanged>(
+            [this](const auto& event) { handleSplitPositionChanged(event.position); });
+        event_handlers_.subscribe<ui::RenderSettingsChanged>(
+            [this](const auto& event) { handleRenderSettingsChanged(event); });
+        event_handlers_.subscribe<ui::WindowResized>([this](const auto&) { handleWindowResized(); });
+        event_handlers_.subscribe<ui::WindowResizeInteraction>(
+            [this](const auto& event) { setViewportResizeActive(event.active); });
+        event_handlers_.subscribe<ui::GridSettingsChanged>(
+            [this](const auto& event) { handleGridSettingsChanged(event); });
+        event_handlers_.subscribe<ui::NodeSelected>([this](const auto&) { triggerSelectionFlash(); });
+        event_handlers_.subscribe<state::TrainingStarted>([this](const auto&) { handleTrainingStarted(); });
+        event_handlers_.subscribe<state::TrainingCompleted>([this](const auto&) { handleTrainingCompleted(); });
+        event_handlers_.subscribe<state::SceneLoaded>([this](const auto&) { handleSceneLoaded(); });
+        event_handlers_.subscribe<state::SceneChanged>(
+            [this](const auto& event) { handleSceneChanged(event.mutation_flags); });
+        event_handlers_.subscribe<state::SceneCleared>([this](const auto&) { handleSceneCleared(); });
+        event_handlers_.subscribe<cmd::SetPLYVisibility>([this](const auto&) { handlePLYVisibilityChanged(); });
+        event_handlers_.subscribe<state::PLYAdded>([this](const auto&) { handlePLYAdded(); });
+        event_handlers_.subscribe<state::PLYRemoved>([this](const auto&) { handlePLYRemoved(); });
+        event_handlers_.subscribe<ui::CropBoxChanged>(
+            [this](const auto& event) { handleCropBoxChanged(event.enabled); });
+        event_handlers_.subscribe<ui::EllipsoidChanged>(
+            [this](const auto& event) { handleEllipsoidChanged(event.enabled); });
+        event_handlers_.subscribe<ui::PointCloudModeChanged>(
+            [this](const auto& event) { handlePointCloudModeChanged(event); });
     }
 
     void RenderingManager::handleToggleSplitView() {
@@ -114,6 +124,40 @@ namespace lfs::vis {
         }
     }
 
+    void RenderingManager::restoreSplitViewMode(
+        const SplitViewMode mode,
+        Viewport& primary_viewport) {
+        std::vector<SplitViewService::ModeChangeResult>
+            changes;
+        {
+            std::lock_guard<std::mutex> lock(
+                settings_mutex_);
+            if (settings_.split_view_mode == mode)
+                return;
+            if (settings_.split_view_mode !=
+                SplitViewMode::Disabled) {
+                changes.push_back(
+                    split_view_service_.toggleMode(
+                        settings_,
+                        settings_.split_view_mode,
+                        &primary_viewport));
+            }
+            if (mode != SplitViewMode::Disabled) {
+                changes.push_back(
+                    split_view_service_.toggleMode(
+                        settings_, mode,
+                        &primary_viewport));
+            }
+            if (mode == SplitViewMode::IndependentDual)
+                syncGridPlanesLocked(settings_.grid_plane);
+            markDirty(DirtyFlag::ALL);
+        }
+        for (const auto& change : changes)
+            applySplitModeChange(change);
+        if (mode != SplitViewMode::GTComparison)
+            invalidateCameraMetricsRequests(true);
+    }
+
     void RenderingManager::handleGoToCamView(const int cam_id) {
         setCurrentCameraId(cam_id);
         LOG_DEBUG("Current camera ID set to: {}", cam_id);
@@ -127,7 +171,7 @@ namespace lfs::vis {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         settings_.split_position = std::clamp(position, 0.0f, 1.0f);
         LOG_TRACE("Split position changed to: {}", position);
-        markDirty(DirtyFlag::SPLIT_VIEW | frame_lifecycle_service_.deferViewportRefresh());
+        markDirty(DirtyFlag::SPLIT_POSITION);
     }
 
     void RenderingManager::handleRenderSettingsChanged(const ui::RenderSettingsChanged& event) {
@@ -154,16 +198,15 @@ namespace lfs::vis {
         }
         if (event.equirectangular) {
             settings_.equirectangular = *event.equirectangular;
+            enforceProjectionBackend(settings_);
             LOG_TRACE("Equirectangular rendering: {}", settings_.equirectangular ? "enabled" : "disabled");
         }
         markDirty(DirtyFlag::SPLATS | DirtyFlag::CAMERA | DirtyFlag::BACKGROUND);
     }
 
     void RenderingManager::handleWindowResized() {
-        LOG_DEBUG("Window resized, clearing render cache");
-        markDirty(DirtyFlag::VIEWPORT | DirtyFlag::CAMERA);
-        viewport_artifact_service_.clearViewportOutput();
-        frame_lifecycle_service_.resetViewportSize();
+        LOG_DEBUG("RenderingManager window resize: deferring viewport refresh");
+        markDirty(frame_lifecycle_service_.deferViewportRefresh());
     }
 
     void RenderingManager::handleGridSettingsChanged(const ui::GridSettingsChanged& event) {
@@ -182,11 +225,17 @@ namespace lfs::vis {
     }
 
     void RenderingManager::handleTrainingStarted() {
+        // The worker completion handoff only invalidates overlay state. Any
+        // renderer setup is consumed by the next render cadence tick.
         markDirty(DirtyFlag::OVERLAY);
     }
 
     void RenderingManager::handleTrainingCompleted() {
-        markDirty(DirtyFlag::OVERLAY);
+        // TrainingCompleted is delivered from the training side. Defer Vulkan
+        // destruction to renderVulkanFrame, which runs on the Vulkan thread and
+        // also has the final trainer/viewer completion ordering in hand.
+        vksplat_terminal_release_pending_.store(true, std::memory_order_release);
+        markDirty(DirtyFlag::SPLATS | DirtyFlag::CAMERA | DirtyFlag::OVERLAY);
     }
 
     void RenderingManager::handleSceneLoaded() {
@@ -213,7 +262,7 @@ namespace lfs::vis {
     }
 
     void RenderingManager::handleSceneCleared() {
-        viewport_artifact_service_.clearViewportOutput();
+        releaseSceneRenderResources();
         invalidateCameraMetricsRequests(true);
         SplitViewService::ModeChangeResult result;
         {
@@ -223,7 +272,6 @@ namespace lfs::vis {
         }
         camera_interaction_service_.clearCurrentCamera();
         camera_interaction_service_.clearHoveredCamera();
-        frame_lifecycle_service_.resetModelTracking();
         applySplitModeChange(result);
         markDirty();
     }

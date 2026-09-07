@@ -9,16 +9,26 @@
 
 namespace lfs::vis::gui {
 
+    // Initializes the thread-local native dialog backend without opening a
+    // dialog. Call only on the UI thread during an idle frame.
+    LFS_VIS_API void warmupNativeFileDialogBackend();
+
     LFS_VIS_API std::filesystem::path OpenImageFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenEnvironmentMapFileDialog(const std::filesystem::path& defaultPath = {});
-    LFS_VIS_API std::filesystem::path PickFolderDialog(const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path OpenFileDialog(const std::filesystem::path& defaultPath = {},
+                                                     const std::string& dialogTitle = {});
+    LFS_VIS_API std::filesystem::path PickFolderDialog(const std::filesystem::path& defaultPath = {},
+                                                       const std::string& dialogTitle = {});
     LFS_VIS_API std::filesystem::path OpenPointCloudFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenMeshFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenCheckpointFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenPPISPFileDialog(const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path OpenProjectFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenDatasetFolderDialog(const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path PickColmapSparseFolderDialog(const std::filesystem::path& defaultSparsePath = {});
     LFS_VIS_API std::filesystem::path OpenJsonFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenCsvFileDialog(const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path OpenXmlFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenLasFileDialog(const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path OpenVideoFileDialog(const std::filesystem::path& defaultPath = {});
 
@@ -32,6 +42,10 @@ namespace lfs::vis::gui {
                                                         const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path SaveJsonFileDialog(const std::string& defaultName,
                                                          const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path SavePngFileDialog(const std::string& defaultName,
+                                                        const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path SaveJpgFileDialog(const std::string& defaultName,
+                                                        const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path SaveTextFileDialog(const std::string& defaultName,
                                                          const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path SaveSogFileDialog(const std::string& defaultName,
@@ -50,5 +64,7 @@ namespace lfs::vis::gui {
                                                         const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path SavePythonFileDialog(const std::string& defaultName,
                                                            const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path SaveProjectFileDialog(const std::string& defaultName = "project.licht",
+                                                            const std::filesystem::path& defaultPath = {});
 
 } // namespace lfs::vis::gui

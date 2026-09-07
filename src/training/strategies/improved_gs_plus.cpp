@@ -4,25 +4,26 @@
 
 #include "improved_gs_plus.hpp"
 
+#include "core/cuda/sh_layout.cuh"
 #include "core/igs_failure_diagnostics.hpp"
 #include "core/logger.hpp"
 #include "core/tensor/internal/tensor_serialization.hpp"
-#include "edge_rasterizer.hpp"
-#include "gsplat_rasterizer.hpp"
+#include "diagnostics/vram_profiler.hpp"
+#include "lfs/training/morton_reorder.hpp"
+#include "lfs/training/sh_value_storage.hpp"
 #include "strategy_utils.hpp"
 
 #include "core/tensor/internal/memory_pool.hpp"
-#include "io/pipelined_image_loader.hpp"
 #include "kernels/densification_kernels.hpp"
-#include "kernels/image_kernels.hpp"
 #include "kernels/mcmc_kernels.hpp"
+#include "kernels/mrnf_kernels.hpp"
 #include "optimizer/adam_optimizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <numeric>
-#include <random>
+#include <utility>
 
 namespace lfs::training {
 
@@ -41,11 +42,6 @@ namespace lfs::training {
             return false;
         }
 
-        // Returns true if shN tensor has non-zero coefficients
-        [[nodiscard]] inline bool has_shN_coefficients(const lfs::core::Tensor& shN) {
-            return shN.is_valid() && shN.ndim() >= 2 && shN.shape()[1] > 0;
-        }
-
         const float get_percentil_value(const float q_percent, const lfs::core::Tensor tensor) {
             auto [sorted_val, sorted_idx] = tensor.sort();
 
@@ -56,44 +52,14 @@ namespace lfs::training {
             return quantile_threshold;
         }
 
-        struct CannyWorkspace {
-            lfs::core::Tensor nms_output;
-        };
-
-        CannyWorkspace create_canny_workspace(int height, int width) {
-            const auto dev = lfs::core::Device::CUDA;
-            const auto dt = lfs::core::DataType::Float32;
-            return {
-                lfs::core::Tensor::zeros({static_cast<size_t>(height), static_cast<size_t>(width)}, dev, dt)};
-        }
-
-        void apply_canny_filter(const lfs::core::Tensor& input_data, CannyWorkspace& ws) {
-            assert(input_data.dtype() == lfs::core::DataType::Float32 ||
-                   input_data.dtype() == lfs::core::DataType::UInt8);
-            assert(input_data.device() == lfs::core::Device::CUDA);
-            assert(input_data.ndim() == 3);
-            assert(input_data.shape()[0] >= 3);
-
-            const int width = input_data.shape()[2];
-            const int height = input_data.shape()[1];
-
-            auto input_contig = input_data.contiguous();
-            if (input_contig.dtype() == lfs::core::DataType::UInt8) {
-                kernels::launch_fused_canny_edge_filter_chw(
-                    input_contig.ptr<uint8_t>(),
-                    ws.nms_output.ptr<float>(),
-                    height,
-                    width);
-            } else {
-                kernels::launch_fused_canny_edge_filter_chw(
-                    input_contig.ptr<float>(),
-                    ws.nms_output.ptr<float>(),
-                    height,
-                    width);
-            }
-        }
-
         void normalize_by_positive_median_inplace(lfs::core::Tensor& tensor) {
+            if (tensor.device() == lfs::core::Device::CUDA &&
+                tensor.dtype() == lfs::core::DataType::Float32 &&
+                tensor.is_valid() && tensor.numel() > 0) {
+                kernels::launch_normalize_by_positive_median(
+                    tensor.ptr<float>(), tensor.numel());
+                return;
+            }
             tensor.masked_fill_(tensor.isnan(), 0.0f);
             auto valid = tensor.masked_select(tensor > 0.0f);
             if (valid.numel() == 0) {
@@ -101,15 +67,8 @@ namespace lfs::training {
                 return;
             }
             auto [sorted, _] = valid.sort();
-            if (tensor.device() == lfs::core::Device::CUDA) {
-                kernels::launch_normalize_by_device_scalar(
-                    tensor.ptr<float>(),
-                    tensor.numel(),
-                    sorted.ptr<float>() + valid.numel() / 2);
-            } else {
-                float median = sorted[valid.numel() / 2].item_as<float>();
-                tensor.div_(std::max(median, 1e-9f));
-            }
+            float median = sorted[valid.numel() / 2].item_as<float>();
+            tensor.div_(std::max(median, 1e-9f));
         }
 
         lfs::core::Tensor normalized_by_positive_median(const lfs::core::Tensor& tensor) {
@@ -161,19 +120,39 @@ namespace lfs::training {
                               ? lfs::core::Tensor::ones_bool({static_cast<size_t>(indices.numel())}, indices.device())
                               : lfs::core::Tensor::zeros_bool({static_cast<size_t>(indices.numel())}, indices.device());
             splat_data.deleted().index_put_(indices, values);
+            splat_data.notify_deleted_mask_changed();
         }
 
-        void append_live_deleted_rows(lfs::core::SplatData& splat_data, const lfs::core::Tensor& free_mask, size_t n_rows) {
-            if (n_rows == 0) {
+        void append_live_deleted_rows(lfs::core::SplatData& splat_data, const lfs::core::Tensor& free_mask) {
+            // safe before or after param growth — pad to size with live rows.
+            const size_t target_size = static_cast<size_t>(splat_data.size());
+            auto& deleted = splat_data.deleted();
+            const size_t desired_capacity = std::max(
+                deleted_mask_capacity(splat_data, free_mask),
+                target_size);
+
+            if (!deleted.is_valid()) {
+                if (target_size == 0) {
+                    return;
+                }
+                deleted = lfs::core::Tensor::zeros_bool({target_size}, splat_data.means().device());
+                deleted.reserve(desired_capacity);
+                splat_data.notify_deleted_mask_changed();
                 return;
             }
 
-            auto& deleted = splat_data.deleted();
-            if (!deleted.is_valid()) {
-                deleted = lfs::core::Tensor::zeros_bool({static_cast<size_t>(splat_data.size())}, splat_data.means().device());
+            const size_t cur = static_cast<size_t>(deleted.numel());
+            if (cur == target_size) {
+                deleted.reserve(desired_capacity);
+                return;
             }
-            deleted.reserve(deleted_mask_capacity(splat_data, free_mask));
-            deleted.append_zeros(n_rows);
+            if (cur < target_size) {
+                deleted.reserve(desired_capacity);
+                deleted.append_zeros(target_size - cur);
+                splat_data.notify_deleted_mask_changed();
+                return;
+            }
+            splat_data.reconcile_deleted_mask();
         }
 
         struct SampledScaleSummary {
@@ -266,63 +245,17 @@ namespace lfs::training {
         ensure_error_score_shape();
     }
 
-    const lfs::core::Tensor ImprovedGSPlus::compute_gaussian_score() {
-        const int64_t N = _splat_data->size();
-
-        auto view_indices = random_cam_indices();
-        const int num_views = static_cast<int>(view_indices.size());
-        assert(num_views > 0);
-
-        CannyWorkspace canny_ws;
-        auto gaussian_scores = lfs::core::Tensor::zeros(
-            {static_cast<size_t>(N)}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-
-        for (int view = 0; view < num_views; view++) {
-            const int idx = view_indices[view];
-            lfs::core::Camera* cam = _views->get_camera(idx);
-
-            assert(_image_loader && "set_image_loader() must be called before training");
-            lfs::io::LoadParams params;
-            params.resize_factor = _views->get_resize_factor();
-            params.max_width = _views->get_max_width();
-            params.output_uint8 = true;
-            if (cam->is_undistort_prepared()) {
-                params.undistort = &cam->undistort_params();
-            }
-            lfs::core::Tensor image = _image_loader->load_image_immediate(cam->image_path(), params);
-
-            const int img_h = image.shape()[1];
-            const int img_w = image.shape()[2];
-
-            if (cam->image_width() != img_w || cam->image_height() != img_h) {
-                cam->set_image_dimensions(img_w, img_h);
-            }
-            if (view == 0 ||
-                img_h != static_cast<int>(canny_ws.nms_output.shape()[0]) ||
-                img_w != static_cast<int>(canny_ws.nms_output.shape()[1])) {
-                canny_ws = create_canny_workspace(img_h, img_w);
-            }
-
-            apply_canny_filter(image, canny_ws);
-            normalize_by_positive_median_inplace(canny_ws.nms_output);
-
-            auto score_render = edge_rasterize(*cam, this->get_model(), canny_ws.nms_output);
-
-            normalize_by_positive_median_inplace(score_render.edges_score);
-            gaussian_scores.add_(score_render.edges_score);
-        }
-
-        gaussian_scores.div_(static_cast<float>(num_views));
-        return gaussian_scores;
-    }
-
     void ImprovedGSPlus::ensure_error_score_shape() {
         const size_t n = static_cast<size_t>(_splat_data->size());
-        if (!_error_score_max.is_valid() ||
-            _error_score_max.ndim() != 1 ||
-            _error_score_max.numel() != n) {
-            _error_score_max = lfs::core::Tensor::zeros({n}, _splat_data->means().device());
-        }
+        const size_t reserve =
+            (_params && _params->max_cap > 0) ? static_cast<size_t>(_params->max_cap) : 0;
+        ensure_score_buffer_inplace(
+            _error_score_max, n, _splat_data->means().device(), reserve);
+    }
+
+    lfs::core::Tensor ImprovedGSPlus::damp_densification_scores(
+        const lfs::core::Tensor& scores) const {
+        return apply_crop_damping_to_scores(*_optimizer, scores);
     }
 
     void ImprovedGSPlus::densify_with_score(const lfs::core::Tensor& edge_scores, const lfs::core::Tensor& error_scores, const int64_t budget) {
@@ -334,7 +267,12 @@ namespace lfs::training {
             return;
         }
 
-        const auto active_indices = get_active_indices();
+        auto active_indices = get_active_indices();
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, static_cast<size_t>(current_size), _splat_data->means().device());
+            frozen_mask.is_valid() && active_indices.numel() > 0) {
+            auto trainable = frozen_mask.index_select(0, active_indices).logical_not();
+            active_indices = active_indices.masked_select(trainable);
+        }
         const int64_t total_active = static_cast<int64_t>(active_indices.numel());
         if (total_active == 0) {
             return;
@@ -346,6 +284,7 @@ namespace lfs::training {
 
         const auto normalized_error = normalized_by_positive_median(error_scores);
         const auto normalized_edge = normalized_by_positive_median(edge_scores);
+        const auto candidate_error = damp_densification_scores(normalized_error);
         const auto device = _splat_data->means().device();
 
         auto active_mask = lfs::core::Tensor::zeros_bool({static_cast<size_t>(_splat_data->size())}, device);
@@ -354,19 +293,21 @@ namespace lfs::training {
 
         lfs::core::Tensor candidate_mask = active_mask;
         if (candidate_budget < total_active) {
-            const auto active_error = normalized_error.index_select(0, active_indices);
+            const auto active_error = candidate_error.index_select(0, active_indices);
             auto [sorted_error, _] = active_error.sort(0, true);
             const float threshold = sorted_error[candidate_budget - 1].item_as<float>();
-            candidate_mask = active_mask.logical_and(normalized_error >= threshold);
+            candidate_mask = active_mask.logical_and(candidate_error >= threshold);
         }
 
         auto sampling_scores = normalized_error * (normalized_edge * EDGE_SCORE_WEIGHT + 1.0f);
         sampling_scores = sampling_scores.masked_fill(~candidate_mask, 0.0f);
 
-        int64_t selectable = static_cast<int64_t>(sampling_scores.count_nonzero());
+        int64_t selectable = static_cast<int64_t>(
+            damp_densification_scores(sampling_scores).count_nonzero());
         if (selectable < budget_for_alloc) {
             auto edge_fallback = normalized_edge.masked_fill(~active_mask, 0.0f);
-            selectable = static_cast<int64_t>(edge_fallback.count_nonzero());
+            selectable = static_cast<int64_t>(
+                damp_densification_scores(edge_fallback).count_nonzero());
             if (selectable > 0) {
                 sampling_scores = std::move(edge_fallback);
             } else {
@@ -374,7 +315,8 @@ namespace lfs::training {
                 auto active_weight_vals = lfs::core::Tensor::ones({static_cast<size_t>(active_indices.numel())}, device);
                 active_weights.index_put_(active_indices, active_weight_vals);
                 sampling_scores = std::move(active_weights);
-                selectable = total_active;
+                selectable = static_cast<int64_t>(
+                    damp_densification_scores(sampling_scores).count_nonzero());
             }
         }
 
@@ -397,11 +339,28 @@ namespace lfs::training {
         _pending_failure_snapshot.sampled_scale_max = 0.0f;
         _pending_failure_snapshot.sampled_scale_exp_max = 0.0f;
 
-        LAS_densify(sampling_scores.clamp_min(1e-12f), std::min<int64_t>(budget_for_alloc, selectable));
+        LAS_densify(
+            damp_densification_scores(sampling_scores.clamp_min(1e-12f)),
+            std::min<int64_t>(budget_for_alloc, selectable));
     }
 
     void ImprovedGSPlus::LAS_densify(const lfs::core::Tensor& scores, const int64_t budget_for_alloc) {
-        const lfs::core::Tensor sampled_idxs = lfs::core::Tensor::multinomial(scores, budget_for_alloc, false);
+        const bool shN_expanded =
+            !_splat_data->shN_value_quantized() &&
+            lfs::training::sh_value::ensure_shN_fp32_for_mutation(*_splat_data);
+        lfs::training::sh_value::ShNCommitGuard shn_guard(
+            *_splat_data, shN_expanded, "ImprovedGSPlus::LAS_densify");
+
+        // Sample without replacement through the same Gumbel-top-k path as MCMC.
+        const size_t n_scores = scores.numel();
+        const size_t k_sample = static_cast<size_t>(budget_for_alloc);
+        auto sampled_idxs = lfs::core::Tensor::empty(
+            {k_sample}, scores.device(), lfs::core::DataType::Int64);
+        const auto seed = static_cast<uint64_t>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        lfs::training::mrnf_strategy::launch_gumbel_topk(
+            scores.ptr<float>(), n_scores, k_sample, seed,
+            sampled_idxs.ptr<int64_t>());
         const auto sampled_scale_summary = summarize_sampled_scales(_splat_data->scaling_raw(), sampled_idxs);
         if (_pending_failure_snapshot.valid) {
             _pending_failure_snapshot.sampled_scale_p95 = sampled_scale_summary.p95;
@@ -409,87 +368,127 @@ namespace lfs::training {
             _pending_failure_snapshot.sampled_scale_exp_max = sampled_scale_summary.exp_max;
         }
 
-        // Get SH dimensions
-        const bool has_shN = _splat_data->shN().is_valid();
-        int shN_dim = 0;
-        if (has_shN) {
-            const auto& shN_shape = _splat_data->shN().shape();
-            if (shN_shape.rank() == 2) {
-                shN_dim = shN_shape[1];
-            } else if (shN_shape.rank() == 3) {
-                shN_dim = shN_shape[1] * shN_shape[2];
-            }
-        }
+        const size_t layout_rest = _splat_data->max_sh_coeffs_rest();
+        const auto layout_rest_u32 = static_cast<uint32_t>(layout_rest);
+        const bool use_shN = layout_rest > 0 &&
+                             _splat_data->shN().is_valid() &&
+                             _splat_data->shN().numel() > 0;
 
         const lfs::core::Device device = _splat_data->means().device();
+        const size_t K = static_cast<size_t>(budget_for_alloc);
 
-        // Allocate temporary tensors for split results [budget_for_alloc, ...]
-        auto second_positions = lfs::core::Tensor::empty({static_cast<size_t>(budget_for_alloc), 3}, device);
-        auto second_rotations = lfs::core::Tensor::empty({static_cast<size_t>(budget_for_alloc), 4}, device);
-        auto second_scales = lfs::core::Tensor::empty({static_cast<size_t>(budget_for_alloc), 3}, device);
-        auto second_sh0 = lfs::core::Tensor::empty({static_cast<size_t>(budget_for_alloc), 3}, device);
-        lfs::core::Tensor second_shN;
-        if (has_shN) {
-            second_shN = lfs::core::Tensor::empty({static_cast<size_t>(budget_for_alloc), static_cast<size_t>(shN_dim)}, device);
-        }
-        auto second_opacities = lfs::core::Tensor::empty({static_cast<size_t>(budget_for_alloc)}, device);
+        // reusable densify child workspace (grow-only).
+        _densify_ws.ensure(K, layout_rest, use_shN, /*sh0_flat_layout=*/true, device);
+        auto second_positions = _densify_ws.means_view(K);
+        auto second_rotations = _densify_ws.rotations_view(K);
+        auto second_scales = _densify_ws.scales_view(K);
+        auto second_sh0 = _densify_ws.sh0_view(K);
+        lfs::core::Tensor second_shN = use_shN ? _densify_ws.shN_view(K) : lfs::core::Tensor();
+        auto second_opacities = _densify_ws.opacities_view(K);
 
-        // Skip shN pointer when shN_dim = 0 (sh-degree 0)
-        const bool use_shN = has_shN && shN_dim > 0;
-
-        // Kernel launch: First result modifies in-place, seconds will go to temporaries:
+        // SH is unchanged by LAS. Keep resident shN swizzled, run the split kernel without
+        // SH, then gather selected child SH rows below.
         kernels::launch_long_axis_split_gaussians_inplace(
             _splat_data->means().ptr<float>(),
             _splat_data->rotation_raw().ptr<float>(),
             _splat_data->scaling_raw().ptr<float>(),
             _splat_data->sh0().ptr<float>(),
-            use_shN ? _splat_data->shN().ptr<float>() : nullptr,
+            nullptr,
             _splat_data->opacity_raw().ptr<float>(),
             second_positions.ptr<float>(),
             second_rotations.ptr<float>(),
             second_scales.ptr<float>(),
             second_sh0.ptr<float>(),
-            use_shN ? second_shN.ptr<float>() : nullptr,
+            nullptr,
             second_opacities.ptr<float>(),
             sampled_idxs.ptr<int64_t>(),
             static_cast<int>(budget_for_alloc),
-            shN_dim,
+            0,
             nullptr);
 
-        // Reset optimizer states for long-axis-split indices
-        auto reset_optimizer_state_at_indices = [&](ParamType param_type) {
-            auto* state = _optimizer->get_state_mutable(param_type);
-            if (!state)
-                return;
+        if (use_shN) {
+            lfs::training::sh_value::gather_shN_to_canonical(
+                *_splat_data, sampled_idxs, second_shN);
+        }
 
-            const auto& shape = state->exp_avg.shape();
-            if (has_zero_dimension(shape))
-                return;
+        // Merge: joint-codec state must reset via the optimizer API (fused scale-zero is a
+        // no-op for joint state — no scales exist); legacy codec keeps the fused fast path.
+        {
+            auto* probe = _optimizer->get_state_mutable(ParamType::Means);
+            const bool joint_codec = probe && probe->is_joint();
+            if (joint_codec) {
+                auto reset_optimizer_state_at_indices = [&](ParamType param_type) {
+                    auto* state = _optimizer->get_state_mutable(param_type);
+                    if (!state)
+                        return;
 
-            std::vector<size_t> dims = {static_cast<size_t>(budget_for_alloc)};
-            for (size_t i = 1; i < shape.rank(); ++i) {
-                dims.push_back(shape[i]);
+                    if (state->is_joint()) {
+                        auto idx_cpu = sampled_idxs.cpu();
+                        std::vector<int64_t> host_idx;
+                        host_idx.reserve(sampled_idxs.numel());
+                        if (idx_cpu.dtype() == lfs::core::DataType::Int64) {
+                            const auto* p = idx_cpu.ptr<int64_t>();
+                            host_idx.assign(p, p + sampled_idxs.numel());
+                        } else if (idx_cpu.dtype() == lfs::core::DataType::Int32) {
+                            const auto* p = idx_cpu.ptr<int32_t>();
+                            for (size_t i = 0; i < sampled_idxs.numel(); ++i)
+                                host_idx.push_back(static_cast<int64_t>(p[i]));
+                        }
+                        if (!host_idx.empty())
+                            _optimizer->reset_state_at_indices(param_type, host_idx);
+                        if (param_type == ParamType::ShN) {
+                            if (layout_rest_u32 != 0 && state->grad.is_valid() && state->grad.numel() > 0) {
+                                auto idx_i32 = sampled_idxs.dtype() == lfs::core::DataType::Int32
+                                                   ? sampled_idxs
+                                                   : sampled_idxs.to(lfs::core::DataType::Int32);
+                                lfs::core::shN_swizzled_zero_at_indices(
+                                    state->grad.ptr<float>(), idx_i32.ptr<int>(), idx_i32.numel(), layout_rest_u32);
+                            }
+                            return;
+                        }
+                    }
+
+                    if (state->grad.is_valid() && state->grad.numel() > 0) {
+                        const auto& shape = state->grad.shape();
+                        if (has_zero_dimension(shape))
+                            return;
+                        std::vector<size_t> dims = {static_cast<size_t>(budget_for_alloc)};
+                        for (size_t i = 1; i < shape.rank(); ++i) {
+                            dims.push_back(shape[i]);
+                        }
+                        auto zeros = lfs::core::Tensor::zeros(lfs::core::TensorShape(dims), state->grad.device());
+                        state->grad.index_put_(sampled_idxs, zeros);
+                    }
+                };
+
+                reset_optimizer_state_at_indices(ParamType::Means);
+                reset_optimizer_state_at_indices(ParamType::Rotation);
+                reset_optimizer_state_at_indices(ParamType::Scaling);
+                reset_optimizer_state_at_indices(ParamType::Sh0);
+                reset_optimizer_state_at_indices(ParamType::ShN);
+                reset_optimizer_state_at_indices(ParamType::Opacity);
+            } else {
+                // fused Adam-scale zero for split parents (legacy codec fast path).
+                {
+                    float* adam_ptrs[12] = {};
+                    const int n_adam = collect_adam_scale_ptrs(*_optimizer, adam_ptrs);
+                    if (n_adam > 0) {
+                        kernels::launch_zero_adam_scales_at_indices(
+                            sampled_idxs.ptr<int64_t>(), K, adam_ptrs, n_adam,
+                            static_cast<size_t>(_splat_data->size()));
+                    }
+                }
             }
-            auto zeros = lfs::core::Tensor::zeros(lfs::core::TensorShape(dims), state->exp_avg.device());
+            zero_adam_grads_at_indices(*_optimizer, sampled_idxs, layout_rest_u32);
+        }
 
-            state->exp_avg.index_put_(sampled_idxs, zeros);
-            state->exp_avg_sq.index_put_(sampled_idxs, zeros);
-            if (state->grad.is_valid()) {
-                state->grad.index_put_(sampled_idxs, zeros);
-            }
-        };
-
-        reset_optimizer_state_at_indices(ParamType::Means);
-        reset_optimizer_state_at_indices(ParamType::Rotation);
-        reset_optimizer_state_at_indices(ParamType::Scaling);
-        reset_optimizer_state_at_indices(ParamType::Sh0);
-        reset_optimizer_state_at_indices(ParamType::ShN);
-        reset_optimizer_state_at_indices(ParamType::Opacity);
-
-        // Now place second split results: fill free slots first, then append
+        // Now place second split results: fill free slots first, then append.
+        // One q16 batch so fill dests and the append tail share a single
+        // decode/overlay/encode per touched 256-splat block.
+        lfs::training::sh_value::ShNMutationBatch shn_batch(*_splat_data);
         auto [filled_indices, remaining] = fill_free_slots_with_data(
             second_positions, second_rotations, second_scales,
-            second_sh0, second_shN, second_opacities, budget_for_alloc);
+            second_sh0, second_shN, second_opacities, budget_for_alloc, &shn_batch);
 
         const int64_t num_filled = budget_for_alloc - remaining;
         if (_pending_failure_snapshot.valid) {
@@ -501,6 +500,16 @@ namespace lfs::training {
         if (remaining > 0) {
             const size_t old_size = static_cast<size_t>(_splat_data->size());
             const size_t n_remaining = static_cast<size_t>(remaining);
+
+            // preflight before multi-param append so a
+            // capacity-ensure failure cannot leave partial row growth.
+            if (!_optimizer->preflight_grow_capacity(n_remaining)) {
+                LOG_ERROR(
+                    "ImprovedGS+ densify aborted: capacity-ensure failed for {} -> {} rows "
+                    "(no params mutated)",
+                    old_size, old_size + n_remaining);
+                return;
+            }
 
             // Get the remaining data
             const auto append_positions = second_positions.slice(0, num_filled, budget_for_alloc);
@@ -517,8 +526,7 @@ namespace lfs::training {
             const auto new_indices = lfs::core::Tensor::from_vector(
                 new_indices_vec, lfs::core::TensorShape({n_remaining}), device);
 
-            // Extend and write data
-            append_live_deleted_rows(*_splat_data, _free_mask, n_remaining);
+            // Grow params first, then pad deleted mask to the new size.
             _splat_data->means().append_zeros(n_remaining);
             _splat_data->means().index_put_(new_indices, append_positions);
 
@@ -535,16 +543,11 @@ namespace lfs::training {
 
             _splat_data->opacity_raw().append_zeros(n_remaining);
             _splat_data->opacity_raw().index_put_(new_indices, append_opacities);
+            append_live_deleted_rows(*_splat_data, _free_mask);
 
             if (use_shN) {
                 auto append_shN = second_shN.slice(0, num_filled, budget_for_alloc);
-                const auto& shN_shape = _splat_data->shN().shape();
-                if (shN_shape.rank() == 3) {
-                    append_shN = append_shN.reshape(
-                        lfs::core::TensorShape({n_remaining, shN_shape[1], shN_shape[2]}));
-                }
-                _splat_data->shN().append_zeros(n_remaining);
-                _splat_data->shN().index_put_(new_indices, append_shN);
+                shn_batch.append(append_shN, old_size);
             }
 
             // Update optimizer states
@@ -555,30 +558,91 @@ namespace lfs::training {
             _optimizer->extend_state_for_new_params(ParamType::ShN, n_remaining);
             _optimizer->extend_state_for_new_params(ParamType::Opacity, n_remaining);
         }
+        shn_batch.flush();
     }
 
     void ImprovedGSPlus::reset_opacity() {
         const float reset_value = 0.1;
         const float logit_reset_value = std::log(reset_value / (1.0f - reset_value));
 
-        _splat_data->opacity_raw().clamp_max_(logit_reset_value);
+        auto& raw_opacity = _splat_data->opacity_raw();
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, _splat_data->size(), raw_opacity.device());
+            frozen_mask.is_valid()) {
+            if (raw_opacity.ndim() == 2) {
+                frozen_mask = frozen_mask.unsqueeze(-1);
+            }
+            auto reset_mask = (raw_opacity > logit_reset_value).logical_and(frozen_mask.logical_not());
+            raw_opacity.masked_fill_(reset_mask, logit_reset_value);
+        } else {
+            raw_opacity.clamp_max_(logit_reset_value);
+        }
 
         auto* state = _optimizer->get_state_mutable(ParamType::Opacity);
         if (state) {
             state->exp_avg.zero_();
-            state->exp_avg_sq.zero_();
         }
     }
 
-    void ImprovedGSPlus::pre_step(int iter, RenderOutput& render_output) {
-        if (iter > _params->stop_refine)
+    lfs::core::Tensor ImprovedGSPlus::edge_score_scratch(const int iter) {
+        if (!_params || iter >= static_cast<int>(_params->stop_refine) ||
+            !_splat_data || _splat_data->size() == 0) {
+            return {};
+        }
+
+        const size_t n = static_cast<size_t>(_splat_data->size());
+        if (!_edge_score_sum.is_valid() || _edge_score_sum.ndim() != 1 ||
+            _edge_score_sum.numel() != n) {
+            _edge_score_sum = lfs::core::Tensor::zeros({n}, _splat_data->means().device());
+            _edge_sample_count = 0;
+        }
+        if (!_edge_view_scores.is_valid() || _edge_view_scores.ndim() != 1 ||
+            _edge_view_scores.numel() != n) {
+            _edge_view_scores = lfs::core::Tensor::zeros({n}, _splat_data->means().device());
+        } else {
+            _edge_view_scores.zero_();
+        }
+        return _edge_view_scores;
+    }
+
+    void ImprovedGSPlus::on_edge_score_accumulated(const int iter) {
+        if (!_params || iter >= static_cast<int>(_params->stop_refine) ||
+            !_edge_view_scores.is_valid() || !_edge_score_sum.is_valid() ||
+            _edge_view_scores.numel() != _edge_score_sum.numel()) {
             return;
+        }
+
+        kernels::launch_normalize_by_positive_median(
+            _edge_view_scores.ptr<float>(), _edge_view_scores.numel(),
+            _edge_view_scores.stream(), &_edge_median_scratch);
+        zero_frozen_scores_inplace(*_splat_data, _edge_view_scores);
+        _edge_score_sum.add_(_edge_view_scores);
+        ++_edge_sample_count;
+    }
+
+    void ImprovedGSPlus::pre_step(int iter, RenderOutput& render_output) {
+        (void)render_output;
+        _precomputed_scores = lfs::core::Tensor();
+        _precompute_valid = false;
+
+        if (!_params || iter > static_cast<int>(_params->stop_refine)) {
+            _edge_score_sum = lfs::core::Tensor();
+            _edge_view_scores = lfs::core::Tensor();
+            _edge_sample_count = 0;
+            return;
+        }
         if (!is_refining(iter))
             return;
+        if (_edge_sample_count <= 0 || !_edge_score_sum.is_valid() ||
+            _edge_score_sum.ndim() != 1 ||
+            _edge_score_sum.numel() != static_cast<size_t>(_splat_data->size())) {
+            return;
+        }
 
-        assert(_views && "set_views() must be called before training");
-
-        _precomputed_scores = compute_gaussian_score();
+        const int completed_views = std::exchange(_edge_sample_count, 0);
+        _precomputed_scores = std::move(_edge_score_sum);
+        _edge_view_scores = lfs::core::Tensor();
+        _precomputed_scores.div_(static_cast<float>(completed_views));
+        zero_frozen_scores_inplace(*_splat_data, _precomputed_scores);
         _precompute_valid = true;
     }
 
@@ -594,10 +658,8 @@ namespace lfs::training {
 
         {
             const size_t n = static_cast<size_t>(_splat_data->size());
-            const auto& info = _splat_data->_densification_info;
-            if (!info.is_valid() || info.ndim() != 2 || info.shape()[0] < 2 || info.shape()[1] != n) {
-                _splat_data->_densification_info = lfs::core::Tensor::zeros({2, n}, _splat_data->means().device());
-            }
+            ensure_densification_info_shape_inplace(
+                _splat_data->_densification_info, n, _splat_data->means().device());
             ensure_error_score_shape();
 
             const auto& accum = _splat_data->_densification_info;
@@ -605,14 +667,14 @@ namespace lfs::training {
                 accum.ndim() == 2 &&
                 accum.shape()[0] >= 2 &&
                 accum.shape()[1] == _error_score_max.numel()) {
-                const float* error_row = accum.ptr<float>() + accum.shape()[1];
-                lfs::training::mcmc::launch_elementwise_max_inplace(
+                lfs::training::mcmc::launch_max_error_and_zero_densification(
                     _error_score_max.ptr<float>(),
-                    error_row,
+                    _splat_data->_densification_info.ptr<float>(),
                     _error_score_max.numel());
+                zero_frozen_scores_inplace(*_splat_data, _error_score_max);
+            } else if (accum.is_valid() && accum.numel() > 0) {
+                _splat_data->_densification_info.zero_();
             }
-
-            _splat_data->_densification_info.zero_();
         }
 
         if (is_refining(iter)) {
@@ -651,9 +713,11 @@ namespace lfs::training {
 
             lfs::core::Tensor::trim_memory_pool();
 
-            _splat_data->_densification_info = lfs::core::Tensor::zeros(
-                {2, static_cast<size_t>(_splat_data->size())},
+            ensure_densification_info_shape_inplace(
+                _splat_data->_densification_info,
+                static_cast<size_t>(_splat_data->size()),
                 _splat_data->means().device());
+            _splat_data->_densification_info.zero_();
             ensure_error_score_shape();
             _error_score_max.zero_();
 
@@ -670,15 +734,28 @@ namespace lfs::training {
         if (iter == _params->stop_refine) {
             _splat_data->_densification_info = lfs::core::Tensor::empty({0});
             _error_score_max = lfs::core::Tensor::empty({0});
+            _edge_score_sum = lfs::core::Tensor();
+            _edge_view_scores = lfs::core::Tensor();
+            _edge_sample_count = 0;
+            _edge_median_scratch.release();
 
             lfs::core::CudaMemoryPool::instance().trim_cached_memory();
         }
     }
 
+    void ImprovedGSPlus::permute_gaussian_rows(const lfs::core::Tensor& perm) {
+        morton::permute_row_tensor(_precomputed_scores, perm);
+        morton::permute_row_tensor(_edge_score_sum, perm);
+        morton::permute_row_tensor(_error_score_max, perm);
+        morton::permute_row_tensor(_free_mask, perm);
+    }
+
     bool ImprovedGSPlus::is_refining(int iter) const {
         return (iter >= _params->start_refine &&
                 iter % _params->refine_every == 0 &&
-                iter <= _params->stop_refine);
+                iter <= _params->stop_refine &&
+                _current_step >= 0 &&
+                static_cast<size_t>(_current_step + 1) < _budget_schedule.size());
     }
 
     void ImprovedGSPlus::step(int iter) {
@@ -690,7 +767,8 @@ namespace lfs::training {
     }
 
     void ImprovedGSPlus::remove_gaussians(const lfs::core::Tensor& mask) {
-        int mask_sum = mask.to(lfs::core::DataType::Int32).sum().template item<int>();
+        const auto prune_mask = exclude_frozen_from_mask(*_splat_data, mask);
+        int mask_sum = prune_mask.to(lfs::core::DataType::Int32).sum().template item<int>();
 
         if (mask_sum == 0) {
             LOG_DEBUG("No Gaussians to remove");
@@ -698,7 +776,7 @@ namespace lfs::training {
         }
 
         LOG_DEBUG("Removing {} Gaussians", mask_sum);
-        remove(mask);
+        remove(prune_mask);
     }
 
     void ImprovedGSPlus::reserve_optimizer_capacity(size_t capacity) {
@@ -753,44 +831,6 @@ namespace lfs::training {
         return is_active.nonzero().squeeze(-1);
     }
 
-    std::vector<int> ImprovedGSPlus::random_cam_indices(const int N) const {
-        const int num_cam_dataset = _views->size();
-        int num_samples = 0;
-
-        if (num_cam_dataset < N) {
-            num_samples = num_cam_dataset;
-        } else {
-            const int min_cam_dataset = 0.08 * num_cam_dataset;
-            num_samples = std::max(N, min_cam_dataset);
-        }
-
-        std::vector<int> all_indices(num_cam_dataset);
-        std::iota(all_indices.begin(), all_indices.end(), 0);
-
-        std::default_random_engine rng(global_seed());
-        std::shuffle(all_indices.begin(), all_indices.end(), rng);
-
-        all_indices.resize(num_samples);
-        return all_indices;
-    }
-
-    // From ImprovedGS but not used
-    [[maybe_unused]] void ImprovedGSPlus::prune_post_reset() {
-        const float q = 0.2f;
-        const lfs::core::Tensor opacity = _splat_data->get_opacity();
-
-        auto [sorted_val, sorted_idx] = opacity.sort();
-
-        int num_gaussians = opacity.shape()[0];
-        int q_index = static_cast<int>(num_gaussians * q);
-
-        float quantile_threshold = sorted_val[q_index].item_as<float>();
-
-        const lfs::core::Tensor prune_mask = (opacity < quantile_threshold);
-
-        lfs::training::ImprovedGSPlus::remove(prune_mask);
-    }
-
     void ImprovedGSPlus::opacity_prune(const int iter) {
         if (iter >= _params->stop_refine) {
             return;
@@ -801,6 +841,7 @@ namespace lfs::training {
             auto active_mask = _free_mask.slice(0, 0, prune_mask.numel()).logical_not();
             prune_mask = prune_mask.logical_and(active_mask);
         }
+        prune_mask = exclude_frozen_from_mask(*_splat_data, prune_mask);
         remove(prune_mask);
     }
 
@@ -808,15 +849,25 @@ namespace lfs::training {
         if (!_free_mask.is_valid() || indices.numel() == 0) {
             return;
         }
+        auto target_indices = indices;
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, _splat_data->size(), indices.device());
+            frozen_mask.is_valid()) {
+            auto trainable = frozen_mask.index_select(0, indices).logical_not();
+            target_indices = indices.masked_select(trainable);
+            if (target_indices.numel() == 0) {
+                return;
+            }
+        }
         // Mark the given indices as free
-        auto true_vals = lfs::core::Tensor::ones_bool({static_cast<size_t>(indices.numel())}, indices.device());
-        _free_mask.index_put_(indices, true_vals);
+        auto true_vals = lfs::core::Tensor::ones_bool({static_cast<size_t>(target_indices.numel())}, target_indices.device());
+        _free_mask.index_put_(target_indices, true_vals);
     }
 
     void ImprovedGSPlus::remove(const lfs::core::Tensor& is_prune) {
         // Soft deletion: mark slots as free instead of resizing tensors
         // This avoids expensive tensor reallocations during training
-        const lfs::core::Tensor prune_indices = is_prune.nonzero().squeeze(-1);
+        const auto prune_mask = exclude_frozen_from_mask(*_splat_data, is_prune);
+        const lfs::core::Tensor prune_indices = prune_mask.nonzero().squeeze(-1);
         const int64_t num_pruned = prune_indices.numel();
 
         if (num_pruned == 0) {
@@ -835,26 +886,52 @@ namespace lfs::training {
             _splat_data->rotation_raw().device());
         _splat_data->rotation_raw().index_put_(prune_indices, zero_rotation);
 
-        // Zero optimizer states in-place (preserves capacity)
+        // Zero optimizer states in-place (preserves capacity).
+        // Joint codec has no per-primitive moment scales — early-return left stale
+        // moments on pruned slots (reused after soft-delete). Mirror MCMC joint reset.
         auto zero_optimizer_state = [&](ParamType param_type) {
             auto* state = _optimizer->get_state_mutable(param_type);
             if (!state)
                 return;
 
-            const auto& shape = state->exp_avg.shape();
-            if (has_zero_dimension(shape))
-                return;
-
-            std::vector<size_t> dims = {static_cast<size_t>(num_pruned)};
-            for (size_t i = 1; i < shape.rank(); ++i) {
-                dims.push_back(shape[i]);
+            if (state->is_joint()) {
+                auto idx_cpu = prune_indices.cpu();
+                std::vector<int64_t> host_idx;
+                host_idx.reserve(static_cast<size_t>(num_pruned));
+                if (idx_cpu.dtype() == lfs::core::DataType::Int64) {
+                    const auto* p = idx_cpu.ptr<int64_t>();
+                    host_idx.assign(p, p + num_pruned);
+                } else if (idx_cpu.dtype() == lfs::core::DataType::Int32) {
+                    const auto* p = idx_cpu.ptr<int32_t>();
+                    for (int64_t i = 0; i < num_pruned; ++i)
+                        host_idx.push_back(static_cast<int64_t>(p[i]));
+                }
+                if (!host_idx.empty())
+                    _optimizer->reset_state_at_indices(param_type, host_idx);
+                if (param_type == ParamType::ShN) {
+                    const auto layout_rest =
+                        static_cast<uint32_t>(_splat_data->max_sh_coeffs_rest());
+                    if (layout_rest != 0 && state->grad.is_valid() && state->grad.numel() > 0) {
+                        auto idx_i32 = prune_indices.dtype() == lfs::core::DataType::Int32
+                                           ? prune_indices
+                                           : prune_indices.to(lfs::core::DataType::Int32);
+                        lfs::core::shN_swizzled_zero_at_indices(
+                            state->grad.ptr<float>(), idx_i32.ptr<int>(), idx_i32.numel(),
+                            layout_rest);
+                    }
+                    return;
+                }
             }
-            auto zeros = lfs::core::Tensor::zeros(lfs::core::TensorShape(dims), state->exp_avg.device());
 
-            // Modify in-place to preserve capacity
-            state->exp_avg.index_put_(prune_indices, zeros);
-            state->exp_avg_sq.index_put_(prune_indices, zeros);
-            if (state->grad.is_valid()) {
+            if (state->grad.is_valid() && state->grad.numel() > 0) {
+                const auto& shape = state->grad.shape();
+                if (has_zero_dimension(shape))
+                    return;
+                std::vector<size_t> dims = {static_cast<size_t>(num_pruned)};
+                for (size_t i = 1; i < shape.rank(); ++i) {
+                    dims.push_back(shape[i]);
+                }
+                auto zeros = lfs::core::Tensor::zeros(lfs::core::TensorShape(dims), state->grad.device());
                 state->grad.index_put_(prune_indices, zeros);
             }
         };
@@ -872,6 +949,8 @@ namespace lfs::training {
         }
 
         LOG_DEBUG("remove(): soft-deleted {} Gaussians (marked as free, rotation & gradients zeroed)", num_pruned);
+        LFS_COUNTER_ADD("strategy.igs_plus.pruned", num_pruned);
+        LFS_GAUGE("model.gaussians.live", _splat_data->size());
     }
 
     std::pair<lfs::core::Tensor, int64_t> ImprovedGSPlus::fill_free_slots_with_data(
@@ -881,7 +960,8 @@ namespace lfs::training {
         const lfs::core::Tensor& sh0,
         const lfs::core::Tensor& shN,
         const lfs::core::Tensor& opacities,
-        int64_t count) {
+        int64_t count,
+        lfs::training::sh_value::ShNMutationBatch* shn_batch) {
 
         if (!_free_mask.is_valid() || count == 0) {
             return {lfs::core::Tensor(), count};
@@ -892,6 +972,11 @@ namespace lfs::training {
         // Find free slot indices within current size
         auto active_region = _free_mask.slice(0, 0, current_size);
         auto free_indices = active_region.nonzero().squeeze(-1);
+        if (auto frozen_mask = make_frozen_mask(*_splat_data, current_size, free_indices.device());
+            frozen_mask.is_valid() && free_indices.numel() > 0) {
+            auto trainable = frozen_mask.index_select(0, free_indices).logical_not();
+            free_indices = free_indices.masked_select(trainable);
+        }
         const int64_t num_free = free_indices.numel();
 
         if (num_free == 0) {
@@ -901,59 +986,109 @@ namespace lfs::training {
         const int64_t slots_to_fill = std::min(count, num_free);
         auto target_indices = free_indices.slice(0, 0, slots_to_fill);
 
-        // Copy data to free slots
-        _splat_data->means().index_put_(target_indices, positions.slice(0, 0, slots_to_fill));
-        _splat_data->rotation_raw().index_put_(target_indices, rotations.slice(0, 0, slots_to_fill));
-        _splat_data->scaling_raw().index_put_(target_indices, scales.slice(0, 0, slots_to_fill));
+        float* adam_ptrs[12] = {};
+        const int n_adam = collect_adam_scale_ptrs(*_optimizer, adam_ptrs);
+        const int opacity_dim = (_splat_data->opacity_raw().ndim() == 2) ? 1 : 0;
+        auto pos_slice = positions.slice(0, 0, slots_to_fill);
+        auto rot_slice = rotations.slice(0, 0, slots_to_fill);
+        auto scale_slice = scales.slice(0, 0, slots_to_fill);
+        auto sh0_slice = sh0.slice(0, 0, slots_to_fill);
+        auto opac_slice = opacities.slice(0, 0, slots_to_fill);
 
-        // sh0 needs reshape from [slots_to_fill, 3] to [slots_to_fill, 1, 3]
-        auto sh0_reshaped = sh0.slice(0, 0, slots_to_fill).reshape(lfs::core::TensorShape({static_cast<size_t>(slots_to_fill), 1, 3}));
-        _splat_data->sh0().index_put_(target_indices, sh0_reshaped);
+        kernels::launch_fill_free_slots_fused(
+            target_indices.ptr<int64_t>(),
+            static_cast<size_t>(slots_to_fill),
+            pos_slice.ptr<float>(),
+            rot_slice.ptr<float>(),
+            scale_slice.ptr<float>(),
+            sh0_slice.ptr<float>(),
+            opac_slice.ptr<float>(),
+            _splat_data->means().ptr<float>(),
+            _splat_data->rotation_raw().ptr<float>(),
+            _splat_data->scaling_raw().ptr<float>(),
+            _splat_data->sh0().ptr<float>(),
+            _splat_data->opacity_raw().ptr<float>(),
+            opacity_dim,
+            adam_ptrs,
+            n_adam,
+            _free_mask.ptr<bool>(),
+            current_size);
 
-        _splat_data->opacity_raw().index_put_(target_indices, opacities.slice(0, 0, slots_to_fill));
-
-        if (shN.is_valid() && has_shN_coefficients(_splat_data->shN())) {
-            const auto& shN_shape = _splat_data->shN().shape();
-            const auto n = static_cast<int>(slots_to_fill);
-            const auto shN_slice = (shN_shape.rank() == 3)
-                                       ? shN.slice(0, 0, slots_to_fill).reshape({n, static_cast<int>(shN_shape[1]), static_cast<int>(shN_shape[2])})
-                                       : shN.slice(0, 0, slots_to_fill).reshape({n, static_cast<int>(shN_shape[1])});
-            _splat_data->shN().index_put_(target_indices, shN_slice);
+        const auto layout_rest = static_cast<uint32_t>(_splat_data->max_sh_coeffs_rest());
+        if (layout_rest > 0 && shN.is_valid() && shN.numel() > 0 &&
+            _splat_data->shN().is_valid() && _splat_data->shN().numel() > 0) {
+            auto shN_slice = shN.slice(0, 0, slots_to_fill);
+            if (shn_batch) {
+                shn_batch->scatter(target_indices, shN_slice);
+            } else {
+                lfs::training::sh_value::scatter_canonical_into_shN(
+                    *_splat_data, target_indices, shN_slice);
+            }
         }
 
-        // Reset optimizer states for filled slots
-        auto reset_optimizer_state = [&](ParamType param_type) {
-            auto* state = _optimizer->get_state_mutable(param_type);
-            if (!state)
-                return;
+        // Zero residual grads so the post-densify Adam step does not use
+        // previous-occupant / pre-split gradients on rewritten rows.
+        zero_adam_grads_at_indices(*_optimizer, target_indices, layout_rest);
 
-            const auto& shape = state->exp_avg.shape();
-            if (has_zero_dimension(shape))
-                return;
+        // Merge: joint-codec state resets via optimizer API (fused scale-zero is a no-op
+        // for joint state); legacy codec relies on the fused fill kernel having zeroed scales.
+        {
+            auto* probe = _optimizer->get_state_mutable(ParamType::Means);
+            const bool joint_codec = probe && probe->is_joint();
+            if (joint_codec) {
+                auto reset_optimizer_state = [&](ParamType param_type) {
+                    auto* state = _optimizer->get_state_mutable(param_type);
+                    if (!state)
+                        return;
 
-            std::vector<size_t> dims = {static_cast<size_t>(slots_to_fill)};
-            for (size_t i = 1; i < shape.rank(); ++i) {
-                dims.push_back(shape[i]);
+                    if (state->is_joint()) {
+                        auto idx_cpu = target_indices.cpu();
+                        std::vector<int64_t> host_idx;
+                        host_idx.reserve(target_indices.numel());
+                        if (idx_cpu.dtype() == lfs::core::DataType::Int64) {
+                            const auto* p = idx_cpu.ptr<int64_t>();
+                            host_idx.assign(p, p + target_indices.numel());
+                        } else if (idx_cpu.dtype() == lfs::core::DataType::Int32) {
+                            const auto* p = idx_cpu.ptr<int32_t>();
+                            for (size_t i = 0; i < target_indices.numel(); ++i)
+                                host_idx.push_back(static_cast<int64_t>(p[i]));
+                        }
+                        if (!host_idx.empty())
+                            _optimizer->reset_state_at_indices(param_type, host_idx);
+                        if (param_type == ParamType::ShN) {
+                            if (layout_rest != 0 && state->grad.is_valid() && state->grad.numel() > 0) {
+                                auto idx_i32 = target_indices.dtype() == lfs::core::DataType::Int32
+                                                   ? target_indices
+                                                   : target_indices.to(lfs::core::DataType::Int32);
+                                lfs::core::shN_swizzled_zero_at_indices(
+                                    state->grad.ptr<float>(), idx_i32.ptr<int>(), idx_i32.numel(), layout_rest);
+                            }
+                            return;
+                        }
+                    }
+
+                    if (state->grad.is_valid() && state->grad.numel() > 0) {
+                        const auto& shape = state->grad.shape();
+                        if (has_zero_dimension(shape))
+                            return;
+                        std::vector<size_t> dims = {static_cast<size_t>(slots_to_fill)};
+                        for (size_t i = 1; i < shape.rank(); ++i) {
+                            dims.push_back(shape[i]);
+                        }
+                        auto zeros = lfs::core::Tensor::zeros(lfs::core::TensorShape(dims), state->grad.device());
+                        state->grad.index_put_(target_indices, zeros);
+                    }
+                };
+
+                reset_optimizer_state(ParamType::Means);
+                reset_optimizer_state(ParamType::Rotation);
+                reset_optimizer_state(ParamType::Scaling);
+                reset_optimizer_state(ParamType::Sh0);
+                reset_optimizer_state(ParamType::ShN);
+                reset_optimizer_state(ParamType::Opacity);
             }
-            auto zeros = lfs::core::Tensor::zeros(lfs::core::TensorShape(dims), state->exp_avg.device());
+        }
 
-            state->exp_avg.index_put_(target_indices, zeros);
-            state->exp_avg_sq.index_put_(target_indices, zeros);
-            if (state->grad.is_valid()) {
-                state->grad.index_put_(target_indices, zeros);
-            }
-        };
-
-        reset_optimizer_state(ParamType::Means);
-        reset_optimizer_state(ParamType::Rotation);
-        reset_optimizer_state(ParamType::Scaling);
-        reset_optimizer_state(ParamType::Sh0);
-        reset_optimizer_state(ParamType::ShN);
-        reset_optimizer_state(ParamType::Opacity);
-
-        // Mark filled slots as active
-        auto false_vals = lfs::core::Tensor::zeros_bool({static_cast<size_t>(slots_to_fill)}, target_indices.device());
-        _free_mask.index_put_(target_indices, false_vals);
         set_deleted_mask_rows(*_splat_data, _free_mask, target_indices, false);
 
         if (_error_score_max.is_valid() && _error_score_max.ndim() == 1 && _error_score_max.numel() >= current_size) {
@@ -1033,6 +1168,10 @@ namespace lfs::training {
             _free_mask = lfs::core::Tensor::zeros_bool({capacity}, _splat_data->means().device());
             sync_deleted_mask_from_free_mask(*_splat_data, _free_mask);
             _precomputed_scores = lfs::core::Tensor();
+            _edge_score_sum = lfs::core::Tensor();
+            _edge_view_scores = lfs::core::Tensor();
+            _edge_sample_count = 0;
+            _edge_median_scratch.release();
             _error_score_max = lfs::core::Tensor::zeros({static_cast<size_t>(_splat_data->size())}, _splat_data->means().device());
             _precompute_valid = false;
             _current_step = 0;
@@ -1045,48 +1184,135 @@ namespace lfs::training {
         }
 
         uint8_t has_optimizer = 0;
-        is.read(reinterpret_cast<char*>(&has_optimizer), sizeof(has_optimizer));
+        lfs::core::serialization_detail::read_exact(
+            is, &has_optimizer, sizeof(has_optimizer), "igs+ optimizer flag");
+        if (has_optimizer > 1)
+            throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: optimizer flag must be boolean");
         if (has_optimizer && _optimizer) {
             _optimizer->deserialize(is);
         }
 
         uint8_t has_scheduler = 0;
-        is.read(reinterpret_cast<char*>(&has_scheduler), sizeof(has_scheduler));
+        lfs::core::serialization_detail::read_exact(
+            is, &has_scheduler, sizeof(has_scheduler), "igs+ scheduler flag");
+        if (has_scheduler > 1)
+            throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: scheduler flag must be boolean");
         if (has_scheduler && _scheduler) {
             _scheduler->deserialize(is);
         }
 
-        is.read(reinterpret_cast<char*>(&_initial_points), sizeof(_initial_points));
-        is.read(reinterpret_cast<char*>(&_current_step), sizeof(_current_step));
-        is.read(reinterpret_cast<char*>(&_total_steps), sizeof(_total_steps));
+        int64_t initial_points = 0;
+        int current_step = 0;
+        int total_steps = 0;
+        lfs::core::serialization_detail::read_exact(
+            is, &initial_points, sizeof(initial_points), "igs+ initial point count");
+        lfs::core::serialization_detail::read_exact(
+            is, &current_step, sizeof(current_step), "igs+ current step");
+        lfs::core::serialization_detail::read_exact(
+            is, &total_steps, sizeof(total_steps), "igs+ total steps");
 
         uint32_t budget_size = 0;
-        is.read(reinterpret_cast<char*>(&budget_size), sizeof(budget_size));
-        _budget_schedule.resize(budget_size);
+        lfs::core::serialization_detail::read_exact(
+            is, &budget_size, sizeof(budget_size), "igs+ budget schedule length");
+        constexpr uint32_t MAX_BUDGET_SCHEDULE_STEPS = 10'000'000;
+        if (total_steps <= 0 || budget_size != static_cast<uint32_t>(total_steps) ||
+            budget_size > MAX_BUDGET_SCHEDULE_STEPS || current_step < 0 ||
+            current_step >= total_steps || initial_points < 0) {
+            throw std::runtime_error(std::format(
+                "Invalid ImprovedGSPlus checkpoint: inconsistent budget schedule "
+                "(initial={}, current={}, total={}, entries={})",
+                initial_points,
+                current_step,
+                total_steps,
+                budget_size));
+        }
+        std::vector<int64_t> budget_schedule(budget_size);
         if (budget_size > 0) {
-            is.read(reinterpret_cast<char*>(_budget_schedule.data()),
-                    static_cast<std::streamsize>(budget_size * sizeof(_budget_schedule.front())));
+            lfs::core::serialization_detail::read_exact(
+                is,
+                budget_schedule.data(),
+                static_cast<size_t>(budget_size) * sizeof(budget_schedule.front()),
+                "igs+ budget schedule");
+            const auto max_budget = _params && _params->max_cap > 0
+                                        ? static_cast<int64_t>(_params->max_cap)
+                                        : std::numeric_limits<int64_t>::max();
+            if (std::ranges::any_of(budget_schedule, [max_budget](const int64_t value) {
+                    return value < 0 || value > max_budget;
+                })) {
+                throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: budget value is out of bounds");
+            }
         }
 
         uint8_t has_free_mask = 0;
-        is.read(reinterpret_cast<char*>(&has_free_mask), sizeof(has_free_mask));
+        lfs::core::serialization_detail::read_exact(
+            is, &has_free_mask, sizeof(has_free_mask), "igs+ free-mask flag");
+        if (has_free_mask > 1)
+            throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: free-mask flag must be boolean");
+        lfs::core::Tensor free_mask;
         if (has_free_mask) {
-            is >> _free_mask;
+            is >> free_mask;
+            const auto model_size = static_cast<size_t>(_splat_data->size());
+            const auto max_capacity = _params && _params->max_cap > 0
+                                          ? static_cast<size_t>(_params->max_cap)
+                                          : model_size;
+            if (!free_mask.is_valid() || !lfs::core::is_bool_like(free_mask.dtype()) ||
+                free_mask.ndim() != 1 || free_mask.numel() < model_size ||
+                free_mask.numel() > max_capacity) {
+                throw std::runtime_error("Invalid ImprovedGSPlus checkpoint: free mask has incompatible schema");
+            }
             if (_splat_data->means().device() == lfs::core::Device::CUDA) {
-                _free_mask = _free_mask.cuda();
+                free_mask = free_mask.cuda();
             }
         } else {
             const size_t capacity = _params->max_cap > 0 ? static_cast<size_t>(_params->max_cap)
                                                          : static_cast<size_t>(_splat_data->size());
-            _free_mask = lfs::core::Tensor::zeros_bool({capacity}, _splat_data->means().device());
+            free_mask = lfs::core::Tensor::zeros_bool({capacity}, _splat_data->means().device());
         }
+
+        _initial_points = initial_points;
+        _current_step = current_step;
+        _total_steps = total_steps;
+        _budget_schedule = std::move(budget_schedule);
+        _free_mask = std::move(free_mask);
         sync_deleted_mask_from_free_mask(*_splat_data, _free_mask);
 
         _precomputed_scores = lfs::core::Tensor();
+        _edge_score_sum = lfs::core::Tensor();
+        _edge_view_scores = lfs::core::Tensor();
+        _edge_sample_count = 0;
+        _edge_median_scratch.release();
         _error_score_max = lfs::core::Tensor::zeros({static_cast<size_t>(_splat_data->size())}, _splat_data->means().device());
         _precompute_valid = false;
 
         LOG_DEBUG("Deserialized ImprovedGSPlus (version {})", version);
+    }
+
+    bool ImprovedGSPlus::can_adopt_checkpoint_state(const IStrategy& loaded) const noexcept {
+        const auto* source = dynamic_cast<const ImprovedGSPlus*>(&loaded);
+        return source && static_cast<bool>(_optimizer) == static_cast<bool>(source->_optimizer) &&
+               static_cast<bool>(_scheduler) == static_cast<bool>(source->_scheduler);
+    }
+
+    void ImprovedGSPlus::adopt_checkpoint_state(IStrategy& loaded) noexcept {
+        auto& source = checked_checkpoint_source<ImprovedGSPlus>(loaded);
+        if (_optimizer)
+            _optimizer->adopt_checkpoint_state(*source._optimizer);
+        if (_scheduler)
+            _scheduler->adopt_checkpoint_state(*source._scheduler);
+        _params.swap(source._params);
+        std::swap(_initial_points, source._initial_points);
+        std::swap(_current_step, source._current_step);
+        std::swap(_total_steps, source._total_steps);
+        _budget_schedule.swap(source._budget_schedule);
+        std::swap(_precomputed_scores, source._precomputed_scores);
+        std::swap(_edge_score_sum, source._edge_score_sum);
+        std::swap(_edge_view_scores, source._edge_view_scores);
+        std::swap(_edge_sample_count, source._edge_sample_count);
+        std::swap(_edge_median_scratch, source._edge_median_scratch);
+        std::swap(_error_score_max, source._error_score_max);
+        std::swap(_precompute_valid, source._precompute_valid);
+        std::swap(_free_mask, source._free_mask);
+        std::swap(_pending_failure_snapshot, source._pending_failure_snapshot);
     }
 
 } // namespace lfs::training

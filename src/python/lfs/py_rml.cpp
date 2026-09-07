@@ -4,6 +4,7 @@
 
 #include "py_rml.hpp"
 #include "core/logger.hpp"
+#include "python/gil.hpp"
 #include "python/python_runtime.hpp"
 
 #include <RmlUi/Core.h>
@@ -19,6 +20,7 @@
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <unordered_set>
+#include <utility>
 
 namespace lfs::python {
 
@@ -27,12 +29,63 @@ namespace lfs::python {
     Rml::Variant python_to_variant(const nb::handle& obj);
 
     namespace {
+        class GilSafeNbObject {
+        public:
+            GilSafeNbObject() = default;
+            explicit GilSafeNbObject(nb::object obj) : obj_(std::move(obj)) {}
+            GilSafeNbObject(const GilSafeNbObject&) = delete;
+            GilSafeNbObject& operator=(const GilSafeNbObject&) = delete;
+            GilSafeNbObject(GilSafeNbObject&& other) noexcept : obj_(std::move(other.obj_)) {}
+            GilSafeNbObject& operator=(GilSafeNbObject&& other) noexcept {
+                if (this != &other) {
+                    reset();
+                    obj_ = std::move(other.obj_);
+                }
+                return *this;
+            }
+            ~GilSafeNbObject() { reset(); }
+
+            void reset() {
+                if (!obj_.is_valid())
+                    return;
+                if (!can_acquire_gil()) {
+                    (void)obj_.release();
+                    return;
+                }
+                const GilAcquire gil;
+                nb::object drop = std::move(obj_);
+                (void)drop;
+            }
+
+            [[nodiscard]] bool valid() const { return obj_.is_valid(); }
+            [[nodiscard]] const nb::object& get() const { return obj_; }
+
+        private:
+            nb::object obj_;
+        };
+
+        std::shared_ptr<GilSafeNbObject> keep_python(nb::handle obj) {
+            return std::make_shared<GilSafeNbObject>(nb::borrow(obj));
+        }
+
+        template <typename Fn>
+        void with_gil_if_ready(Fn&& fn) {
+            if (can_acquire_gil()) {
+                const GilAcquire gil;
+                std::forward<Fn>(fn)();
+                return;
+            }
+            std::forward<Fn>(fn)();
+        }
+
         std::unordered_map<Rml::ElementDocument*, std::vector<Rml::ElementPtr>> s_held_elements;
         std::unordered_map<Rml::Element*, Rml::ElementDocument*> s_detached_element_documents;
         std::unordered_set<Rml::ElementDocument*> s_dirty_documents;
+        std::unordered_set<Rml::ElementDocument*> s_update_requested_documents;
         std::map<std::string, DataModelArrayStorage> s_model_storage;
         std::unordered_map<std::string, Rml::DataModelHandle> s_active_handles;
         std::unordered_map<std::string, Rml::Context*> s_model_contexts;
+        std::unordered_map<std::string, Rml::ElementDocument*> s_model_documents;
         std::unordered_set<Rml::Context*> s_string_array_type_contexts;
         std::unordered_set<Rml::Context*> s_record_array_type_contexts;
         std::unordered_set<Rml::Context*> s_builtin_transform_contexts;
@@ -193,6 +246,39 @@ namespace lfs::python {
             }
         }
 
+        // Models created via PyRmlContext::create_data_model (e.g. in on_bind_model,
+        // before the panel document is loaded) only register their context. Resolve
+        // the owning document lazily from the context and cache it, so dirty/update
+        // invalidation can find it.
+        Rml::ElementDocument* resolve_model_document(const std::string& model_name) {
+            if (auto it = s_model_documents.find(model_name);
+                it != s_model_documents.end() && it->second)
+                return it->second;
+            if (auto cit = s_model_contexts.find(model_name);
+                cit != s_model_contexts.end() && cit->second) {
+                Rml::Context* ctx = cit->second;
+                if (ctx->GetNumDocuments() > 0) {
+                    if (Rml::ElementDocument* doc = ctx->GetDocument(0)) {
+                        s_model_documents[model_name] = doc;
+                        return doc;
+                    }
+                }
+            }
+            return nullptr;
+        }
+
+        void mark_model_document_dirty(const std::string& model_name) {
+            if (auto* doc = resolve_model_document(model_name))
+                s_dirty_documents.insert(doc);
+            request_redraw();
+        }
+
+        void request_model_document_update(const std::string& model_name) {
+            if (auto* doc = resolve_model_document(model_name))
+                s_update_requested_documents.insert(doc);
+            request_redraw();
+        }
+
     } // namespace
 
     Rml::ElementPtr extractHeldElement(Rml::ElementDocument* doc, Rml::Element* raw) {
@@ -224,14 +310,24 @@ namespace lfs::python {
             }
         }
         s_held_elements.erase(doc);
+        s_dirty_documents.erase(doc);
+        s_update_requested_documents.erase(doc);
     }
 
     bool consume_document_dirty(Rml::ElementDocument* doc) {
         return s_dirty_documents.erase(doc) > 0;
     }
 
+    bool consume_document_update_request(Rml::ElementDocument* doc) {
+        return s_update_requested_documents.erase(doc) > 0;
+    }
+
     bool is_document_dirty(Rml::ElementDocument* doc) {
         return doc && s_dirty_documents.contains(doc);
+    }
+
+    bool is_document_update_requested(Rml::ElementDocument* doc) {
+        return doc && s_update_requested_documents.contains(doc);
     }
 
     nb::object variant_to_python(const Rml::Variant& v) {
@@ -305,6 +401,7 @@ namespace lfs::python {
         s_model_storage.erase(name);
         s_active_handles.erase(name);
         s_model_contexts.erase(name);
+        s_model_documents.erase(name);
         return ctx_->RemoveDataModel(name);
     }
 
@@ -753,6 +850,7 @@ namespace lfs::python {
         if (!ctor)
             return nb::none();
         s_model_contexts[name] = ctx;
+        s_model_documents[name] = doc_;
         register_builtin_transforms(ctor, ctx);
         return nb::cast(PyDataModelConstructor(std::move(ctor), name, ctx));
     }
@@ -763,6 +861,7 @@ namespace lfs::python {
         s_model_storage.erase(name);
         s_active_handles.erase(name);
         s_model_contexts.erase(name);
+        s_model_documents.erase(name);
         return ctx->RemoveDataModel(name);
     }
 
@@ -770,12 +869,16 @@ namespace lfs::python {
 
     void PyDataModelHandle::dirty(const std::string& name) {
         handle_.DirtyVariable(name);
-        request_redraw();
+        mark_model_document_dirty(model_name_);
     }
 
     void PyDataModelHandle::dirty_all() {
         handle_.DirtyAllVariables();
-        request_redraw();
+        mark_model_document_dirty(model_name_);
+    }
+
+    void PyDataModelHandle::request_update() {
+        request_model_document_update(model_name_);
     }
 
     bool PyDataModelHandle::is_dirty(const std::string& name) {
@@ -795,7 +898,7 @@ namespace lfs::python {
             return;
         arr_it->second = std::move(updated);
         handle_.DirtyVariable(name);
-        request_redraw();
+        mark_model_document_dirty(model_name_);
     }
 
     void PyDataModelHandle::update_record_list(const std::string& name, nb::list items) {
@@ -813,19 +916,20 @@ namespace lfs::python {
             return;
         arr_it->second = std::move(updated);
         handle_.DirtyVariable(name);
-        request_redraw();
+        mark_model_document_dirty(model_name_);
     }
 
     // --- PyDataModelConstructor ---
 
     void PyDataModelConstructor::bind(const std::string& name, nb::callable getter,
                                       nb::object setter) {
-        nb::callable get_cb = nb::borrow<nb::callable>(getter);
-        prevent_gc_.push_back(nb::object(get_cb));
+        auto get_keep = keep_python(getter);
+        prevent_gc_.push_back(nb::object(getter));
 
-        Rml::DataGetFunc get_func = [get_cb](Rml::Variant& out) {
+        Rml::DataGetFunc get_func = [get_keep](Rml::Variant& out) {
             nb::gil_scoped_acquire gil;
             try {
+                nb::callable get_cb = nb::borrow<nb::callable>(get_keep->get());
                 nb::object result = get_cb();
                 out = python_to_variant(result);
             } catch (const std::exception& e) {
@@ -835,12 +939,13 @@ namespace lfs::python {
 
         Rml::DataSetFunc set_func;
         if (!setter.is_none()) {
-            nb::callable set_cb = nb::borrow<nb::callable>(setter);
-            prevent_gc_.push_back(nb::object(set_cb));
+            auto set_keep = keep_python(setter);
+            prevent_gc_.push_back(nb::object(setter));
 
-            set_func = [set_cb](const Rml::Variant& in) {
+            set_func = [set_keep](const Rml::Variant& in) {
                 nb::gil_scoped_acquire gil;
                 try {
+                    nb::callable set_cb = nb::borrow<nb::callable>(set_keep->get());
                     set_cb(variant_to_python(in));
                 } catch (const std::exception& e) {
                     LOG_ERROR("Data model setter error: {}", e.what());
@@ -856,19 +961,20 @@ namespace lfs::python {
     }
 
     void PyDataModelConstructor::bind_event(const std::string& name, nb::callable callback) {
-        nb::callable cb = nb::borrow<nb::callable>(callback);
-        prevent_gc_.push_back(nb::object(cb));
+        auto cb_keep = keep_python(callback);
+        prevent_gc_.push_back(nb::object(callback));
         const auto model_name = model_name_;
         auto* context = context_;
 
         ctor_.BindEventCallback(
-            name, [cb, model_name, context](Rml::DataModelHandle handle, Rml::Event& event,
-                                            const Rml::VariantList& args) {
+            name, [cb_keep, model_name, context](Rml::DataModelHandle handle, Rml::Event& event,
+                                                 const Rml::VariantList& args) {
                 nb::gil_scoped_acquire gil;
                 try {
                     nb::list py_args;
                     for (const auto& arg : args)
                         py_args.append(variant_to_python(arg));
+                    nb::callable cb = nb::borrow<nb::callable>(cb_keep->get());
                     cb(PyDataModelHandle(handle, model_name, context), PyRmlEvent(&event),
                        py_args);
                 } catch (const std::exception& e) {
@@ -878,16 +984,17 @@ namespace lfs::python {
     }
 
     void PyDataModelConstructor::register_transform(const std::string& name, nb::callable func) {
-        nb::callable cb = nb::borrow<nb::callable>(func);
-        prevent_gc_.push_back(nb::object(cb));
+        auto cb_keep = keep_python(func);
+        prevent_gc_.push_back(nb::object(func));
 
         ctor_.RegisterTransformFunc(
-            name, [cb](const Rml::VariantList& args) -> Rml::Variant {
+            name, [cb_keep](const Rml::VariantList& args) -> Rml::Variant {
                 nb::gil_scoped_acquire gil;
                 try {
                     nb::list py_args;
                     for (const auto& arg : args)
                         py_args.append(variant_to_python(arg));
+                    nb::callable cb = nb::borrow<nb::callable>(cb_keep->get());
                     nb::object result = cb(*py_args);
                     return python_to_variant(result);
                 } catch (const std::exception& e) {
@@ -972,13 +1079,29 @@ namespace lfs::python {
 
     // --- PyEventListener ---
 
+    class PyEventListener::Callback {
+    public:
+        explicit Callback(nb::callable cb) : obj_(std::move(cb)) {}
+        GilSafeNbObject obj_;
+    };
+
+    PyEventListener::PyEventListener(nb::callable cb)
+        : callback_(std::make_unique<Callback>(std::move(cb))) {}
+
+    PyEventListener::~PyEventListener() = default;
+
     void PyEventListener::ProcessEvent(Rml::Event& event) {
         nb::gil_scoped_acquire gil;
         try {
-            callback_(PyRmlEvent(&event));
+            nb::callable cb = nb::borrow<nb::callable>(callback_->obj_.get());
+            cb(PyRmlEvent(&event));
         } catch (const std::exception& e) {
             LOG_ERROR("RmlUI event listener error: {}", e.what());
         }
+    }
+
+    void PyEventListener::OnDetach(Rml::Element*) {
+        delete this;
     }
 
     // --- RmlDocumentRegistry ---
@@ -991,15 +1114,15 @@ namespace lfs::python {
     void RmlDocumentRegistry::register_document(const std::string& name,
                                                 Rml::ElementDocument* doc) {
         auto it = documents_.find(name);
-        if (it != documents_.end())
-            clearHeldElements(it->second);
+        if (it != documents_.end() && it->second != doc)
+            release_rml_document_state(it->second);
         documents_[name] = doc;
     }
 
     void RmlDocumentRegistry::unregister_document(const std::string& name) {
         auto it = documents_.find(name);
         if (it != documents_.end()) {
-            clearHeldElements(it->second);
+            release_rml_document_state(it->second);
             documents_.erase(it);
         }
     }
@@ -1007,6 +1130,29 @@ namespace lfs::python {
     Rml::ElementDocument* RmlDocumentRegistry::get_document(const std::string& name) {
         auto it = documents_.find(name);
         return it != documents_.end() ? it->second : nullptr;
+    }
+
+    void release_rml_document_state(Rml::ElementDocument* doc) {
+        if (!doc)
+            return;
+
+        clearHeldElements(doc);
+
+        std::vector<std::string> names;
+        for (const auto& [name, bound_doc] : s_model_documents) {
+            if (bound_doc == doc)
+                names.push_back(name);
+        }
+
+        auto* ctx = doc->GetContext();
+        for (const auto& name : names) {
+            s_model_storage.erase(name);
+            s_active_handles.erase(name);
+            s_model_contexts.erase(name);
+            s_model_documents.erase(name);
+            if (ctx)
+                ctx->RemoveDataModel(name);
+        }
     }
 
     void release_rml_context_state(Rml::Context* context) {
@@ -1018,6 +1164,7 @@ namespace lfs::python {
                 return false;
             s_model_storage.erase(entry.first);
             s_active_handles.erase(entry.first);
+            s_model_documents.erase(entry.first);
             return true;
         });
 
@@ -1119,6 +1266,7 @@ namespace lfs::python {
         nb::class_<PyDataModelHandle>(rml, "DataModelHandle")
             .def("dirty", &PyDataModelHandle::dirty, nb::arg("name"))
             .def("dirty_all", &PyDataModelHandle::dirty_all)
+            .def("request_update", &PyDataModelHandle::request_update)
             .def("is_dirty", &PyDataModelHandle::is_dirty, nb::arg("name"))
             .def("update_string_list", &PyDataModelHandle::update_string_list, nb::arg("name"),
                  nb::arg("items"))
@@ -1147,11 +1295,15 @@ namespace lfs::python {
 
         set_rml_doc_registry_callbacks(
             [](const char* name, void* doc) {
-                RmlDocumentRegistry::instance().register_document(
-                    name, static_cast<Rml::ElementDocument*>(doc));
+                with_gil_if_ready([&] {
+                    RmlDocumentRegistry::instance().register_document(
+                        name, static_cast<Rml::ElementDocument*>(doc));
+                });
             },
             [](const char* name) {
-                RmlDocumentRegistry::instance().unregister_document(name);
+                with_gil_if_ready([&] {
+                    RmlDocumentRegistry::instance().unregister_document(name);
+                });
             });
     }
 

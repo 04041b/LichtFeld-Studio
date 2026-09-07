@@ -8,30 +8,64 @@
 #include <cmath>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <string_view>
 
 namespace lfs::rendering {
 
     enum class GaussianRasterBackend : int {
-        FastGs = 0,
-        Gut = 1,
-        VkSplat = 2,
-        VkSplatGut = 3,
+        ThreeDgs = 2,
+        ThreeDgut = 3,
+    };
+
+    enum class DepthVisualizationMode : int {
+        Palette = 0,
+        Grayscale = 1,
     };
 
     inline bool isGutBackend(const GaussianRasterBackend backend) {
-        return backend == GaussianRasterBackend::Gut ||
-               backend == GaussianRasterBackend::VkSplatGut;
+        return backend == GaussianRasterBackend::ThreeDgut;
     }
 
     inline bool isVkSplatBackend(const GaussianRasterBackend backend) {
-        return backend == GaussianRasterBackend::VkSplat ||
-               backend == GaussianRasterBackend::VkSplatGut;
+        return backend == GaussianRasterBackend::ThreeDgs ||
+               backend == GaussianRasterBackend::ThreeDgut;
+    }
+
+    inline GaussianRasterBackend normalizeViewerRasterBackend(const GaussianRasterBackend backend,
+                                                              const bool gut = false) {
+        switch (backend) {
+        case GaussianRasterBackend::ThreeDgs:
+        case GaussianRasterBackend::ThreeDgut:
+            return backend;
+        }
+        return gut ? GaussianRasterBackend::ThreeDgut : GaussianRasterBackend::ThreeDgs;
+    }
+
+    inline GaussianRasterBackend viewerRasterBackendForGutMode(const bool gut) {
+        return gut ? GaussianRasterBackend::ThreeDgut : GaussianRasterBackend::ThreeDgs;
+    }
+
+    inline constexpr std::string_view THREE_DGS_BACKEND_ID = "3dgs";
+    inline constexpr std::string_view THREE_DGUT_BACKEND_ID = "3dgut";
+
+    inline bool isGaussianRasterBackendId(const std::string_view id) {
+        return id == THREE_DGS_BACKEND_ID || id == THREE_DGUT_BACKEND_ID;
+    }
+
+    inline std::string_view gaussianRasterBackendId(const GaussianRasterBackend backend) {
+        return isGutBackend(backend) ? THREE_DGUT_BACKEND_ID : THREE_DGS_BACKEND_ID;
+    }
+
+    inline GaussianRasterBackend gaussianRasterBackendFromId(const std::string_view id) {
+        return id == THREE_DGUT_BACKEND_ID ? GaussianRasterBackend::ThreeDgut
+                                           : GaussianRasterBackend::ThreeDgs;
     }
 
     constexpr float DEFAULT_NEAR_PLANE = 0.1f;
     constexpr float DEFAULT_FAR_PLANE = 100000.0f;
-    constexpr int MAX_VIEWPORT_SIZE = 16384;
-
+    constexpr float DEFAULT_DEPTH_VIEW_MIN = DEFAULT_NEAR_PLANE;
+    constexpr float DEFAULT_DEPTH_VIEW_MAX = 100.0f;
+    constexpr float MAX_DEPTH_VIEW_DISTANCE = 10000.0f;
     // 35mm full-frame sensor dimensions
     constexpr float SENSOR_WIDTH_35MM = 36.0f;
     constexpr float SENSOR_HEIGHT_35MM = 24.0f;
@@ -57,10 +91,6 @@ namespace lfs::rendering {
         return glm::degrees(focalLengthToVFovRad(focal_mm));
     }
 
-    inline float focalLengthToHFov(const float focal_mm) {
-        return glm::degrees(2.0f * std::atan(SENSOR_WIDTH_35MM / (2.0f * focal_mm)));
-    }
-
     inline float vFovToFocalLength(const float vfov_degrees) {
         return SENSOR_HEIGHT_35MM / (2.0f * std::tan(glm::radians(vfov_degrees) * 0.5f));
     }
@@ -84,23 +114,6 @@ namespace lfs::rendering {
                                                      const float far_plane = DEFAULT_FAR_PLANE) {
         const float vfov = focalLengthToVFov(focal_length_mm);
         return createProjectionMatrix(viewport_size, vfov, orthographic, ortho_scale, near_plane, far_plane);
-    }
-
-    inline glm::mat4 createProjectionMatrixFromIntrinsics(const glm::ivec2& viewport_size,
-                                                          const CameraIntrinsics& intrinsics,
-                                                          const float near_plane = DEFAULT_NEAR_PLANE,
-                                                          const float far_plane = DEFAULT_FAR_PLANE) {
-        // This produces an image-space frustum with window-space Y increasing downward.
-        const float width = static_cast<float>(viewport_size.x);
-        const float height = static_cast<float>(viewport_size.y);
-        const float fx = std::max(intrinsics.focal_x, 1e-6f);
-        const float fy = std::max(intrinsics.focal_y, 1e-6f);
-
-        const float left = -intrinsics.center_x * near_plane / fx;
-        const float right = (width - intrinsics.center_x) * near_plane / fx;
-        const float top = (height - intrinsics.center_y) * near_plane / fy;
-        const float bottom = -intrinsics.center_y * near_plane / fy;
-        return glm::frustum(left, right, bottom, top, near_plane, far_plane);
     }
 
 } // namespace lfs::rendering

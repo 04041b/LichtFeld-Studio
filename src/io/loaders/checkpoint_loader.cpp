@@ -72,7 +72,7 @@ namespace lfs::io {
         }
 
         LOG_INFO("Loading checkpoint file: {}", lfs::core::path_to_utf8(path));
-        auto splat_result = lfs::core::load_checkpoint_splat_data(path);
+        auto splat_result = lfs::core::load_checkpoint_splat_data(path, options.splat_tensor_allocator);
         if (!splat_result) {
             return make_error(ErrorCode::CORRUPTED_DATA,
                               std::format("Failed to load checkpoint: {}", splat_result.error()), path);
@@ -97,7 +97,8 @@ namespace lfs::io {
             .scene_center = Tensor::zeros({3}, Device::CPU),
             .loader_used = name(),
             .load_time = load_time,
-            .warnings = {std::format("Checkpoint from iteration {}", iteration)}};
+            .warnings = {std::format("Checkpoint from iteration {}", iteration)},
+            .georeference = std::nullopt};
 
         LOG_INFO("Checkpoint loaded successfully in {}ms ({} Gaussians from iteration {})",
                  load_time.count(), num_gaussians, iteration);
@@ -123,8 +124,11 @@ namespace lfs::io {
             return false;
         }
 
-        uint32_t magic;
+        uint32_t magic = 0;
         file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        if (!file) {
+            return false;
+        }
         return magic == lfs::core::CHECKPOINT_MAGIC;
     }
 

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <glm/glm.hpp>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -40,13 +41,9 @@ namespace lfs::rendering {
                                                             0, -1, 0, 0,
                                                             0, 0, -1, 0,
                                                             0, 0, 0, 1};
-    inline const glm::mat4 VISUALIZER_TO_DATA_CAMERA_AXES_4 = DATA_TO_VISUALIZER_CAMERA_AXES_4;
     inline const glm::mat3 DATA_TO_VISUALIZER_WORLD_AXES = DATA_TO_VISUALIZER_CAMERA_AXES;
-    inline const glm::mat3 VISUALIZER_TO_DATA_WORLD_AXES = DATA_TO_VISUALIZER_WORLD_AXES;
     inline const glm::mat4 DATA_TO_VISUALIZER_WORLD_AXES_4 = DATA_TO_VISUALIZER_CAMERA_AXES_4;
     inline const glm::mat4 VISUALIZER_TO_DATA_WORLD_AXES_4 = DATA_TO_VISUALIZER_WORLD_AXES_4;
-    inline const glm::mat3 VISUALIZER_TO_RASTER_CAMERA_AXES{1, 0, 0, 0, 1, 0, 0, 0, -1};
-    inline const glm::mat3 RASTER_TO_VISUALIZER_CAMERA_AXES = VISUALIZER_TO_RASTER_CAMERA_AXES;
 
     inline glm::vec3 cameraRight(const glm::mat3& rotation) {
         return glm::normalize(rotation[0]);
@@ -72,16 +69,8 @@ namespace lfs::rendering {
         return visualizer_rotation * VISUALIZER_TO_DATA_CAMERA_AXES;
     }
 
-    inline glm::mat3 rasterCameraToWorldFromVisualizerRotation(const glm::mat3& visualizer_rotation) {
-        return visualizer_rotation * VISUALIZER_TO_RASTER_CAMERA_AXES;
-    }
-
     inline glm::vec3 visualizerWorldPointFromDataWorld(const glm::vec3& data_point) {
         return DATA_TO_VISUALIZER_WORLD_AXES * data_point;
-    }
-
-    inline glm::vec3 dataWorldPointFromVisualizerWorld(const glm::vec3& visualizer_point) {
-        return VISUALIZER_TO_DATA_WORLD_AXES * visualizer_point;
     }
 
     inline glm::mat4 dataWorldTransformToVisualizerWorld(const glm::mat4& data_world_transform) {
@@ -168,6 +157,16 @@ namespace lfs::rendering {
         view[3][1] = translation_inv.y;
         view[3][2] = translation_inv.z;
         return view;
+    }
+
+    // Sequencer poses are in visualizer world space; headless renders consume
+    // raw dataset points and a +Y-down, +Z-forward camera.
+    inline glm::mat4 dataWorldToCameraFromVisualizerPose(const glm::mat3& rotation,
+                                                         const glm::vec3& position) {
+        // Convert raw world points on the right and local camera axes on the
+        // left. Converting only the camera axes leaves the eye in the wrong world.
+        return glm::mat4(VISUALIZER_TO_DATA_CAMERA_AXES) * makeViewMatrix(rotation, position) *
+               DATA_TO_VISUALIZER_WORLD_AXES_4;
     }
 
     inline glm::vec3 chooseFallbackUp(const glm::vec3& forward) {
@@ -283,12 +282,26 @@ namespace lfs::rendering {
                                           const float screen_x,
                                           const float screen_y,
                                           const float depth,
-                                          const float focal_length_mm) {
+                                          const float focal_length_mm,
+                                          const bool orthographic = false,
+                                          const float ortho_scale = DEFAULT_ORTHO_SCALE) {
         const auto [fx, fy] = computePixelFocalLengths(viewport_size, focal_length_mm);
         const float width = static_cast<float>(viewport_size.x);
         const float height = static_cast<float>(viewport_size.y);
         const float cx = width * 0.5f;
         const float cy = height * 0.5f;
+
+        if (orthographic) {
+            if (!std::isfinite(ortho_scale) || ortho_scale <= 0.0f) {
+                return glm::vec3(std::numeric_limits<float>::quiet_NaN());
+            }
+
+            const glm::vec3 view_pos(
+                (screen_x - cx) / ortho_scale,
+                (cy - screen_y) / ortho_scale,
+                -depth);
+            return rotation * view_pos + translation;
+        }
 
         const glm::vec3 view_pos(
             (screen_x - cx) * depth / fx,

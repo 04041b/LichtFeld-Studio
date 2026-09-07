@@ -5,16 +5,24 @@
 #include "io/loader_service.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/sh_value_quant.hpp"
+#include "core/splat_data.hpp"
 #include "io/error.hpp"
+#include "io/formats/rad.hpp"
 #include "io/loaders/blender_loader.hpp"
 #include "io/loaders/checkpoint_loader.hpp"
 #include "io/loaders/colmap_loader.hpp"
 #include "io/loaders/mesh_loader.hpp"
 #include "io/loaders/ply_loader.hpp"
+#include "io/loaders/rad_loader.hpp"
 #include "io/loaders/sogs_loader.hpp"
 #include "io/loaders/spz_loader.hpp"
 #include "io/loaders/usd_loader.hpp"
+
+#include <algorithm>
+#include <cstdlib>
 #include <format>
+#include <string>
 
 namespace lfs::io {
 
@@ -26,12 +34,121 @@ namespace lfs::io {
         registry_->registerLoader(std::make_unique<SogLoader>());
         registry_->registerLoader(std::make_unique<SpzLoader>());
         registry_->registerLoader(std::make_unique<USDLoader>());
+        registry_->registerLoader(std::make_unique<RadLoader>());
         registry_->registerLoader(std::make_unique<CheckpointLoader>());
         registry_->registerLoader(std::make_unique<ColmapLoader>());
         registry_->registerLoader(std::make_unique<BlenderLoader>());
         registry_->registerLoader(std::make_unique<MeshLoader>());
 
         LOG_DEBUG("LoaderService initialized with {} loaders", registry_->size());
+    }
+
+    namespace {
+        [[nodiscard]] bool splat_tensor_renderer_ready(const lfs::core::Tensor& tensor) {
+            if (!tensor.is_valid() || tensor.numel() == 0) {
+                return true; // empty/absent — nothing to migrate
+            }
+            // Match what the Vulkan splat renderer actually binds (vksplat requires this kind).
+            return tensor.is_external_storage() &&
+                   tensor.external_storage_kind() == "vulkan_external_buffer";
+        }
+
+        [[nodiscard]] bool pagedRadGpuResidencyRequested(const lfs::core::SplatData& model) {
+            return lfs::io::rad_paged_load_recommended(model);
+        }
+    } // namespace
+
+    bool splatTensorsRendererReady(const lfs::core::SplatData& model) {
+        const bool base_ready =
+            splat_tensor_renderer_ready(model.means_raw()) &&
+            splat_tensor_renderer_ready(model.sh0_raw()) &&
+            splat_tensor_renderer_ready(model.scaling_raw()) &&
+            splat_tensor_renderer_ready(model.rotation_raw()) &&
+            splat_tensor_renderer_ready(model.opacity_raw()) &&
+            splat_tensor_renderer_ready(model.shN_raw());
+        return base_ready &&
+               (!model.shN_value_quantized() ||
+                splat_tensor_renderer_ready(model.shN_value_bounds()));
+    }
+
+    Result<void> migrateSplatTensorsToAllocator(lfs::core::SplatData& model,
+                                                const SplatTensorAllocator& allocator) {
+        if (!allocator) {
+            return {};
+        }
+        if (pagedRadGpuResidencyRequested(model)) {
+            model.set_tensor_allocator(allocator);
+            LOG_INFO("RAD paged LOD active: skipping full renderer-storage migration (chunks={})",
+                     model.lod_tree->chunk_count());
+            return {};
+        }
+        if (splatTensorsRendererReady(model)) {
+            model.set_tensor_allocator(allocator);
+            return {};
+        }
+
+        try {
+            const auto copy_to_allocator =
+                [&](const lfs::core::Tensor& source, const std::string_view name) -> lfs::core::Tensor {
+                lfs::core::Tensor source_contiguous = source.is_contiguous() ? source : source.contiguous();
+                const auto& shape = source_contiguous.shape();
+                const size_t capacity = shape.rank() > 0 ? shape[0] : source_contiguous.numel();
+                lfs::core::Tensor dst = allocator(shape, capacity, source_contiguous.dtype(), name);
+                dst.set_name(std::string{name});
+                dst.copy_from(source_contiguous);
+                return dst;
+            };
+
+            const int max_sh = model.get_max_sh_degree();
+            const int active_sh = model.get_active_sh_degree();
+            const float scene_scale = model.get_scene_scale();
+            const bool shN_q16 = model.shN_value_quantized();
+            const bool encode_q16 = lfs::core::sh_value_quant::enabled() && !shN_q16;
+            lfs::core::Tensor deleted = model.has_deleted_mask() ? model.deleted() : lfs::core::Tensor{};
+
+            lfs::core::Tensor shN;
+            lfs::core::Tensor shN_bounds;
+            const auto& shN_src = model.shN_raw();
+            if (shN_src.is_valid() && shN_src.numel() > 0) {
+                if (encode_q16) {
+                    // Keep the source float/f16 workspace; encode into allocator
+                    // q16 after the migrate so we do not import a full-size float
+                    // rest buffer just to throw it away.
+                    shN = shN_src;
+                } else {
+                    shN = copy_to_allocator(shN_src, "SplatData.shN");
+                }
+            }
+            if (shN_q16) {
+                shN_bounds = copy_to_allocator(
+                    model.shN_value_bounds(), "SplatData.shN_value_bounds");
+            }
+            lfs::core::SplatData migrated(max_sh,
+                                          copy_to_allocator(model.means_raw(), "SplatData.means"),
+                                          copy_to_allocator(model.sh0_raw(), "SplatData.sh0"),
+                                          std::move(shN),
+                                          copy_to_allocator(model.scaling_raw(), "SplatData.scaling"),
+                                          copy_to_allocator(model.rotation_raw(), "SplatData.rotation"),
+                                          copy_to_allocator(model.opacity_raw(), "SplatData.opacity"),
+                                          scene_scale,
+                                          lfs::core::SplatData::ShNLayout::Swizzled);
+            migrated.set_active_sh_degree(active_sh, std::move(shN_bounds));
+            if (deleted.is_valid()) {
+                migrated.deleted() = std::move(deleted);
+            }
+            auto lod_tree = std::move(model.lod_tree);
+            model = std::move(migrated);
+            model.lod_tree = std::move(lod_tree);
+            model.set_tensor_allocator(allocator);
+            if (encode_q16) {
+                (void)model.apply_shN_value_quant();
+            }
+            lfs::core::Tensor::trim_memory_pool();
+        } catch (const std::exception& e) {
+            return make_error(ErrorCode::CORRUPTED_DATA,
+                              std::format("Failed to migrate splat tensors to renderer storage: {}", e.what()));
+        }
+        return {};
     }
 
     Result<LoadResult> LoaderService::load(
@@ -68,7 +185,7 @@ namespace lfs::io {
                 message = std::format(
                     "Cannot open '{}' - unsupported file format.\n\n"
                     "Supported formats:\n"
-                    "  - Gaussian Splat files: .ply, .sog, .spz, .usd, .usda, .usdc, .usdz\n"
+                    "  - Gaussian Splat files: .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz\n"
                     "  - Mesh files: .obj, .fbx, .gltf, .glb, .stl, .dae\n"
                     "  - Training checkpoints: .resume\n"
                     "  - NeRF transforms: .json",
@@ -82,7 +199,21 @@ namespace lfs::io {
         LOG_INFO("Using {} loader for: {}", loader->name(), lfs::core::path_to_utf8(path));
 
         // Perform the load - let the loader return proper errors
-        return loader->load(path, options);
+        auto result = loader->load(path, options);
+
+        // Guarantee a renderer-ready model regardless of the format's decoder: formats that
+        // don't honor splat_tensor_allocator (SOG, SPZ, ...) land in plain CUDA storage, which
+        // the Vulkan splat renderer rejects. This migrates them in one place; PLY/checkpoint are
+        // already external, so it's a no-op for them.
+        if (result && options.splat_tensor_allocator) {
+            if (auto* splat = std::get_if<std::shared_ptr<SplatData>>(&result->data); splat && *splat) {
+                if (auto migrated = migrateSplatTensorsToAllocator(**splat, options.splat_tensor_allocator);
+                    !migrated) {
+                    return std::unexpected(migrated.error());
+                }
+            }
+        }
+        return result;
     }
 
     std::vector<std::string> LoaderService::getAvailableLoaders() const {

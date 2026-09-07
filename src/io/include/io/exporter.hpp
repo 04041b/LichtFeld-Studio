@@ -6,11 +6,14 @@
 
 #include "core/export.hpp"
 #include "core/point_cloud.hpp"
+#include "core/provenance.hpp"
 #include "core/splat_data.hpp"
 #include "io/error.hpp"
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,6 +48,7 @@ namespace lfs::io {
         ExportProgressCallback progress_callback = nullptr;
         // Additional per-vertex float properties appended after the built-in PLY schema.
         std::vector<PlyAttributeBlock> extra_attributes;
+        std::optional<core::ProvenanceStamp> provenance{}; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
     };
 
     /**
@@ -55,7 +59,6 @@ namespace lfs::io {
     [[nodiscard]] LFS_IO_API Result<void> save_ply(const SplatData& splat_data, const PlySaveOptions& options);
     [[nodiscard]] LFS_IO_API Result<void> save_ply(const PointCloud& point_cloud, const PlySaveOptions& options);
 
-    LFS_IO_API PointCloud to_point_cloud(const SplatData& splat_data);
     LFS_IO_API std::vector<std::string> get_ply_attribute_names(const SplatData& splat_data);
 
     // ============================================================================
@@ -67,6 +70,7 @@ namespace lfs::io {
         int kmeans_iterations = 10;
         bool use_gpu = true;
         ExportProgressCallback progress_callback = nullptr;
+        std::optional<core::ProvenanceStamp> provenance{}; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
     };
 
     /**
@@ -83,6 +87,7 @@ namespace lfs::io {
         std::filesystem::path output_path;
         int kmeans_iterations = 10;
         ExportProgressCallback progress_callback = nullptr;
+        std::optional<core::ProvenanceStamp> provenance{}; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
     };
 
     /**
@@ -95,9 +100,14 @@ namespace lfs::io {
     // SPZ Export (Niantic compressed format)
     // ============================================================================
 
+    inline constexpr int kSpzExportZstdLevel = 9;
+
     struct SpzSaveOptions {
         std::filesystem::path output_path;
+        int version = 4;                             // SPZ container version: 4 (zstd, current) or 3 (legacy gzip)
+        int compression_level = kSpzExportZstdLevel; // zstd compression level for SPZ v4
         ExportProgressCallback progress_callback = nullptr;
+        std::optional<core::ProvenanceStamp> provenance{}; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
     };
 
     /**
@@ -113,6 +123,7 @@ namespace lfs::io {
     struct UsdSaveOptions {
         std::filesystem::path output_path;
         ExportProgressCallback progress_callback = nullptr;
+        std::optional<core::ProvenanceStamp> provenance{}; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
     };
 
     /**
@@ -128,6 +139,7 @@ namespace lfs::io {
     struct NurecUsdzSaveOptions {
         std::filesystem::path output_path;
         ExportProgressCallback progress_callback = nullptr;
+        std::optional<core::ProvenanceStamp> provenance{}; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
     };
 
     /**
@@ -140,12 +152,17 @@ namespace lfs::io {
     // RAD Export (Random Access Dataset format)
     // ============================================================================
 
+    inline constexpr std::uint32_t kRadNativeChunkSplats =
+        static_cast<std::uint32_t>(lfs::core::SplatLodTree::kChunkSplats);
+    inline constexpr std::uint32_t kRadStreamableChunkSplats = 65'536;
+
     struct RadSaveOptions {
         std::filesystem::path output_path;
-        int compression_level = 6;                          // gzip compression level (0-9, default 6)
-        std::vector<float> lod_ratios;                      // Custom LOD ratios (e.g., {0.2, 0.5, 1.0}), empty = use defaults
-        bool flip_y = true;                                 // Flip Y axis on export (enabled by default)
-        ExportProgressCallback progress_callback = nullptr; // Progress callback
+        int compression_level = 6;                            // gzip compression level (0-9, default 6)
+        bool flip_y = false;                                  // Flip Y axis on export
+        std::uint32_t chunk_size = kRadStreamableChunkSplats; // RAD splats per file chunk
+        ExportProgressCallback progress_callback = nullptr;   // Progress callback
+        std::optional<core::ProvenanceStamp> provenance{};    // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
     };
 
     /**

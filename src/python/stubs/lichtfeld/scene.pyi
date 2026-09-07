@@ -21,7 +21,9 @@ class SplatData:
 
     @property
     def shN_raw(self) -> lichtfeld.Tensor:
-        """Raw SHN tensor [N, (degree+1)^2-1, 3] (view)"""
+        """
+        SHN tensor in canonical [N, (degree+1)^2-1, 3] layout (materialised from the internal swizzled storage — this allocates, not a view).
+        """
 
     @property
     def scaling_raw(self) -> lichtfeld.Tensor:
@@ -106,7 +108,9 @@ class SplatData:
         """Set maximum SH degree"""
 
     def reserve_capacity(self, capacity: int) -> None:
-        """Reserve capacity for Gaussians (for densification)"""
+        """
+        Reserve capacity for Gaussians (for densification). Raises if the model is renderer-backed.
+        """
 
 class NodeType(enum.Enum):
     SPLAT = 0
@@ -114,6 +118,8 @@ class NodeType(enum.Enum):
     POINTCLOUD = 1
 
     GROUP = 2
+
+    PLY_SEQUENCE = 13
 
     CROPBOX = 3
 
@@ -310,6 +316,10 @@ class SceneNode:
         """Unique node identifier"""
 
     @property
+    def uuid(self) -> str:
+        """Durable node UUID"""
+
+    @property
     def parent_id(self) -> int:
         """Parent node identifier (-1 for root)"""
 
@@ -320,6 +330,10 @@ class SceneNode:
     @property
     def type(self) -> NodeType:
         """Node type (SPLAT, GROUP, CAMERA, etc.)"""
+
+    @property
+    def local_transform(self) -> tuple:
+        """Local transform as 4x4 row-major tuple"""
 
     @property
     def world_transform(self) -> tuple:
@@ -367,6 +381,10 @@ class SceneNode:
         """Path to the camera mask file"""
 
     @property
+    def depth_path(self) -> str:
+        """Path to the camera depth map file"""
+
+    @property
     def has_camera(self) -> bool:
         """Whether this node has camera data"""
 
@@ -374,9 +392,18 @@ class SceneNode:
     def has_mask(self) -> bool:
         """Whether this camera node has a mask file"""
 
+    @property
+    def has_depth(self) -> bool:
+        """Whether this camera node has a depth map file"""
+
     def load_mask(self, resize_factor: int = 1, max_width: int = 0, invert: bool = False, threshold: float = 0.5) -> lichtfeld.Tensor | None:
         """
         Load mask as tensor [1, H, W] on CUDA (None if not a camera node or no mask)
+        """
+
+    def load_depth(self, resize_factor: int = 1, max_width: int = 0) -> lichtfeld.Tensor | None:
+        """
+        Load depth map as tensor [H, W] on CUDA (None if not a camera node or no depth map)
         """
 
     @property
@@ -468,7 +495,7 @@ class Scene:
     def add_camera_group(self, name: str, parent: int, camera_count: int) -> int:
         """Add a camera group node"""
 
-    def add_camera(self, name: str, parent: int, R: lichtfeld.Tensor, T: lichtfeld.Tensor, focal_x: float, focal_y: float, width: int, height: int, image_path: str = '', uid: int = -1) -> int:
+    def add_camera(self, name: str, parent: int, R: lichtfeld.Tensor, T: lichtfeld.Tensor, focal_x: float, focal_y: float, width: int, height: int, image_path: str = '', uid: int = -1, mask: lichtfeld.Tensor | None = None) -> int:
         """
         Add a camera node with intrinsic and extrinsic parameters.
 
@@ -483,13 +510,20 @@ class Scene:
             height: Image height in pixels
             image_path: Optional path to camera image
             uid: Optional unique identifier (-1 for auto-assigned)
+            mask: Optional in-memory mask tensor (H, W) or (1, H, W) at the image
+                resolution. Bypasses the on-disk masks/ workflow — useful for
+                direct-scene plugins that want to attach per-frame masks without
+                writing files. Set the session's ``mask_mode`` to ``Ignore`` or
+                ``Segment`` for it to take effect during training.
 
         Returns:
             Node ID of created camera
         """
 
     def remove_node(self, name: str, keep_children: bool = False) -> None:
-        """Remove a node by name, optionally keeping its children"""
+        """
+        Remove a node by name, optionally keeping its children. Raises RuntimeError if the GUI scene manager rejects removal.
+        """
 
     def rename_node(self, old_name: str, new_name: str) -> bool:
         """Rename a node, returns true on success"""
@@ -497,14 +531,17 @@ class Scene:
     def clear(self) -> None:
         """Remove all nodes from the scene"""
 
-    def reparent(self, node_id: int, new_parent_id: int) -> None:
-        """Move a node under a new parent"""
+    def reparent(self, node_id: int, new_parent_id: int) -> bool:
+        """Move a node under a new parent, returns true on success"""
 
     def root_nodes(self) -> list[int]:
         """Get all root-level nodes"""
 
     def get_node_by_id(self, id: int) -> SceneNode | None:
         """Find a node by its integer ID (None if not found)"""
+
+    def get_node_by_uuid(self, uuid: str) -> SceneNode | None:
+        """Find a node by its durable UUID (None if invalid or not found)"""
 
     def get_node(self, name: str) -> SceneNode | None:
         """Find a node by name (None if not found)"""
@@ -679,7 +716,7 @@ class Scene:
         """Notify the renderer that scene data has changed"""
 
     def duplicate_node(self, name: str) -> str:
-        """Duplicate a node by name, returns new node ID"""
+        """Duplicate a node by name, returns the new node name"""
 
     def merge_group(self, group_name: str) -> str:
         """Merge all splats in a group into a single node, returns merged node ID"""
@@ -742,8 +779,20 @@ class Camera:
         """Full path to mask file"""
 
     @property
+    def depth_path(self) -> str:
+        """Full path to depth map file"""
+
+    @property
     def has_mask(self) -> bool:
         """Whether a mask file exists"""
+
+    @property
+    def has_depth(self) -> bool:
+        """Whether a depth map file exists"""
+
+    @property
+    def has_image(self) -> bool:
+        """Whether the bound dataset image file exists"""
 
     @property
     def uid(self) -> int:
@@ -790,6 +839,9 @@ class Camera:
 
     def load_mask(self, resize_factor: int = 1, max_width: int = 0, invert: bool = False, threshold: float = 0.5) -> lichtfeld.Tensor:
         """Load mask as tensor [1, H, W] on CUDA"""
+
+    def load_depth(self, resize_factor: int = 1, max_width: int = 0) -> lichtfeld.Tensor:
+        """Load depth map as tensor [H, W] on CUDA"""
 
 class CameraDataset:
     def __len__(self) -> int:

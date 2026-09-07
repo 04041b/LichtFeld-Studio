@@ -4,19 +4,19 @@
 
 #include "core/camera.hpp"
 #include "core/executable_path.hpp"
+#include "core/image_io.hpp"
 #include "core/logger.hpp"
-#include "core/mesh_data.hpp"
 #include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
-#include "gs_rasterizer_tensor.hpp"
+#include "environment_image.hpp"
+#include "environment_math.hpp"
 #include "image_layout.hpp"
 #include "point_cloud_raster.cuh"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering.hpp"
 #include "screen_overlay_renderer.hpp"
-#include <OpenImageIO/imageio.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -24,11 +24,9 @@
 #include <filesystem>
 #include <format>
 #include <glm/gtc/constants.hpp>
-#include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <limits>
 #include <mutex>
-#include <string_view>
 #include <vector>
 
 namespace lfs::rendering {
@@ -41,53 +39,11 @@ namespace lfs::rendering {
             bool flip_y = false;
             float far_plane = DEFAULT_FAR_PLANE;
             bool orthographic = false;
-            bool color_has_alpha = false;
-        };
-
-        struct GaussianRasterResources {
-            Tensor crop_box_transform_tensor;
-            Tensor crop_box_min_tensor;
-            Tensor crop_box_max_tensor;
-            Tensor ellipsoid_transform_tensor;
-            Tensor ellipsoid_radii_tensor;
-            Tensor view_volume_transform_tensor;
-            Tensor view_volume_min_tensor;
-            Tensor view_volume_max_tensor;
-        };
-
-        struct GaussianRasterRequest {
-            FrameView frame_view;
-            float scaling_modifier = 1.0f;
-            bool antialiasing = false;
-            bool mip_filter = false;
-            int sh_degree = 3;
-            GaussianRasterBackend raster_backend = GaussianRasterBackend::FastGs;
-            bool gut = false;
-            bool equirectangular = false;
-            GaussianSceneState scene;
-            GaussianFilterState filters;
-            GaussianOverlayState overlay;
-            bool transparent_background = false;
-            unsigned long long* hovered_depth_id = nullptr;
-            Tensor* screen_positions_out = nullptr;
-        };
-
-        struct EnvironmentImage {
-            std::filesystem::path path;
-            int width = 0;
-            int height = 0;
-            std::vector<float> pixels;
-
-            [[nodiscard]] bool valid() const {
-                return width > 0 && height > 0 &&
-                       pixels.size() == static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
-            }
         };
 
         struct EnvironmentImageCache {
             std::mutex mutex;
-            EnvironmentImage image;
-            std::string last_error;
+            std::shared_ptr<const EnvironmentImage> image;
         };
 
         [[nodiscard]] EnvironmentImageCache& environmentImageCache() {
@@ -116,134 +72,100 @@ namespace lfs::rendering {
             return lfs::core::getAssetsDir() / requested;
         }
 
-        Result<EnvironmentImage> loadEnvironmentImage(const std::filesystem::path& environment_path) {
-            const auto resolved_path = resolveEnvironmentPath(environment_path);
-            auto& cache = environmentImageCache();
-            std::lock_guard lock(cache.mutex);
-            if (cache.image.valid() && cache.image.path == resolved_path) {
-                return cache.image;
-            }
+    } // namespace
 
-            cache.image = {};
-            cache.last_error.clear();
-            if (resolved_path.empty()) {
-                cache.last_error = "Environment map path is empty";
-                return std::unexpected(cache.last_error);
-            }
-            if (!std::filesystem::exists(resolved_path)) {
-                cache.last_error = std::format("Environment map not found: {}", resolved_path.string());
-                return std::unexpected(cache.last_error);
-            }
+    std::expected<std::shared_ptr<const EnvironmentImage>, std::string>
+    loadEnvironmentImageShared(const std::filesystem::path& environment_path) {
+        const auto resolved_path = resolveEnvironmentPath(environment_path);
+        auto& cache = environmentImageCache();
+        std::lock_guard lock(cache.mutex);
+        if (cache.image && cache.image->valid() && cache.image->path == resolved_path) {
+            return cache.image;
+        }
 
-            const std::string path_utf8 = lfs::core::path_to_utf8(resolved_path);
-            std::unique_ptr<OIIO::ImageInput> input(OIIO::ImageInput::open(path_utf8));
-            if (!input) {
-                cache.last_error = std::format("Failed to open environment map {}: {}", path_utf8, OIIO::geterror());
-                return std::unexpected(cache.last_error);
-            }
+        cache.image.reset();
+        if (resolved_path.empty()) {
+            return std::unexpected("Environment map path is empty");
+        }
+        if (!std::filesystem::exists(resolved_path)) {
+            return std::unexpected(std::format("Environment map not found: {}", resolved_path.string()));
+        }
 
-            const auto& spec = input->spec();
-            if (spec.width <= 0 || spec.height <= 0 || spec.nchannels <= 0) {
-                input->close();
-                cache.last_error = std::format("Invalid environment map dimensions for {}", path_utf8);
-                return std::unexpected(cache.last_error);
-            }
+        const std::string path_utf8 = lfs::core::path_to_utf8(resolved_path);
+        auto [source, width, height, channels] = lfs::core::load_image_float(resolved_path);
+        if (!source)
+            return std::unexpected(std::format("Failed to read environment map {}", path_utf8));
+        if (width <= 0 || height <= 0 || channels <= 0) {
+            lfs::core::free_image_float(source);
+            return std::unexpected(std::format("Invalid environment map dimensions for {}", path_utf8));
+        }
+        const int read_channels = channels >= 3 ? 3 : 1;
 
-            std::vector<float> source_pixels(
-                static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) *
-                static_cast<size_t>(spec.nchannels));
-            if (!input->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT, source_pixels.data())) {
-                cache.last_error = std::format("Failed to read environment map {}: {}", path_utf8, input->geterror());
-                input->close();
-                return std::unexpected(cache.last_error);
-            }
-            input->close();
-
-            EnvironmentImage image{
-                .path = resolved_path,
-                .width = spec.width,
-                .height = spec.height,
-                .pixels = std::vector<float>(
-                    static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) * 3u),
-            };
-            for (int y = 0; y < spec.height; ++y) {
-                for (int x = 0; x < spec.width; ++x) {
-                    const size_t src_index =
-                        (static_cast<size_t>(y) * static_cast<size_t>(spec.width) + static_cast<size_t>(x)) *
-                        static_cast<size_t>(spec.nchannels);
-                    const size_t dst_index =
-                        (static_cast<size_t>(y) * static_cast<size_t>(spec.width) + static_cast<size_t>(x)) * 3u;
-                    if (spec.nchannels >= 3) {
-                        image.pixels[dst_index + 0] = source_pixels[src_index + 0];
-                        image.pixels[dst_index + 1] = source_pixels[src_index + 1];
-                        image.pixels[dst_index + 2] = source_pixels[src_index + 2];
-                    } else {
-                        const float value = source_pixels[src_index];
-                        image.pixels[dst_index + 0] = value;
-                        image.pixels[dst_index + 1] = value;
-                        image.pixels[dst_index + 2] = value;
-                    }
+        auto image = std::make_shared<EnvironmentImage>();
+        image->path = resolved_path;
+        image->width = width;
+        image->height = height;
+        if (read_channels == 3) {
+            if (channels == 3) {
+                image->pixels.assign(source, source + static_cast<size_t>(width) * height * 3);
+            } else {
+                const size_t pixel_count =
+                    static_cast<size_t>(width) * static_cast<size_t>(height);
+                image->pixels.resize(pixel_count * 3u);
+                for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+                    image->pixels[pixel * 3u + 0u] = source[pixel * channels + 0u];
+                    image->pixels[pixel * 3u + 1u] = source[pixel * channels + 1u];
+                    image->pixels[pixel * 3u + 2u] = source[pixel * channels + 2u];
                 }
             }
-
-            cache.image = image;
-            LOG_INFO("Loaded tensor environment map {}", resolved_path.string());
-            return image;
+        } else {
+            const size_t pixel_count =
+                static_cast<size_t>(width) * static_cast<size_t>(height);
+            image->pixels.resize(pixel_count * 3u);
+            for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+                const float value = source[pixel * channels];
+                image->pixels[pixel * 3u + 0u] = value;
+                image->pixels[pixel * 3u + 1u] = value;
+                image->pixels[pixel * 3u + 2u] = value;
+            }
         }
+        lfs::core::free_image_float(source);
 
-        [[nodiscard]] glm::vec3 acesTonemap(const glm::vec3& value) {
-            constexpr float a = 2.51f;
-            constexpr float b = 0.03f;
-            constexpr float c = 2.43f;
-            constexpr float d = 0.59f;
-            constexpr float e = 0.14f;
-            return glm::clamp(
-                (value * (a * value + glm::vec3(b))) /
-                    (value * (c * value + glm::vec3(d)) + glm::vec3(e)),
-                glm::vec3(0.0f),
-                glm::vec3(1.0f));
-        }
+        cache.image = image;
+        LOG_INFO("Loaded tensor environment map {}", resolved_path.string());
+        return image;
+    }
 
-        [[nodiscard]] glm::vec3 rotateAroundY(const glm::vec3& value, const float radians) {
-            const float c = std::cos(radians);
-            const float s = std::sin(radians);
-            return {
-                c * value.x + s * value.z,
-                value.y,
-                -s * value.x + c * value.z,
-            };
+    std::expected<EnvironmentImage, std::string> loadEnvironmentImage(
+        const std::filesystem::path& environment_path) {
+        auto image = loadEnvironmentImageShared(environment_path);
+        if (!image) {
+            return std::unexpected(image.error());
         }
+        return **image;
+    }
+
+    void releaseEnvironmentImageCache() {
+        auto& cache = environmentImageCache();
+        std::lock_guard lock(cache.mutex);
+        cache.image.reset();
+    }
+
+    namespace {
 
         [[nodiscard]] glm::vec3 sampleEnvironmentBilinear(const EnvironmentImage& image,
-                                                          float u,
-                                                          float v) {
+                                                          const float u,
+                                                          const float v) {
             if (!image.valid()) {
                 return glm::vec3(0.0f);
             }
-            u = u - std::floor(u);
-            v = std::clamp(v, 0.0f, 1.0f);
-
-            const float x = u * static_cast<float>(image.width - 1);
-            const float y = v * static_cast<float>(image.height - 1);
-            const int x0 = std::clamp(static_cast<int>(std::floor(x)), 0, image.width - 1);
-            const int y0 = std::clamp(static_cast<int>(std::floor(y)), 0, image.height - 1);
-            const int x1 = (x0 + 1) % image.width;
-            const int y1 = std::clamp(y0 + 1, 0, image.height - 1);
-            const float tx = x - static_cast<float>(x0);
-            const float ty = y - static_cast<float>(y0);
-
-            const auto fetch = [&](const int px, const int py) {
+            const auto fetch = [&](const int px, const int py) -> envmath::Vec3 {
                 const size_t index =
                     (static_cast<size_t>(py) * static_cast<size_t>(image.width) + static_cast<size_t>(px)) * 3u;
-                return glm::vec3(
-                    image.pixels[index + 0],
-                    image.pixels[index + 1],
-                    image.pixels[index + 2]);
+                return {image.pixels[index + 0], image.pixels[index + 1], image.pixels[index + 2]};
             };
-
-            const glm::vec3 top = glm::mix(fetch(x0, y0), fetch(x1, y0), tx);
-            const glm::vec3 bottom = glm::mix(fetch(x0, y1), fetch(x1, y1), tx);
-            return glm::mix(top, bottom, ty);
+            const auto color = envmath::sampleEnvironmentBilinear(fetch, u, v, image.width, image.height);
+            return {color.x, color.y, color.z};
         }
 
         [[nodiscard]] glm::vec3 environmentDirectionForPixel(
@@ -253,42 +175,35 @@ namespace lfs::rendering {
             const bool equirectangular_view) {
             const float width = static_cast<float>(std::max(frame_view.size.x, 1));
             const float height = static_cast<float>(std::max(frame_view.size.y, 1));
-            const float tex_u = (static_cast<float>(x) + 0.5f) / width;
-            const float tex_v = 1.0f - (static_cast<float>(y) + 0.5f) / height;
 
-            glm::vec3 local_dir;
-            if (equirectangular_view) {
-                const float lon = (tex_u - 0.5f) * (2.0f * glm::pi<float>());
-                const float lat = (tex_v - 0.5f) * glm::pi<float>();
-                const float cos_lat = std::cos(lat);
-                local_dir = glm::normalize(glm::vec3(
-                    std::sin(lon) * cos_lat,
-                    std::sin(lat),
-                    -std::cos(lon) * cos_lat));
+            float focal_x = 0.0f;
+            float focal_y = 0.0f;
+            float center_x = width * 0.5f;
+            float center_y = height * 0.5f;
+            if (frame_view.intrinsics_override.has_value() && !frame_view.orthographic) {
+                const auto& intrinsics = *frame_view.intrinsics_override;
+                focal_x = intrinsics.focal_x;
+                focal_y = intrinsics.focal_y;
+                center_x = intrinsics.center_x;
+                center_y = intrinsics.center_y;
             } else {
-                float focal_x = 0.0f;
-                float focal_y = 0.0f;
-                float center_x = width * 0.5f;
-                float center_y = height * 0.5f;
-                if (frame_view.intrinsics_override.has_value() && !frame_view.orthographic) {
-                    const auto& intrinsics = *frame_view.intrinsics_override;
-                    focal_x = intrinsics.focal_x;
-                    focal_y = intrinsics.focal_y;
-                    center_x = intrinsics.center_x;
-                    center_y = intrinsics.center_y;
-                } else {
-                    const auto focal = computePixelFocalLengths(frame_view.size, frame_view.focal_length_mm);
-                    focal_x = focal.first;
-                    focal_y = focal.second;
-                }
-                const glm::vec2 pixel(tex_u * width, tex_v * height);
-                local_dir = glm::normalize(glm::vec3(
-                    (pixel.x - center_x) / std::max(focal_x, 1e-6f),
-                    (pixel.y - center_y) / std::max(focal_y, 1e-6f),
-                    -1.0f));
+                const auto focal = computePixelFocalLengths(frame_view.size, frame_view.focal_length_mm);
+                focal_x = focal.first;
+                focal_y = focal.second;
             }
 
-            return glm::normalize(frame_view.rotation * local_dir);
+            const auto dir = envmath::environmentWorldDirection(
+                static_cast<float>(x),
+                static_cast<float>(y),
+                width,
+                height,
+                equirectangular_view,
+                focal_x,
+                focal_y,
+                center_x,
+                center_y,
+                &frame_view.rotation[0][0]);
+            return {dir.x, dir.y, dir.z};
         }
 
         Result<std::vector<float>> renderEnvironmentBackground(
@@ -307,7 +222,7 @@ namespace lfs::rendering {
                 return image;
             }
 
-            auto environment = loadEnvironmentImage(request.environment.map_path);
+            auto environment = loadEnvironmentImageShared(request.environment.map_path);
             if (!environment) {
                 return std::unexpected(environment.error());
             }
@@ -318,245 +233,19 @@ namespace lfs::rendering {
                 for (int x = 0; x < width; ++x) {
                     glm::vec3 world_dir = environmentDirectionForPixel(
                         request.frame_view, x, y, request.environment.equirectangular);
-                    world_dir = glm::normalize(rotateAroundY(world_dir, rotation));
+                    const auto rotated = envmath::rotateAroundY({world_dir.x, world_dir.y, world_dir.z}, rotation);
+                    const auto uv = envmath::equirectUvForDirection(envmath::normalized(rotated));
 
-                    const float longitude = std::atan2(world_dir.x, -world_dir.z);
-                    const float latitude = std::asin(std::clamp(world_dir.y, -1.0f, 1.0f));
-                    const float u = longitude / (2.0f * glm::pi<float>()) + 0.5f;
-                    const float v = 0.5f - latitude / glm::pi<float>();
-
-                    glm::vec3 color = sampleEnvironmentBilinear(*environment, u, v) * exposure;
-                    color = acesTonemap(color);
-                    color = glm::pow(color, glm::vec3(1.0f / 2.2f));
-                    color = glm::clamp(color, glm::vec3(0.0f), glm::vec3(1.0f));
+                    const glm::vec3 hdr = sampleEnvironmentBilinear(**environment, uv.u, uv.v);
+                    const auto color = envmath::shadeEnvironmentRadiance({hdr.x, hdr.y, hdr.z}, exposure);
 
                     const size_t pixel = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
-                    image[pixel] = color.r;
-                    image[pixel_count + pixel] = color.g;
-                    image[2 * pixel_count + pixel] = color.b;
+                    image[pixel] = color.x;
+                    image[pixel_count + pixel] = color.y;
+                    image[2 * pixel_count + pixel] = color.z;
                 }
             }
             return image;
-        }
-
-        [[nodiscard]] bool tensorMatchesGaussianCount(const Tensor* const tensor,
-                                                      const size_t gaussian_count) {
-            return tensor == nullptr || !tensor->is_valid() || tensor->numel() == gaussian_count;
-        }
-
-        [[nodiscard]] glm::vec2 computeFov(const float vfov_rad, const int width, const int height) {
-            const float aspect = static_cast<float>(width) / static_cast<float>(height);
-            return glm::vec2(
-                std::atan(std::tan(vfov_rad * 0.5f) * aspect) * 2.0f,
-                vfov_rad);
-        }
-
-        Result<lfs::core::Camera> createRasterCamera(const FrameView& frame_view,
-                                                     const bool gut,
-                                                     const bool equirectangular) {
-            const glm::mat3 camera_to_world =
-                (gut || equirectangular)
-                    ? dataCameraToWorldFromVisualizerRotation(frame_view.rotation)
-                    : rasterCameraToWorldFromVisualizerRotation(frame_view.rotation);
-            const glm::mat3 world_to_camera = glm::transpose(camera_to_world);
-            const glm::vec3 translation = -world_to_camera * frame_view.translation;
-
-            std::vector<float> rotation_data;
-            rotation_data.reserve(9);
-            for (int row = 0; row < 3; ++row) {
-                for (int col = 0; col < 3; ++col) {
-                    rotation_data.push_back(world_to_camera[col][row]);
-                }
-            }
-
-            auto rotation_tensor = Tensor::from_vector(rotation_data, {3, 3}, lfs::core::Device::CPU);
-            auto translation_tensor = Tensor::from_vector(
-                std::vector<float>{translation.x, translation.y, translation.z},
-                {3},
-                lfs::core::Device::CPU);
-
-            float focal_x = 0.0f;
-            float focal_y = 0.0f;
-            float center_x = 0.0f;
-            float center_y = 0.0f;
-            if (frame_view.intrinsics_override.has_value()) {
-                const auto& intrinsics = *frame_view.intrinsics_override;
-                focal_x = intrinsics.focal_x;
-                focal_y = intrinsics.focal_y;
-                center_x = intrinsics.center_x;
-                center_y = intrinsics.center_y;
-            } else {
-                const glm::vec2 fov = computeFov(
-                    focalLengthToVFovRad(frame_view.focal_length_mm),
-                    frame_view.size.x,
-                    frame_view.size.y);
-                focal_x = lfs::core::fov2focal(fov.x, frame_view.size.x);
-                focal_y = lfs::core::fov2focal(fov.y, frame_view.size.y);
-                center_x = frame_view.size.x / 2.0f;
-                center_y = frame_view.size.y / 2.0f;
-            }
-
-            try {
-                return lfs::core::Camera(
-                    rotation_tensor,
-                    translation_tensor,
-                    focal_x,
-                    focal_y,
-                    center_x,
-                    center_y,
-                    Tensor::empty({0}, lfs::core::Device::CPU, lfs::core::DataType::Float32),
-                    Tensor::empty({0}, lfs::core::Device::CPU, lfs::core::DataType::Float32),
-                    lfs::core::CameraModelType::PINHOLE,
-                    "render_camera",
-                    "none",
-                    std::filesystem::path{},
-                    frame_view.size.x,
-                    frame_view.size.y,
-                    -1);
-            } catch (const std::exception& e) {
-                return std::unexpected(std::format("Failed to create camera: {}", e.what()));
-            }
-        }
-
-        [[nodiscard]] std::unique_ptr<Tensor> makeModelTransformsTensor(
-            const std::vector<glm::mat4>& transforms) {
-            if (transforms.empty()) {
-                return nullptr;
-            }
-
-            std::vector<float> transform_data(transforms.size() * 16);
-            for (size_t i = 0; i < transforms.size(); ++i) {
-                const auto& mat = transforms[i];
-                for (int row = 0; row < 4; ++row) {
-                    for (int col = 0; col < 4; ++col) {
-                        transform_data[i * 16 + row * 4 + col] = mat[col][row];
-                    }
-                }
-            }
-
-            return std::make_unique<Tensor>(
-                Tensor::from_vector(
-                    transform_data,
-                    {transforms.size(), 4, 4},
-                    lfs::core::Device::CPU)
-                    .cuda());
-        }
-
-        [[nodiscard]] Tensor* cudaTensorPointer(const std::shared_ptr<Tensor>& tensor,
-                                                std::unique_ptr<Tensor>& cuda_copy) {
-            if (!tensor || !tensor->is_valid()) {
-                return nullptr;
-            }
-            if (tensor->device() == lfs::core::Device::CUDA) {
-                return tensor.get();
-            }
-            cuda_copy = std::make_unique<Tensor>(tensor->cuda());
-            return cuda_copy.get();
-        }
-
-        void applyCropBoxToRaster(GaussianRasterRequest& request,
-                                  GaussianRasterResources& resources) {
-            if (!request.filters.crop_region.has_value()) {
-                return;
-            }
-
-            const auto& crop = *request.filters.crop_region;
-            const glm::mat4& world_to_box = crop.bounds.transform;
-            std::vector<float> transform_data(16);
-            for (int row = 0; row < 4; ++row) {
-                for (int col = 0; col < 4; ++col) {
-                    transform_data[row * 4 + col] = world_to_box[col][row];
-                }
-            }
-
-            resources.crop_box_transform_tensor =
-                Tensor::from_vector(transform_data, {4, 4}, lfs::core::Device::CPU).cuda();
-            resources.crop_box_min_tensor =
-                Tensor::from_vector(
-                    std::vector<float>{crop.bounds.min.x, crop.bounds.min.y, crop.bounds.min.z},
-                    {3},
-                    lfs::core::Device::CPU)
-                    .cuda();
-            resources.crop_box_max_tensor =
-                Tensor::from_vector(
-                    std::vector<float>{crop.bounds.max.x, crop.bounds.max.y, crop.bounds.max.z},
-                    {3},
-                    lfs::core::Device::CPU)
-                    .cuda();
-        }
-
-        void applyEllipsoidToRaster(GaussianRasterRequest& request,
-                                    GaussianRasterResources& resources) {
-            if (!request.filters.ellipsoid_region.has_value()) {
-                return;
-            }
-
-            const auto& ellipsoid = *request.filters.ellipsoid_region;
-            const glm::mat4& world_to_ellipsoid = ellipsoid.bounds.transform;
-            std::vector<float> transform_data(16);
-            for (int row = 0; row < 4; ++row) {
-                for (int col = 0; col < 4; ++col) {
-                    transform_data[row * 4 + col] = world_to_ellipsoid[col][row];
-                }
-            }
-
-            resources.ellipsoid_transform_tensor =
-                Tensor::from_vector(transform_data, {4, 4}, lfs::core::Device::CPU).cuda();
-            resources.ellipsoid_radii_tensor =
-                Tensor::from_vector(
-                    std::vector<float>{
-                        ellipsoid.bounds.radii.x,
-                        ellipsoid.bounds.radii.y,
-                        ellipsoid.bounds.radii.z},
-                    {3},
-                    lfs::core::Device::CPU)
-                    .cuda();
-        }
-
-        void applyViewVolumeToRaster(GaussianRasterRequest& request,
-                                     GaussianRasterResources& resources) {
-            if (!request.filters.view_volume.has_value()) {
-                return;
-            }
-
-            const auto& view_volume = *request.filters.view_volume;
-            const glm::mat4& world_to_volume = view_volume.transform;
-            std::vector<float> transform_data(16);
-            for (int row = 0; row < 4; ++row) {
-                for (int col = 0; col < 4; ++col) {
-                    transform_data[row * 4 + col] = world_to_volume[col][row];
-                }
-            }
-
-            resources.view_volume_transform_tensor =
-                Tensor::from_vector(transform_data, {4, 4}, lfs::core::Device::CPU).cuda();
-            resources.view_volume_min_tensor =
-                Tensor::from_vector(
-                    std::vector<float>{view_volume.min.x, view_volume.min.y, view_volume.min.z},
-                    {3},
-                    lfs::core::Device::CPU)
-                    .cuda();
-            resources.view_volume_max_tensor =
-                Tensor::from_vector(
-                    std::vector<float>{view_volume.max.x, view_volume.max.y, view_volume.max.z},
-                    {3},
-                    lfs::core::Device::CPU)
-                    .cuda();
-        }
-
-        [[nodiscard]] FrameMetadata makeFrameMetadata(const RasterImageResult& result) {
-            return FrameMetadata{
-                .depth_panels = {FramePanelMetadata{
-                    .depth = result.depth.is_valid() ? std::make_shared<Tensor>(result.depth) : nullptr,
-                    .start_position = 0.0f,
-                    .end_position = 1.0f,
-                }},
-                .depth_panel_count = 1,
-                .valid = result.valid,
-                .flip_y = result.flip_y,
-                .far_plane = result.far_plane,
-                .orthographic = result.orthographic,
-                .color_has_alpha = result.color_has_alpha};
         }
 
         [[nodiscard]] FrameMetadata makePointCloudFrameMetadata(
@@ -571,29 +260,7 @@ namespace lfs::rendering {
                 .valid = result.valid,
                 .flip_y = result.flip_y,
                 .far_plane = result.far_plane,
-                .orthographic = result.orthographic,
-                .color_has_alpha = result.color_has_alpha};
-        }
-
-        [[nodiscard]] int readTensorIndex(const Tensor* const tensor,
-                                          const size_t index) {
-            if (!tensor || !tensor->is_valid() || index >= tensor->numel()) {
-                return 0;
-            }
-
-            switch (tensor->dtype()) {
-            case lfs::core::DataType::Float32:
-                return static_cast<int>(std::lround(tensor->ptr<float>()[index]));
-            case lfs::core::DataType::Int32:
-                return tensor->ptr<int>()[index];
-            case lfs::core::DataType::Int64:
-                return static_cast<int>(tensor->ptr<int64_t>()[index]);
-            case lfs::core::DataType::UInt8:
-            case lfs::core::DataType::Bool:
-                return static_cast<int>(tensor->ptr<unsigned char>()[index]);
-            default:
-                return 0;
-            }
+                .orthographic = result.orthographic};
         }
 
         [[nodiscard]] std::optional<glm::mat4> cameraVisualizerTransform(
@@ -637,9 +304,13 @@ namespace lfs::rendering {
             const glm::mat4& visualizer_camera_to_world,
             const float scale) {
             std::vector<glm::vec3> points;
-            const int image_width = camera.image_width() > 0 ? camera.image_width() : camera.camera_width();
-            const int image_height = camera.image_height() > 0 ? camera.image_height() : camera.camera_height();
-            if (image_width <= 0 || image_height <= 0 || scale <= 0.0f) {
+            // Picking must follow the calibrated frustum, not the resolution
+            // selected for loading training images. Undistortion updates these
+            // calibration dimensions and FoVy together; training downscaling
+            // only changes the operational decode dimensions.
+            const int calibration_width = camera.camera_width();
+            const int calibration_height = camera.camera_height();
+            if (calibration_width <= 0 || calibration_height <= 0 || scale <= 0.0f) {
                 return points;
             }
 
@@ -667,12 +338,13 @@ namespace lfs::rendering {
                 return points;
             }
 
-            if (camera.focal_y() <= 0.0f) {
+            if (camera.FoVy() <= 0.0f) {
                 return points;
             }
 
-            const float aspect = static_cast<float>(image_width) / static_cast<float>(image_height);
-            const float fov_y = lfs::core::focal2fov(camera.focal_y(), image_height);
+            const float aspect = static_cast<float>(calibration_width) /
+                                 static_cast<float>(calibration_height);
+            const float fov_y = camera.FoVy();
             const float half_height = std::tan(fov_y * 0.5f) * scale;
             const float half_width = half_height * aspect;
 
@@ -727,154 +399,18 @@ namespace lfs::rendering {
                 request.viewport_pos.y + projected->y * scale_y);
         }
 
-        [[nodiscard]] glm::vec3 readPointColor(const float* const colors,
-                                               const size_t point_index,
-                                               const bool desaturate) {
-            glm::vec3 color(
-                std::clamp(colors[point_index * 3 + 0], 0.0f, 1.0f),
-                std::clamp(colors[point_index * 3 + 1], 0.0f, 1.0f),
-                std::clamp(colors[point_index * 3 + 2], 0.0f, 1.0f));
-
-            if (desaturate) {
-                const float gray = glm::dot(color, glm::vec3(0.299f, 0.587f, 0.114f));
-                color = glm::mix(color, glm::vec3(gray), 0.75f);
-            }
-            return color;
-        }
-
-        [[nodiscard]] bool pointPassesCrop(const glm::vec3& world_pos,
-                                           const PointCloudFilterState& filters,
-                                           bool& desaturate) {
-            desaturate = false;
-            if (!filters.crop_box.has_value()) {
-                return true;
-            }
-
-            const auto& crop = *filters.crop_box;
-            const glm::vec3 local = glm::vec3(crop.transform * glm::vec4(world_pos, 1.0f));
-            const bool inside =
-                local.x >= crop.min.x && local.x <= crop.max.x &&
-                local.y >= crop.min.y && local.y <= crop.max.y &&
-                local.z >= crop.min.z && local.z <= crop.max.z;
-            const bool visible = filters.crop_inverse ? !inside : inside;
-            desaturate = filters.crop_desaturate && !visible;
-            return visible || filters.crop_desaturate;
-        }
-
-        [[nodiscard]] std::optional<glm::vec3> projectPointToPixel(
-            const glm::vec3& world_pos,
-            const PointCloudRenderRequest& request,
-            const glm::mat4& view,
-            const glm::mat4& projection) {
-            const glm::vec4 view_pos4 = view * glm::vec4(world_pos, 1.0f);
-            const glm::vec3 view_pos(view_pos4);
-            const int width = request.frame_view.size.x;
-            const int height = request.frame_view.size.y;
-
-            if (request.render.equirectangular) {
-                const float len = glm::length(view_pos);
-                if (len <= 1e-6f) {
-                    return std::nullopt;
-                }
-                const glm::vec3 dir = view_pos / len;
-                const float u = 0.5f + std::atan2(dir.x, -dir.z) / (2.0f * glm::pi<float>());
-                const float v = 0.5f + std::asin(std::clamp(dir.y, -1.0f, 1.0f)) / glm::pi<float>();
-                const float px = u * static_cast<float>(width - 1);
-                const float py = v * static_cast<float>(height - 1);
-                if (!std::isfinite(px) || !std::isfinite(py) ||
-                    px < 0.0f || px >= static_cast<float>(width) ||
-                    py < 0.0f || py >= static_cast<float>(height)) {
-                    return std::nullopt;
-                }
-                return glm::vec3(px, py, len);
-            }
-
-            const glm::vec4 clip = projection * view_pos4;
-            if (std::abs(clip.w) <= 1e-6f) {
-                return std::nullopt;
-            }
-            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-            if (!std::isfinite(ndc.x) || !std::isfinite(ndc.y) || !std::isfinite(ndc.z) ||
-                ndc.x < -1.0f || ndc.x > 1.0f ||
-                ndc.y < -1.0f || ndc.y > 1.0f ||
-                ndc.z < 0.0f || ndc.z > 1.0f) {
-                return std::nullopt;
-            }
-
-            const float px = (ndc.x * 0.5f + 0.5f) * static_cast<float>(width - 1);
-            const float py = (ndc.y * 0.5f + 0.5f) * static_cast<float>(height - 1);
-            const float depth = request.frame_view.orthographic ? -view_pos.z : std::max(-view_pos.z, 0.0f);
-            if (depth <= 0.0f && !request.frame_view.orthographic) {
-                return std::nullopt;
-            }
-            return glm::vec3(px, py, depth);
-        }
-
-        [[nodiscard]] int pointRadiusPixels(const PointCloudRenderRequest& request,
-                                            const float depth) {
-            const float voxel = std::max(request.render.voxel_size * request.render.scaling_modifier, 1e-5f);
-            if (request.frame_view.orthographic) {
-                const float pixels_per_world =
-                    static_cast<float>(request.frame_view.size.y) /
-                    std::max(request.frame_view.ortho_scale, 1e-5f);
-                return std::max(1, static_cast<int>(std::ceil(voxel * pixels_per_world * 0.5f)));
-            }
-
-            const float vfov = focalLengthToVFovRad(request.frame_view.focal_length_mm);
-            const float focal_y = lfs::core::fov2focal(vfov, request.frame_view.size.y);
-            return std::max(1, static_cast<int>(std::ceil(voxel * focal_y / std::max(depth, 1e-4f))));
-        }
-
-        void drawSoftwarePoint(std::vector<float>& image,
-                               std::vector<float>& depth,
-                               const int width,
-                               const int height,
-                               const int channels,
-                               const glm::vec3& pixel_depth,
-                               const glm::vec3& color,
-                               const int radius) {
-            const int cx = static_cast<int>(std::lround(pixel_depth.x));
-            const int cy = static_cast<int>(std::lround(pixel_depth.y));
-            const float point_depth = pixel_depth.z;
-            const int r2 = radius * radius;
-
-            for (int yy = cy - radius; yy <= cy + radius; ++yy) {
-                if (yy < 0 || yy >= height) {
-                    continue;
-                }
-                for (int xx = cx - radius; xx <= cx + radius; ++xx) {
-                    if (xx < 0 || xx >= width) {
-                        continue;
-                    }
-                    const int dx = xx - cx;
-                    const int dy = yy - cy;
-                    if (dx * dx + dy * dy > r2) {
-                        continue;
-                    }
-
-                    const size_t pixel_index = static_cast<size_t>(yy) * width + xx;
-                    if (point_depth >= depth[pixel_index]) {
-                        continue;
-                    }
-                    depth[pixel_index] = point_depth;
-                    image[pixel_index] = color.r;
-                    image[static_cast<size_t>(height) * width + pixel_index] = color.g;
-                    image[static_cast<size_t>(2) * height * width + pixel_index] = color.b;
-                    if (channels == 4) {
-                        image[static_cast<size_t>(3) * height * width + pixel_index] = 1.0f;
-                    }
-                }
-            }
-        }
-
         Result<RasterImageResult> renderSoftwarePointCloud(
             const Tensor& positions_source,
             const Tensor& colors_source,
-            const PointCloudRenderRequest& request) {
-            if (request.frame_view.size.x <= 0 || request.frame_view.size.y <= 0 ||
-                request.frame_view.size.x > MAX_VIEWPORT_SIZE ||
-                request.frame_view.size.y > MAX_VIEWPORT_SIZE) {
+            const PointCloudRenderRequest& request,
+            const Tensor* const deleted_mask_source) {
+            if (request.frame_view.size.x <= 0 || request.frame_view.size.y <= 0) {
                 return std::unexpected("Invalid viewport dimensions");
+            }
+            const auto width_pixels = static_cast<std::size_t>(request.frame_view.size.x);
+            const auto height_pixels = static_cast<std::size_t>(request.frame_view.size.y);
+            if (width_pixels > std::numeric_limits<std::size_t>::max() / height_pixels) {
+                return std::unexpected("Viewport dimensions overflow pixel count");
             }
             if (!positions_source.is_valid() || positions_source.ndim() != 2 || positions_source.size(1) != 3) {
                 return std::unexpected("Point cloud positions must have shape [N, 3]");
@@ -882,6 +418,10 @@ namespace lfs::rendering {
             if (!colors_source.is_valid() || colors_source.ndim() != 2 || colors_source.size(1) != 3 ||
                 colors_source.size(0) != positions_source.size(0)) {
                 return std::unexpected("Point cloud colors must have shape [N, 3]");
+            }
+            if (deleted_mask_source && deleted_mask_source->is_valid() &&
+                deleted_mask_source->numel() != positions_source.size(0)) {
+                return std::unexpected("Point cloud deleted mask must match point count");
             }
 
             Tensor positions_cuda = positions_source;
@@ -955,6 +495,20 @@ namespace lfs::rendering {
                 visibility_device = visibility_cuda.ptr<std::uint8_t>();
             }
 
+            Tensor deleted_mask_cuda;
+            const bool* deleted_mask_device = nullptr;
+            if (deleted_mask_source && deleted_mask_source->is_valid()) {
+                deleted_mask_cuda = *deleted_mask_source;
+                if (deleted_mask_cuda.dtype() != lfs::core::DataType::Bool) {
+                    deleted_mask_cuda = deleted_mask_cuda.to(lfs::core::DataType::Bool);
+                }
+                if (deleted_mask_cuda.device() != lfs::core::Device::CUDA) {
+                    deleted_mask_cuda = deleted_mask_cuda.cuda();
+                }
+                deleted_mask_cuda = deleted_mask_cuda.contiguous();
+                deleted_mask_device = deleted_mask_cuda.ptr<bool>();
+            }
+
             const glm::mat4 view = request.frame_view.getViewMatrix();
             const glm::mat4 projection = createProjectionMatrix(
                 request.frame_view.size,
@@ -976,12 +530,14 @@ namespace lfs::rendering {
                 {static_cast<size_t>(1), static_cast<size_t>(height), static_cast<size_t>(width)},
                 lfs::core::Device::CUDA, lfs::core::DataType::Float32);
 
+            lfs::core::pin_operands({&positions_cuda, &colors_cuda});
             pcraster::LaunchParams params{};
             params.positions = positions_cuda.ptr<float>();
             params.colors = colors_cuda.ptr<float>();
             params.transforms = transforms_device;
             params.transform_indices = transform_indices_ptr;
             params.visibility_mask = visibility_device;
+            params.deleted_mask = deleted_mask_device;
             params.n_points = static_cast<std::size_t>(positions_source.size(0));
             params.n_transforms = static_cast<int>(transforms.size());
             params.n_visibility = static_cast<int>(request.scene.node_visibility_mask.size());
@@ -997,6 +553,16 @@ namespace lfs::rendering {
                 params.crop.max[2] = crop.max.z;
                 params.crop.inverse = request.filters.crop_inverse;
                 params.crop.desaturate = request.filters.crop_desaturate;
+            }
+            params.has_crop_ellipsoid = request.filters.crop_ellipsoid.has_value();
+            if (params.has_crop_ellipsoid) {
+                const auto& ellipsoid = *request.filters.crop_ellipsoid;
+                std::copy_n(glm::value_ptr(ellipsoid.transform), 16, params.crop_ellipsoid.to_local);
+                params.crop_ellipsoid.radii[0] = ellipsoid.radii.x;
+                params.crop_ellipsoid.radii[1] = ellipsoid.radii.y;
+                params.crop_ellipsoid.radii[2] = ellipsoid.radii.z;
+                params.crop_ellipsoid.inverse = request.filters.crop_inverse;
+                params.crop_ellipsoid.desaturate = request.filters.crop_desaturate;
             }
             std::copy_n(glm::value_ptr(view), 16, params.view);
             std::copy_n(glm::value_ptr(view_proj), 16, params.view_proj);
@@ -1032,8 +598,7 @@ namespace lfs::rendering {
                 .depth = std::move(depth_tensor),
                 .valid = true,
                 .far_plane = request.frame_view.far_plane,
-                .orthographic = request.frame_view.orthographic,
-                .color_has_alpha = request.transparent_background};
+                .orthographic = request.frame_view.orthographic};
         }
 
         [[nodiscard]] Result<Tensor> toCpuChwFloatTensor(const Tensor& image) {
@@ -1056,668 +621,7 @@ namespace lfs::rendering {
             return formatted.cpu().contiguous();
         }
 
-        [[nodiscard]] std::optional<glm::vec3> projectMeshPoint(
-            const glm::vec3& world_pos,
-            const ViewportData& viewport,
-            const glm::mat4& view,
-            const glm::mat4& projection) {
-            const glm::vec4 view_pos4 = view * glm::vec4(world_pos, 1.0f);
-            const glm::vec4 clip = projection * view_pos4;
-            if (std::abs(clip.w) <= 1e-6f) {
-                return std::nullopt;
-            }
-            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-            if (!std::isfinite(ndc.x) || !std::isfinite(ndc.y) || !std::isfinite(ndc.z) ||
-                ndc.x < -1.0f || ndc.x > 1.0f ||
-                ndc.y < -1.0f || ndc.y > 1.0f ||
-                ndc.z < 0.0f || ndc.z > 1.0f) {
-                return std::nullopt;
-            }
-            const float x = (ndc.x * 0.5f + 0.5f) * static_cast<float>(viewport.size.x - 1);
-            const float y = (ndc.y * 0.5f + 0.5f) * static_cast<float>(viewport.size.y - 1);
-            const float z = viewport.orthographic ? -view_pos4.z : std::max(-view_pos4.z, 0.0f);
-            if (z <= 0.0f && !viewport.orthographic) {
-                return std::nullopt;
-            }
-            return glm::vec3(x, y, z);
-        }
-
-        [[nodiscard]] float edgeFunction(const glm::vec2& a,
-                                         const glm::vec2& b,
-                                         const glm::vec2& c) {
-            return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
-        }
-
-        [[nodiscard]] glm::vec3 safeNormalize(const glm::vec3& value,
-                                              const glm::vec3& fallback) {
-            const float length = glm::length(value);
-            return length > 1.0e-8f ? value / length : fallback;
-        }
-
-        [[nodiscard]] glm::vec3 srgbToLinear(const glm::vec3& value) {
-            return glm::pow(glm::clamp(value, glm::vec3(0.0f), glm::vec3(1.0f)), glm::vec3(2.2f));
-        }
-
-        [[nodiscard]] glm::vec4 fetchTexel(const lfs::core::TextureImage& image,
-                                           const int x,
-                                           const int y) {
-            if (image.width <= 0 || image.height <= 0 || image.channels <= 0 || image.pixels.empty()) {
-                return glm::vec4(1.0f);
-            }
-
-            const int px = std::clamp(x, 0, image.width - 1);
-            const int py = std::clamp(y, 0, image.height - 1);
-            const size_t index =
-                (static_cast<size_t>(py) * static_cast<size_t>(image.width) + static_cast<size_t>(px)) *
-                static_cast<size_t>(image.channels);
-            const auto read = [&](const int channel, const float fallback) {
-                return channel < image.channels
-                           ? static_cast<float>(image.pixels[index + static_cast<size_t>(channel)]) / 255.0f
-                           : fallback;
-            };
-
-            const float r = read(0, 1.0f);
-            return {
-                r,
-                read(1, r),
-                read(2, r),
-                read(3, 1.0f),
-            };
-        }
-
-        [[nodiscard]] glm::vec4 sampleTextureBilinear(const lfs::core::TextureImage& image,
-                                                      float u,
-                                                      float v) {
-            if (image.width <= 0 || image.height <= 0 || image.channels <= 0 || image.pixels.empty()) {
-                return glm::vec4(1.0f);
-            }
-
-            u -= std::floor(u);
-            v -= std::floor(v);
-
-            const float x = u * static_cast<float>(image.width - 1);
-            const float y = v * static_cast<float>(image.height - 1);
-            const int x0 = std::clamp(static_cast<int>(std::floor(x)), 0, image.width - 1);
-            const int y0 = std::clamp(static_cast<int>(std::floor(y)), 0, image.height - 1);
-            const int x1 = (x0 + 1) % image.width;
-            const int y1 = (y0 + 1) % image.height;
-            const float tx = x - static_cast<float>(x0);
-            const float ty = y - static_cast<float>(y0);
-
-            const glm::vec4 top = glm::mix(fetchTexel(image, x0, y0), fetchTexel(image, x1, y0), tx);
-            const glm::vec4 bottom = glm::mix(fetchTexel(image, x0, y1), fetchTexel(image, x1, y1), tx);
-            return glm::mix(top, bottom, ty);
-        }
-
-        [[nodiscard]] const lfs::core::Material& meshMaterialOrDefault(
-            const lfs::core::MeshData& mesh,
-            const size_t material_index) {
-            static const lfs::core::Material DEFAULT_MATERIAL{};
-            if (mesh.materials.empty()) {
-                return DEFAULT_MATERIAL;
-            }
-            return mesh.materials[std::min(material_index, mesh.materials.size() - 1)];
-        }
-
-        struct MeshCpuView {
-            Tensor vertices;
-            Tensor indices;
-            Tensor normals;
-            Tensor tangents;
-            Tensor texcoords;
-            Tensor colors;
-            const float* vertex_data = nullptr;
-            const int* index_data = nullptr;
-            const float* normal_data = nullptr;
-            const float* tangent_data = nullptr;
-            const float* texcoord_data = nullptr;
-            const float* color_data = nullptr;
-            size_t vertex_count = 0;
-            size_t face_count = 0;
-            bool has_normals = false;
-            bool has_tangents = false;
-            bool has_texcoords = false;
-            bool has_colors = false;
-        };
-
-        [[nodiscard]] bool prepareMeshCpuView(const lfs::core::MeshData& mesh,
-                                              MeshCpuView& out) {
-            if (!mesh.vertices.is_valid() || !mesh.indices.is_valid()) {
-                return false;
-            }
-
-            out = {};
-            out.vertices = mesh.vertices.cpu().contiguous();
-            out.indices = mesh.indices.cpu().contiguous();
-            if (out.vertices.dtype() != lfs::core::DataType::Float32 ||
-                out.indices.dtype() != lfs::core::DataType::Int32 ||
-                out.vertices.ndim() != 2 || out.vertices.size(1) != 3 ||
-                out.indices.ndim() != 2 || out.indices.size(1) != 3) {
-                return false;
-            }
-
-            out.vertex_count = static_cast<size_t>(out.vertices.size(0));
-            out.face_count = static_cast<size_t>(out.indices.size(0));
-            out.vertex_data = out.vertices.ptr<float>();
-            out.index_data = out.indices.ptr<int>();
-            if (!out.vertex_data || !out.index_data || out.vertex_count == 0 || out.face_count == 0) {
-                return false;
-            }
-
-            const auto prepare_float_attribute = [&](const Tensor& source,
-                                                     Tensor& destination,
-                                                     const int columns,
-                                                     const float*& ptr) {
-                if (!source.is_valid()) {
-                    return false;
-                }
-                destination = source.cpu().contiguous();
-                if (destination.dtype() != lfs::core::DataType::Float32 ||
-                    destination.ndim() != 2 ||
-                    destination.size(1) < columns ||
-                    static_cast<size_t>(destination.size(0)) < out.vertex_count) {
-                    destination = {};
-                    return false;
-                }
-                ptr = destination.ptr<float>();
-                return ptr != nullptr;
-            };
-
-            out.has_normals = prepare_float_attribute(mesh.normals, out.normals, 3, out.normal_data);
-            out.has_tangents = prepare_float_attribute(mesh.tangents, out.tangents, 4, out.tangent_data);
-            out.has_texcoords = prepare_float_attribute(mesh.texcoords, out.texcoords, 2, out.texcoord_data);
-            out.has_colors = prepare_float_attribute(mesh.colors, out.colors, 4, out.color_data);
-            return true;
-        }
-
-        [[nodiscard]] glm::vec3 meshVertexPosition(const MeshCpuView& mesh,
-                                                   const int index) {
-            const size_t base = static_cast<size_t>(index) * 3u;
-            return {mesh.vertex_data[base + 0], mesh.vertex_data[base + 1], mesh.vertex_data[base + 2]};
-        }
-
-        [[nodiscard]] glm::vec3 meshVertexNormal(const MeshCpuView& mesh,
-                                                 const int index,
-                                                 const glm::vec3& fallback) {
-            if (!mesh.has_normals) {
-                return fallback;
-            }
-            const size_t base = static_cast<size_t>(index) * 3u;
-            return safeNormalize({mesh.normal_data[base + 0],
-                                  mesh.normal_data[base + 1],
-                                  mesh.normal_data[base + 2]},
-                                 fallback);
-        }
-
-        [[nodiscard]] glm::vec4 meshVertexTangent(const MeshCpuView& mesh,
-                                                  const int index) {
-            if (!mesh.has_tangents) {
-                return glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
-            }
-            const size_t base = static_cast<size_t>(index) * 4u;
-            return {mesh.tangent_data[base + 0],
-                    mesh.tangent_data[base + 1],
-                    mesh.tangent_data[base + 2],
-                    mesh.tangent_data[base + 3]};
-        }
-
-        [[nodiscard]] glm::vec2 meshVertexTexcoord(const MeshCpuView& mesh,
-                                                   const int index) {
-            if (!mesh.has_texcoords) {
-                return glm::vec2(0.0f);
-            }
-            const size_t base = static_cast<size_t>(index) * 2u;
-            return {mesh.texcoord_data[base + 0], mesh.texcoord_data[base + 1]};
-        }
-
-        [[nodiscard]] glm::vec4 meshVertexColor(const MeshCpuView& mesh,
-                                                const int index) {
-            if (!mesh.has_colors) {
-                return glm::vec4(1.0f);
-            }
-            const size_t base = static_cast<size_t>(index) * 4u;
-            return {mesh.color_data[base + 0],
-                    mesh.color_data[base + 1],
-                    mesh.color_data[base + 2],
-                    mesh.color_data[base + 3]};
-        }
-
-        struct SubmeshDrawRange {
-            size_t start_index = 0;
-            size_t index_count = 0;
-            size_t material_index = 0;
-        };
-
-        [[nodiscard]] std::vector<SubmeshDrawRange> meshDrawRanges(const lfs::core::MeshData& mesh,
-                                                                   const size_t total_index_count) {
-            if (mesh.submeshes.empty()) {
-                return {{.start_index = 0, .index_count = total_index_count, .material_index = 0}};
-            }
-
-            std::vector<SubmeshDrawRange> ranges;
-            ranges.reserve(mesh.submeshes.size());
-            for (const auto& submesh : mesh.submeshes) {
-                if (submesh.start_index >= total_index_count) {
-                    continue;
-                }
-                const size_t end_index = std::min(submesh.start_index + submesh.index_count, total_index_count);
-                if (end_index <= submesh.start_index + 2u) {
-                    continue;
-                }
-                ranges.push_back({
-                    .start_index = submesh.start_index,
-                    .index_count = end_index - submesh.start_index,
-                    .material_index = submesh.material_index,
-                });
-            }
-            if (ranges.empty()) {
-                ranges.push_back({.start_index = 0, .index_count = total_index_count, .material_index = 0});
-            }
-            return ranges;
-        }
-
-        [[nodiscard]] float distributionGGX(const glm::vec3& normal,
-                                            const glm::vec3& half_vector,
-                                            const float roughness) {
-            const float a = roughness * roughness;
-            const float a2 = a * a;
-            const float ndoth = std::max(glm::dot(normal, half_vector), 0.0f);
-            const float ndoth2 = ndoth * ndoth;
-            const float denom = ndoth2 * (a2 - 1.0f) + 1.0f;
-            return a2 / (glm::pi<float>() * denom * denom + 1.0e-6f);
-        }
-
-        [[nodiscard]] float geometrySchlickGGX(const float ndotv,
-                                               const float roughness) {
-            const float r = roughness + 1.0f;
-            const float k = (r * r) / 8.0f;
-            return ndotv / (ndotv * (1.0f - k) + k + 1.0e-6f);
-        }
-
-        [[nodiscard]] float geometrySmith(const glm::vec3& normal,
-                                          const glm::vec3& view,
-                                          const glm::vec3& light,
-                                          const float roughness) {
-            return geometrySchlickGGX(std::max(glm::dot(normal, view), 0.0f), roughness) *
-                   geometrySchlickGGX(std::max(glm::dot(normal, light), 0.0f), roughness);
-        }
-
-        [[nodiscard]] glm::vec3 fresnelSchlick(const float cos_theta,
-                                               const glm::vec3& f0) {
-            return f0 + (glm::vec3(1.0f) - f0) *
-                            std::pow(std::clamp(1.0f - cos_theta, 0.0f, 1.0f), 5.0f);
-        }
-
-        void drawMeshLine(std::vector<float>& image,
-                          const int width,
-                          const int height,
-                          const glm::vec2& a,
-                          const glm::vec2& b,
-                          const glm::vec3& color,
-                          const float thickness) {
-            const glm::vec2 delta = b - a;
-            const int steps = std::max(1, static_cast<int>(std::ceil(glm::length(delta))));
-            const int radius = std::max(1, static_cast<int>(std::ceil(thickness * 0.5f)));
-            const size_t pixel_count = static_cast<size_t>(width) * height;
-            for (int i = 0; i <= steps; ++i) {
-                const float t = static_cast<float>(i) / static_cast<float>(steps);
-                const glm::vec2 p = glm::mix(a, b, t);
-                const int cx = static_cast<int>(std::lround(p.x));
-                const int cy = static_cast<int>(std::lround(p.y));
-                for (int yy = cy - radius; yy <= cy + radius; ++yy) {
-                    if (yy < 0 || yy >= height) {
-                        continue;
-                    }
-                    for (int xx = cx - radius; xx <= cx + radius; ++xx) {
-                        if (xx < 0 || xx >= width) {
-                            continue;
-                        }
-                        const size_t pixel = static_cast<size_t>(yy) * width + xx;
-                        image[pixel] = color.r;
-                        image[pixel_count + pixel] = color.g;
-                        image[2 * pixel_count + pixel] = color.b;
-                    }
-                }
-            }
-        }
-
-        struct SoftwareShadowMap {
-            bool active = false;
-            int size = 0;
-            glm::mat4 light_vp{1.0f};
-            std::vector<float> depth;
-        };
-
-        [[nodiscard]] glm::mat4 computeSoftwareLightVP(const MeshCpuView& mesh,
-                                                       const glm::mat4& model,
-                                                       const glm::vec3& light_dir) {
-            glm::vec3 aabb_min(std::numeric_limits<float>::max());
-            glm::vec3 aabb_max(std::numeric_limits<float>::lowest());
-            for (size_t i = 0; i < mesh.vertex_count; ++i) {
-                const glm::vec3 local = meshVertexPosition(mesh, static_cast<int>(i));
-                const glm::vec3 world = glm::vec3(model * glm::vec4(local, 1.0f));
-                aabb_min = glm::min(aabb_min, world);
-                aabb_max = glm::max(aabb_max, world);
-            }
-
-            const glm::vec3 center = (aabb_min + aabb_max) * 0.5f;
-            const float radius = std::max(glm::length(aabb_max - aabb_min) * 0.5f, 1.0e-3f);
-            const glm::vec3 dir = safeNormalize(light_dir, glm::vec3(0.3f, 1.0f, 0.5f));
-            const glm::vec3 eye = center + dir * radius * 2.0f;
-
-            glm::vec3 up(0.0f, 1.0f, 0.0f);
-            if (std::abs(glm::dot(dir, up)) > 0.99f) {
-                up = glm::vec3(0.0f, 0.0f, 1.0f);
-            }
-            return glm::ortho(-radius, radius, -radius, radius, 0.01f, radius * 4.0f) *
-                   glm::lookAt(eye, center, up);
-        }
-
-        [[nodiscard]] std::optional<glm::vec3> projectShadowPoint(const glm::mat4& light_vp,
-                                                                  const glm::vec3& world,
-                                                                  const int size) {
-            const glm::vec4 clip = light_vp * glm::vec4(world, 1.0f);
-            if (std::abs(clip.w) <= 1.0e-6f) {
-                return std::nullopt;
-            }
-            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-            if (!std::isfinite(ndc.x) || !std::isfinite(ndc.y) || !std::isfinite(ndc.z) ||
-                ndc.x < -1.0f || ndc.x > 1.0f ||
-                ndc.y < -1.0f || ndc.y > 1.0f ||
-                ndc.z < 0.0f || ndc.z > 1.0f) {
-                return std::nullopt;
-            }
-            return glm::vec3(
-                (ndc.x * 0.5f + 0.5f) * static_cast<float>(size - 1),
-                (ndc.y * 0.5f + 0.5f) * static_cast<float>(size - 1),
-                ndc.z);
-        }
-
-        void rasterizeShadowTriangle(SoftwareShadowMap& shadow,
-                                     const std::array<glm::vec3, 3>& screen) {
-            const glm::vec2 p0(screen[0]);
-            const glm::vec2 p1(screen[1]);
-            const glm::vec2 p2(screen[2]);
-            const float area = edgeFunction(p0, p1, p2);
-            if (std::abs(area) <= 1e-6f) {
-                return;
-            }
-
-            const int min_x = std::clamp(
-                static_cast<int>(std::floor(std::min({p0.x, p1.x, p2.x}))), 0, shadow.size - 1);
-            const int max_x = std::clamp(
-                static_cast<int>(std::ceil(std::max({p0.x, p1.x, p2.x}))), 0, shadow.size - 1);
-            const int min_y = std::clamp(
-                static_cast<int>(std::floor(std::min({p0.y, p1.y, p2.y}))), 0, shadow.size - 1);
-            const int max_y = std::clamp(
-                static_cast<int>(std::ceil(std::max({p0.y, p1.y, p2.y}))), 0, shadow.size - 1);
-
-            for (int y = min_y; y <= max_y; ++y) {
-                for (int x = min_x; x <= max_x; ++x) {
-                    const glm::vec2 p(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
-                    const float w0 = edgeFunction(p1, p2, p) / area;
-                    const float w1 = edgeFunction(p2, p0, p) / area;
-                    const float w2 = edgeFunction(p0, p1, p) / area;
-                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
-                        continue;
-                    }
-                    const float z = w0 * screen[0].z + w1 * screen[1].z + w2 * screen[2].z;
-                    const size_t pixel = static_cast<size_t>(y) * shadow.size + x;
-                    shadow.depth[pixel] = std::min(shadow.depth[pixel], z);
-                }
-            }
-        }
-
-        [[nodiscard]] SoftwareShadowMap buildSoftwareShadowMap(const MeshCpuView& mesh,
-                                                               const lfs::core::MeshData& source_mesh,
-                                                               const MeshFrameItem& item,
-                                                               const glm::vec3& light_dir) {
-            SoftwareShadowMap shadow;
-            if (!item.options.shadow_enabled) {
-                return shadow;
-            }
-
-            shadow.size = std::clamp(item.options.shadow_map_resolution, 64, 1024);
-            shadow.active = true;
-            shadow.light_vp = computeSoftwareLightVP(mesh, item.transform, light_dir);
-            shadow.depth.assign(static_cast<size_t>(shadow.size) * shadow.size, 1.0f);
-
-            const size_t total_index_count = mesh.face_count * 3u;
-            for (const auto& range : meshDrawRanges(source_mesh, total_index_count)) {
-                const size_t end = range.start_index + range.index_count;
-                for (size_t flat = range.start_index; flat + 2u < end; flat += 3u) {
-                    std::array<glm::vec3, 3> screen{};
-                    bool visible = true;
-                    for (int corner = 0; corner < 3; ++corner) {
-                        const int idx = mesh.index_data[flat + static_cast<size_t>(corner)];
-                        if (idx < 0 || static_cast<size_t>(idx) >= mesh.vertex_count) {
-                            visible = false;
-                            break;
-                        }
-                        const glm::vec3 local = meshVertexPosition(mesh, idx);
-                        const glm::vec3 world = glm::vec3(item.transform * glm::vec4(local, 1.0f));
-                        const auto projected = projectShadowPoint(shadow.light_vp, world, shadow.size);
-                        if (!projected) {
-                            visible = false;
-                            break;
-                        }
-                        screen[corner] = *projected;
-                    }
-                    if (visible) {
-                        rasterizeShadowTriangle(shadow, screen);
-                    }
-                }
-            }
-            return shadow;
-        }
-
-        [[nodiscard]] float sampleShadow(const SoftwareShadowMap& shadow,
-                                         const glm::vec3& world_position,
-                                         const float bias = 0.0025f) {
-            if (!shadow.active || shadow.size <= 0 || shadow.depth.empty()) {
-                return 1.0f;
-            }
-
-            const glm::vec4 clip = shadow.light_vp * glm::vec4(world_position, 1.0f);
-            if (std::abs(clip.w) <= 1.0e-6f) {
-                return 1.0f;
-            }
-            glm::vec3 proj = glm::vec3(clip) / clip.w;
-            proj = proj * 0.5f + 0.5f;
-            if (proj.z < 0.0f || proj.z > 1.0f ||
-                proj.x < 0.0f || proj.x > 1.0f ||
-                proj.y < 0.0f || proj.y > 1.0f) {
-                return 1.0f;
-            }
-
-            const float sx = proj.x * static_cast<float>(shadow.size - 1);
-            const float sy = proj.y * static_cast<float>(shadow.size - 1);
-            const int ix = static_cast<int>(std::round(sx));
-            const int iy = static_cast<int>(std::round(sy));
-            float lit = 0.0f;
-            int samples = 0;
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const int x = ix + dx;
-                    const int y = iy + dy;
-                    if (x < 0 || y < 0 || x >= shadow.size || y >= shadow.size) {
-                        lit += 1.0f;
-                    } else {
-                        const float depth = shadow.depth[static_cast<size_t>(y) * shadow.size + x];
-                        lit += (proj.z - bias <= depth) ? 1.0f : 0.0f;
-                    }
-                    ++samples;
-                }
-            }
-            return samples > 0 ? lit / static_cast<float>(samples) : 1.0f;
-        }
-
-        [[nodiscard]] glm::vec3 shadeMeshPixel(const lfs::core::MeshData& mesh,
-                                               const size_t material_index,
-                                               const MeshRenderOptions& options,
-                                               const glm::vec3& world_position,
-                                               glm::vec3 normal,
-                                               const glm::vec3& tangent,
-                                               const float tangent_handedness,
-                                               const glm::vec2& texcoord,
-                                               const glm::vec4& vertex_color,
-                                               const glm::vec3& camera_position,
-                                               const glm::vec3& light_dir,
-                                               const SoftwareShadowMap& shadow_map) {
-            const auto& material = meshMaterialOrDefault(mesh, material_index);
-
-            glm::vec4 albedo = material.base_color;
-            if (mesh.has_texcoords() &&
-                material.has_albedo_texture() &&
-                material.albedo_tex > 0 &&
-                material.albedo_tex <= mesh.texture_images.size()) {
-                const auto sample = sampleTextureBilinear(mesh.texture_images[material.albedo_tex - 1u],
-                                                          texcoord.x, texcoord.y);
-                albedo *= glm::vec4(srgbToLinear(glm::vec3(sample)), sample.a);
-            }
-            albedo *= vertex_color;
-
-            float metallic = material.metallic;
-            float roughness = material.roughness;
-            float ao = material.ao;
-            if (mesh.has_texcoords() &&
-                material.has_metallic_roughness_texture() &&
-                material.metallic_roughness_tex > 0 &&
-                material.metallic_roughness_tex <= mesh.texture_images.size()) {
-                const glm::vec3 orm = glm::vec3(sampleTextureBilinear(
-                    mesh.texture_images[material.metallic_roughness_tex - 1u],
-                    texcoord.x, texcoord.y));
-                ao *= orm.r;
-                roughness *= orm.g;
-                metallic *= orm.b;
-            }
-            roughness = std::max(roughness, 0.04f);
-
-            normal = safeNormalize(normal, glm::vec3(0.0f, 1.0f, 0.0f));
-            if (mesh.has_texcoords() &&
-                material.has_normal_texture() &&
-                material.normal_tex > 0 &&
-                material.normal_tex <= mesh.texture_images.size()) {
-                const glm::vec3 normal_sample = glm::vec3(sampleTextureBilinear(
-                                                    mesh.texture_images[material.normal_tex - 1u],
-                                                    texcoord.x, texcoord.y)) *
-                                                    2.0f -
-                                                glm::vec3(1.0f);
-                const glm::vec3 t = safeNormalize(tangent, glm::vec3(1.0f, 0.0f, 0.0f));
-                const glm::vec3 b = safeNormalize(glm::cross(normal, t) * tangent_handedness,
-                                                  glm::vec3(0.0f, 1.0f, 0.0f));
-                normal = safeNormalize(glm::mat3(t, b, normal) * normal_sample, normal);
-            }
-
-            const glm::vec3 view_dir = safeNormalize(camera_position - world_position, glm::vec3(0.0f, 0.0f, 1.0f));
-            const glm::vec3 light = safeNormalize(light_dir, glm::vec3(0.3f, 1.0f, 0.5f));
-            const glm::vec3 half_vector = safeNormalize(view_dir + light, normal);
-            const float ndotl = std::max(glm::dot(normal, light), 0.0f);
-            const float shadow = sampleShadow(shadow_map, world_position);
-
-            const glm::vec3 albedo_rgb = glm::clamp(glm::vec3(albedo), glm::vec3(0.0f), glm::vec3(1.0f));
-            const glm::vec3 f0 = glm::mix(glm::vec3(0.04f), albedo_rgb, std::clamp(metallic, 0.0f, 1.0f));
-            const float ndf = distributionGGX(normal, half_vector, roughness);
-            const float geom = geometrySmith(normal, view_dir, light, roughness);
-            const glm::vec3 fresnel = fresnelSchlick(std::max(glm::dot(half_vector, view_dir), 0.0f), f0);
-            const glm::vec3 kd = (glm::vec3(1.0f) - fresnel) * (1.0f - std::clamp(metallic, 0.0f, 1.0f));
-            const glm::vec3 diffuse = kd * albedo_rgb / glm::pi<float>();
-            const glm::vec3 specular =
-                (ndf * geom * fresnel) /
-                std::max(4.0f * std::max(glm::dot(normal, view_dir), 0.0f) * ndotl, 1.0e-4f);
-
-            glm::vec3 color =
-                (diffuse + specular) * ndotl * options.light_intensity * shadow +
-                albedo_rgb * options.ambient * ao +
-                material.emissive;
-            color = color / (color + glm::vec3(1.0f));
-            color = glm::pow(glm::clamp(color, glm::vec3(0.0f), glm::vec3(1.0f)), glm::vec3(1.0f / 2.2f));
-
-            if (options.dim_non_emphasized && !options.is_emphasized) {
-                const float gray = glm::dot(color, glm::vec3(0.2126f, 0.7152f, 0.0722f));
-                color = glm::mix(color, glm::vec3(gray), 0.6f);
-            }
-            if (options.is_emphasized && options.flash_intensity > 0.0f) {
-                color = glm::mix(color, glm::vec3(1.0f, 0.95f, 0.6f),
-                                 std::clamp(options.flash_intensity, 0.0f, 1.0f) * 0.5f);
-            }
-            return glm::clamp(color, glm::vec3(0.0f), glm::vec3(1.0f));
-        }
-
-        void rasterizeMeshTriangle(std::vector<float>& image,
-                                   std::vector<float>& depth,
-                                   const int width,
-                                   const int height,
-                                   const lfs::core::MeshData& mesh,
-                                   const size_t material_index,
-                                   const MeshRenderOptions& options,
-                                   const std::array<glm::vec3, 3>& screen,
-                                   const std::array<glm::vec3, 3>& world,
-                                   const std::array<glm::vec3, 3>& normals,
-                                   const std::array<glm::vec3, 3>& tangents,
-                                   const std::array<float, 3>& tangent_handedness,
-                                   const std::array<glm::vec2, 3>& texcoords,
-                                   const std::array<glm::vec4, 3>& colors,
-                                   const glm::vec3& camera_position,
-                                   const glm::vec3& light_dir,
-                                   const SoftwareShadowMap& shadow_map) {
-            const glm::vec2 p0(screen[0]);
-            const glm::vec2 p1(screen[1]);
-            const glm::vec2 p2(screen[2]);
-            const float area = edgeFunction(p0, p1, p2);
-            if (std::abs(area) <= 1e-6f) {
-                return;
-            }
-
-            const int min_x = std::clamp(
-                static_cast<int>(std::floor(std::min({p0.x, p1.x, p2.x}))), 0, width - 1);
-            const int max_x = std::clamp(
-                static_cast<int>(std::ceil(std::max({p0.x, p1.x, p2.x}))), 0, width - 1);
-            const int min_y = std::clamp(
-                static_cast<int>(std::floor(std::min({p0.y, p1.y, p2.y}))), 0, height - 1);
-            const int max_y = std::clamp(
-                static_cast<int>(std::ceil(std::max({p0.y, p1.y, p2.y}))), 0, height - 1);
-            const size_t pixel_count = static_cast<size_t>(width) * height;
-
-            for (int y = min_y; y <= max_y; ++y) {
-                for (int x = min_x; x <= max_x; ++x) {
-                    const glm::vec2 p(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
-                    const float w0 = edgeFunction(p1, p2, p) / area;
-                    const float w1 = edgeFunction(p2, p0, p) / area;
-                    const float w2 = edgeFunction(p0, p1, p) / area;
-                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
-                        continue;
-                    }
-                    const float z = w0 * screen[0].z + w1 * screen[1].z + w2 * screen[2].z;
-                    const size_t pixel = static_cast<size_t>(y) * width + x;
-                    if (z >= depth[pixel]) {
-                        continue;
-                    }
-                    const glm::vec3 world_position = w0 * world[0] + w1 * world[1] + w2 * world[2];
-                    const glm::vec3 normal = safeNormalize(w0 * normals[0] + w1 * normals[1] + w2 * normals[2],
-                                                           glm::normalize(glm::cross(world[1] - world[0],
-                                                                                     world[2] - world[0])));
-                    const glm::vec3 tangent = safeNormalize(w0 * tangents[0] + w1 * tangents[1] + w2 * tangents[2],
-                                                            glm::vec3(1.0f, 0.0f, 0.0f));
-                    const float handedness = w0 * tangent_handedness[0] +
-                                             w1 * tangent_handedness[1] +
-                                             w2 * tangent_handedness[2];
-                    const glm::vec2 uv = w0 * texcoords[0] + w1 * texcoords[1] + w2 * texcoords[2];
-                    const glm::vec4 vertex_color = w0 * colors[0] + w1 * colors[1] + w2 * colors[2];
-                    const glm::vec3 color = shadeMeshPixel(mesh, material_index, options,
-                                                           world_position, normal, tangent,
-                                                           handedness >= 0.0f ? 1.0f : -1.0f,
-                                                           uv, vertex_color, camera_position,
-                                                           light_dir, shadow_map);
-                    depth[pixel] = z;
-                    image[pixel] = color.r;
-                    image[pixel_count + pixel] = color.g;
-                    image[2 * pixel_count + pixel] = color.b;
-                }
-            }
-        }
-
-        Result<Tensor> renderSoftwareVideoComposite(
+        Result<Tensor> composeVideoFrame(
             const std::shared_ptr<lfs::core::Tensor>& primary_image,
             const FrameMetadata* primary_metadata,
             const VideoCompositeFrameRequest& request) {
@@ -1795,101 +699,40 @@ namespace lfs::rendering {
                 }
             }
 
-            const glm::mat4 view = request.viewport.getViewMatrix();
-            const glm::mat4 projection = request.viewport.getProjectionMatrix();
-            const glm::vec3 camera_position = request.viewport.translation;
-
-            for (const auto& item : request.meshes) {
-                if (!item.mesh) {
-                    continue;
+            if (request.prerendered_meshes != nullptr) {
+                const auto& mesh_layer = *request.prerendered_meshes;
+                if (!mesh_layer.rgba.is_valid() || !mesh_layer.view_depth.is_valid()) {
+                    return std::unexpected("Pre-rendered mesh layer is invalid");
                 }
-                MeshCpuView mesh;
-                if (!prepareMeshCpuView(*item.mesh, mesh)) {
-                    continue;
+                Tensor mesh_rgba = mesh_layer.rgba.cpu().contiguous();
+                Tensor mesh_depth = mesh_layer.view_depth.cpu().contiguous();
+                if (mesh_rgba.dtype() != lfs::core::DataType::Float32 ||
+                    mesh_rgba.ndim() != 3 || mesh_rgba.size(0) != 4u ||
+                    mesh_rgba.size(1) != static_cast<size_t>(height) ||
+                    mesh_rgba.size(2) != static_cast<size_t>(width) ||
+                    mesh_depth.dtype() != lfs::core::DataType::Float32 ||
+                    mesh_depth.ndim() != 2 ||
+                    mesh_depth.size(0) != static_cast<size_t>(height) ||
+                    mesh_depth.size(1) != static_cast<size_t>(width)) {
+                    return std::unexpected("Pre-rendered mesh layer dimensions must match the composite frame");
                 }
 
-                const glm::vec3 light_dir = safeNormalize(item.options.light_dir, glm::vec3(0.3f, 1.0f, 0.5f));
-                const glm::mat3 normal_matrix = glm::transpose(glm::inverse(glm::mat3(item.transform)));
-                const auto draw_ranges = meshDrawRanges(*item.mesh, mesh.face_count * 3u);
-                const SoftwareShadowMap shadow_map = buildSoftwareShadowMap(mesh, *item.mesh, item, light_dir);
-
-                for (const auto& range : draw_ranges) {
-                    const auto& material = meshMaterialOrDefault(*item.mesh, range.material_index);
-                    const bool cull_backfaces = item.options.backface_culling && !material.double_sided;
-                    const size_t end = range.start_index + range.index_count;
-                    for (size_t flat = range.start_index; flat + 2u < end; flat += 3u) {
-                        std::array<int, 3> vertex_indices{};
-                        bool valid_indices = true;
-                        for (int corner = 0; corner < 3; ++corner) {
-                            const int idx = mesh.index_data[flat + static_cast<size_t>(corner)];
-                            if (idx < 0 || static_cast<size_t>(idx) >= mesh.vertex_count) {
-                                valid_indices = false;
-                                break;
-                            }
-                            vertex_indices[corner] = idx;
-                        }
-                        if (!valid_indices) {
-                            continue;
-                        }
-
-                        std::array<glm::vec3, 3> world{};
-                        std::array<glm::vec3, 3> screen{};
-                        std::array<glm::vec3, 3> normals{};
-                        std::array<glm::vec3, 3> tangents{};
-                        std::array<float, 3> tangent_handedness{};
-                        std::array<glm::vec2, 3> texcoords{};
-                        std::array<glm::vec4, 3> colors{};
-
-                        const glm::vec3 local0 = meshVertexPosition(mesh, vertex_indices[0]);
-                        const glm::vec3 local1 = meshVertexPosition(mesh, vertex_indices[1]);
-                        const glm::vec3 local2 = meshVertexPosition(mesh, vertex_indices[2]);
-                        const glm::vec3 face_normal_local =
-                            safeNormalize(glm::cross(local1 - local0, local2 - local0), glm::vec3(0.0f, 1.0f, 0.0f));
-                        const glm::vec3 face_normal_world =
-                            safeNormalize(normal_matrix * face_normal_local, glm::vec3(0.0f, 1.0f, 0.0f));
-
-                        bool visible = true;
-                        for (int corner = 0; corner < 3; ++corner) {
-                            const int idx = vertex_indices[corner];
-                            const glm::vec3 local = meshVertexPosition(mesh, idx);
-                            world[corner] = glm::vec3(item.transform * glm::vec4(local, 1.0f));
-                            const auto projected = projectMeshPoint(world[corner], request.viewport, view, projection);
-                            if (!projected) {
-                                visible = false;
-                                break;
-                            }
-                            screen[corner] = *projected;
-                            normals[corner] = safeNormalize(normal_matrix * meshVertexNormal(mesh, idx, face_normal_local),
-                                                            face_normal_world);
-                            const glm::vec4 tangent = meshVertexTangent(mesh, idx);
-                            tangents[corner] = safeNormalize(glm::mat3(item.transform) * glm::vec3(tangent),
-                                                             glm::vec3(1.0f, 0.0f, 0.0f));
-                            tangent_handedness[corner] = tangent.w >= 0.0f ? 1.0f : -1.0f;
-                            texcoords[corner] = meshVertexTexcoord(mesh, idx);
-                            colors[corner] = meshVertexColor(mesh, idx);
-                        }
-                        if (!visible) {
-                            continue;
-                        }
-
-                        const glm::vec3 normal = safeNormalize(glm::cross(world[1] - world[0], world[2] - world[0]),
-                                                               face_normal_world);
-                        const glm::vec3 triangle_center = (world[0] + world[1] + world[2]) / 3.0f;
-                        if (cull_backfaces && glm::dot(normal, camera_position - triangle_center) <= 0.0f) {
-                            continue;
-                        }
-                        rasterizeMeshTriangle(image, depth, width, height, *item.mesh, range.material_index,
-                                              item.options, screen, world, normals, tangents,
-                                              tangent_handedness, texcoords, colors, camera_position,
-                                              light_dir, shadow_map);
-
-                        if (item.options.wireframe_overlay) {
-                            drawMeshLine(image, width, height, screen[0], screen[1], item.options.wireframe_color, item.options.wireframe_width);
-                            drawMeshLine(image, width, height, screen[1], screen[2], item.options.wireframe_color, item.options.wireframe_width);
-                            drawMeshLine(image, width, height, screen[2], screen[0], item.options.wireframe_color, item.options.wireframe_width);
-                        }
+                const float* rgba = mesh_rgba.ptr<float>();
+                const float* view_depth = mesh_depth.ptr<float>();
+                for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+                    if (rgba[3u * pixel_count + pixel] > 0.0f &&
+                        view_depth[pixel] < depth[pixel]) {
+                        image[pixel] = rgba[pixel];
+                        image[pixel_count + pixel] = rgba[pixel_count + pixel];
+                        image[2u * pixel_count + pixel] = rgba[2u * pixel_count + pixel];
+                        depth[pixel] = view_depth[pixel];
                     }
                 }
+                return Tensor::from_vector(
+                           image,
+                           {static_cast<size_t>(3), static_cast<size_t>(height), static_cast<size_t>(width)},
+                           lfs::core::Device::CPU)
+                    .cuda();
             }
 
             return Tensor::from_vector(
@@ -1900,164 +743,23 @@ namespace lfs::rendering {
         }
     } // namespace
 
-    class RasterOnlyRenderingEngine final : public RenderingEngine {
+    class UtilityRenderingEngine final : public RenderingEngine {
     public:
-        ~RasterOnlyRenderingEngine() override {
+        ~UtilityRenderingEngine() override {
             shutdown();
         }
 
         Result<void> initialize() override {
-            return initializeRasterOnly();
-        }
-
-        Result<void> initializeRasterOnly() override {
-            if (!background_.is_valid()) {
-                background_ = Tensor::zeros({3}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-            }
-            raster_initialized_ = true;
+            initialized_ = true;
             return {};
         }
 
         void shutdown() override {
-            raster_initialized_ = false;
-            if (hovered_depth_id_device_) {
-                cudaFree(hovered_depth_id_device_);
-                hovered_depth_id_device_ = nullptr;
-            }
-            if (hovered_depth_id_host_) {
-                cudaFreeHost(hovered_depth_id_host_);
-                hovered_depth_id_host_ = nullptr;
-            }
+            initialized_ = false;
         }
 
         bool isInitialized() const override {
-            return raster_initialized_;
-        }
-
-        bool isRasterInitialized() const override {
-            return raster_initialized_;
-        }
-
-        Result<GaussianGpuFrameResult> renderGaussiansGpuFrame(
-            const lfs::core::SplatData& splat_data,
-            const ViewportRenderRequest& request) override {
-            auto image_result = renderGaussiansImage(splat_data, request);
-            if (!image_result || !image_result->image) {
-                return std::unexpected(image_result ? "Gaussian GPU-frame render returned no image"
-                                                    : image_result.error());
-            }
-
-            return GaussianGpuFrameResult{
-                .frame = cacheTensorFrame(image_result->image, image_result->metadata, request.frame_view.size),
-                .metadata = std::move(image_result->metadata)};
-        }
-
-        Result<GaussianImageResult> renderGaussiansImage(
-            const lfs::core::SplatData& splat_data,
-            const ViewportRenderRequest& request) override {
-            auto result = renderRaster(
-                splat_data,
-                GaussianRasterRequest{
-                    .frame_view = request.frame_view,
-                    .scaling_modifier = request.scaling_modifier,
-                    .antialiasing = request.antialiasing,
-                    .mip_filter = request.mip_filter,
-                    .sh_degree = request.sh_degree,
-                    .raster_backend = request.raster_backend,
-                    .gut = request.gut,
-                    .equirectangular = request.equirectangular,
-                    .scene = request.scene,
-                    .filters = request.filters,
-                    .overlay = request.overlay,
-                    .transparent_background = request.transparent_background});
-            if (!result) {
-                return std::unexpected(result.error());
-            }
-
-            return GaussianImageResult{
-                .image = std::make_shared<Tensor>(std::move(result->image)),
-                .metadata = makeFrameMetadata(*result)};
-        }
-
-        Result<DualGaussianImageResult> renderGaussiansImagePair(
-            const lfs::core::SplatData& splat_data,
-            const std::array<ViewportRenderRequest, 2>& requests) override {
-            DualGaussianImageResult pair_result;
-            for (size_t i = 0; i < pair_result.size(); ++i) {
-                auto single = renderGaussiansImage(splat_data, requests[i]);
-                if (!single) {
-                    return std::unexpected(single.error());
-                }
-                pair_result[i] = std::move(*single);
-            }
-            return pair_result;
-        }
-
-        Result<std::optional<int>> queryHoveredGaussianId(
-            const lfs::core::SplatData& splat_data,
-            const HoveredGaussianQueryRequest& request) override {
-            if (!ensureHoveredDepthQueryBuffersAllocated()) {
-                return std::unexpected("Failed to allocate hovered-depth query buffers");
-            }
-
-            constexpr auto NO_HOVERED_RESULT = std::numeric_limits<unsigned long long>::max();
-            if (cudaMemset(hovered_depth_id_device_, 0xFF, sizeof(unsigned long long)) != cudaSuccess) {
-                return std::unexpected("Failed to reset hovered-depth query buffer");
-            }
-
-            auto render_result = renderRaster(
-                splat_data,
-                GaussianRasterRequest{
-                    .frame_view = request.frame_view,
-                    .scaling_modifier = request.scaling_modifier,
-                    .mip_filter = request.mip_filter,
-                    .sh_degree = request.sh_degree,
-                    .raster_backend = request.raster_backend,
-                    .gut = request.gut,
-                    .equirectangular = request.equirectangular,
-                    .scene = request.scene,
-                    .filters = request.filters,
-                    .overlay =
-                        GaussianOverlayState{
-                            .cursor =
-                                {.enabled = true,
-                                 .cursor = request.cursor}},
-                    .hovered_depth_id = hovered_depth_id_device_});
-            if (!render_result) {
-                return std::unexpected(render_result.error());
-            }
-
-            if (cudaMemcpy(hovered_depth_id_host_, hovered_depth_id_device_,
-                           sizeof(unsigned long long), cudaMemcpyDeviceToHost) != cudaSuccess) {
-                return std::unexpected("Failed to read back hovered-depth query result");
-            }
-
-            const unsigned long long packed = *hovered_depth_id_host_;
-            if (packed == NO_HOVERED_RESULT) {
-                return std::optional<int>{};
-            }
-            return std::optional<int>{static_cast<int>(packed & 0xFFFFFFFFu)};
-        }
-
-        Result<std::shared_ptr<lfs::core::Tensor>> renderGaussianScreenPositions(
-            const lfs::core::SplatData& splat_data,
-            const ScreenPositionRenderRequest& request) override {
-            Tensor screen_positions;
-            auto render_result = renderRaster(
-                splat_data,
-                GaussianRasterRequest{
-                    .frame_view = request.frame_view,
-                    .sh_degree = 0,
-                    .equirectangular = request.equirectangular,
-                    .scene = request.scene,
-                    .screen_positions_out = &screen_positions});
-            if (!render_result) {
-                return std::unexpected(render_result.error());
-            }
-            if (!screen_positions.is_valid()) {
-                return std::unexpected("Screen-position render returned no screen positions");
-            }
-            return std::make_shared<Tensor>(std::move(screen_positions));
+            return initialized_;
         }
 
         Result<GpuFrame> renderPointCloudGpuFrame(
@@ -2082,7 +784,11 @@ namespace lfs::rendering {
                 return std::unexpected(std::format("Failed to derive point colors from SH data: {}", e.what()));
             }
 
-            auto result = renderSoftwarePointCloud(splat_data.get_means(), colors, request);
+            auto result = renderSoftwarePointCloud(
+                splat_data.get_means(),
+                colors,
+                request,
+                splat_data.has_deleted_mask() ? &splat_data.deleted() : nullptr);
             if (!result) {
                 return std::unexpected(result.error());
             }
@@ -2095,7 +801,7 @@ namespace lfs::rendering {
         Result<PointCloudImageResult> renderPointCloudImage(
             const lfs::core::PointCloud& point_cloud,
             const PointCloudRenderRequest& request) override {
-            auto result = renderSoftwarePointCloud(point_cloud.means, point_cloud.colors, request);
+            auto result = renderSoftwarePointCloud(point_cloud.means, point_cloud.colors, request, nullptr);
             if (!result) {
                 return std::unexpected(result.error());
             }
@@ -2149,7 +855,7 @@ namespace lfs::rendering {
                 }
             }
 
-            auto composite = renderSoftwareVideoComposite(primary_image, primary_metadata, request);
+            auto composite = composeVideoFrame(primary_image, primary_metadata, request);
             if (!composite) {
                 return std::unexpected(composite.error());
             }
@@ -2238,7 +944,9 @@ namespace lfs::rendering {
                 }
             }
 
-            return best_uid;
+            if (best_score < HIT_RADIUS_PIXELS)
+                return best_uid;
+            return -1;
         }
 
         ScreenOverlayRenderer* getScreenOverlayRenderer() override {
@@ -2256,206 +964,17 @@ namespace lfs::rendering {
                 cached_tensor_frame_id_ = next_tensor_frame_id_++;
             }
 
-            TextureHandle depth_handle{};
-            if (metadata.primaryDepth() && metadata.primaryDepth()->is_valid()) {
-                depth_handle = {
-                    .id = cached_tensor_frame_id_,
-                    .size = viewport_size,
-                    .texcoord_scale = metadata.depth_texcoord_scale};
-            }
-
             return GpuFrame{
                 .color =
                     {.id = cached_tensor_frame_id_,
                      .size = viewport_size,
                      .texcoord_scale = glm::vec2(1.0f)},
-                .depth = depth_handle,
-                .flip_y = metadata.flip_y,
-                .depth_is_ndc = metadata.depth_is_ndc,
-                .color_has_alpha = metadata.color_has_alpha,
                 .near_plane = metadata.near_plane,
                 .far_plane = metadata.far_plane,
                 .orthographic = metadata.orthographic};
         }
 
-        Result<RasterImageResult> renderRaster(
-            const lfs::core::SplatData& splat_data,
-            GaussianRasterRequest request) {
-            if (!isRasterInitialized()) {
-                return std::unexpected("Rendering raster pipeline is not initialized");
-            }
-            if (request.frame_view.size.x <= 0 || request.frame_view.size.y <= 0 ||
-                request.frame_view.size.x > MAX_VIEWPORT_SIZE ||
-                request.frame_view.size.y > MAX_VIEWPORT_SIZE) {
-                return std::unexpected("Invalid viewport dimensions");
-            }
-
-            if (background_.is_valid()) {
-                if (auto* bg_data = background_.ptr<float>();
-                    bg_data && background_.device() == lfs::core::Device::CUDA) {
-                    const float bg_values[3] = {
-                        request.frame_view.background_color.r,
-                        request.frame_view.background_color.g,
-                        request.frame_view.background_color.b};
-                    cudaMemcpy(bg_data, bg_values, sizeof(bg_values), cudaMemcpyHostToDevice);
-                }
-            }
-
-            auto camera = createRasterCamera(request.frame_view, request.gut, request.equirectangular);
-            if (!camera) {
-                return std::unexpected(camera.error());
-            }
-
-            const size_t gaussian_count = static_cast<size_t>(splat_data.size());
-            const int effective_sh_degree = std::clamp(request.sh_degree, 0, splat_data.get_max_sh_degree());
-
-            auto model_transforms_tensor =
-                makeModelTransformsTensor(request.scene.model_transforms ? *request.scene.model_transforms
-                                                                         : std::vector<glm::mat4>{});
-
-            std::unique_ptr<Tensor> transform_indices_cuda;
-            Tensor* transform_indices_ptr = cudaTensorPointer(request.scene.transform_indices, transform_indices_cuda);
-            if (!tensorMatchesGaussianCount(transform_indices_ptr, gaussian_count)) {
-                LOG_WARN("Ignoring transform_indices with stale size: model has {}, tensor has {}",
-                         gaussian_count, transform_indices_ptr->numel());
-                transform_indices_ptr = nullptr;
-                transform_indices_cuda.reset();
-            }
-
-            std::unique_ptr<Tensor> selection_mask_cuda;
-            Tensor* selection_mask_ptr = cudaTensorPointer(request.overlay.emphasis.mask, selection_mask_cuda);
-            if (!tensorMatchesGaussianCount(selection_mask_ptr, gaussian_count)) {
-                LOG_WARN("Ignoring selection_mask with stale size: model has {}, tensor has {}",
-                         gaussian_count, selection_mask_ptr->numel());
-                selection_mask_ptr = nullptr;
-                selection_mask_cuda.reset();
-            }
-
-            Tensor* preview_selection_ptr = request.overlay.emphasis.transient_mask.mask;
-            if (preview_selection_ptr && !preview_selection_ptr->is_valid()) {
-                preview_selection_ptr = nullptr;
-            }
-            if (!tensorMatchesGaussianCount(preview_selection_ptr, gaussian_count)) {
-                LOG_WARN("Ignoring preview_selection_tensor with stale size: model has {}, tensor has {}",
-                         gaussian_count, preview_selection_ptr->numel());
-                preview_selection_ptr = nullptr;
-            }
-
-            GaussianRasterResources resources;
-            applyCropBoxToRaster(request, resources);
-            applyEllipsoidToRaster(request, resources);
-            applyViewVolumeToRaster(request, resources);
-
-            try {
-                if (request.gut ||
-                    isGutBackend(request.raster_backend) ||
-                    request.equirectangular) {
-                    const auto camera_model = request.equirectangular
-                                                  ? GutCameraModel::EQUIRECTANGULAR
-                                                  : GutCameraModel::PINHOLE;
-                    auto render_output = gut_rasterize_tensor(
-                        *camera,
-                        splat_data,
-                        background_,
-                        effective_sh_degree,
-                        request.scaling_modifier,
-                        camera_model,
-                        model_transforms_tensor.get(),
-                        transform_indices_ptr,
-                        request.scene.node_visibility_mask,
-                        request.transparent_background);
-                    return RasterImageResult{
-                        .image = std::move(render_output.image),
-                        .depth = std::move(render_output.depth),
-                        .valid = true,
-                        .flip_y = true,
-                        .far_plane = request.frame_view.far_plane,
-                        .orthographic = request.frame_view.orthographic,
-                        .color_has_alpha = request.transparent_background};
-                }
-
-                auto [image, depth] = rasterize_tensor(
-                    *camera,
-                    splat_data,
-                    background_,
-                    effective_sh_degree,
-                    request.overlay.markers.show_rings,
-                    request.overlay.markers.ring_width,
-                    model_transforms_tensor.get(),
-                    transform_indices_ptr,
-                    selection_mask_ptr,
-                    request.screen_positions_out,
-                    request.overlay.cursor.enabled,
-                    request.overlay.cursor.cursor.x,
-                    request.overlay.cursor.cursor.y,
-                    request.overlay.cursor.radius,
-                    request.overlay.emphasis.transient_mask.additive,
-                    preview_selection_ptr,
-                    request.overlay.cursor.saturation_preview,
-                    request.overlay.cursor.saturation_amount,
-                    request.overlay.markers.show_center_markers,
-                    resources.crop_box_transform_tensor.is_valid() ? &resources.crop_box_transform_tensor : nullptr,
-                    resources.crop_box_min_tensor.is_valid() ? &resources.crop_box_min_tensor : nullptr,
-                    resources.crop_box_max_tensor.is_valid() ? &resources.crop_box_max_tensor : nullptr,
-                    request.filters.crop_region ? request.filters.crop_region->inverse : false,
-                    request.filters.crop_region ? request.filters.crop_region->desaturate : false,
-                    request.filters.crop_region ? request.filters.crop_region->parent_node_index : -1,
-                    resources.ellipsoid_transform_tensor.is_valid() ? &resources.ellipsoid_transform_tensor : nullptr,
-                    resources.ellipsoid_radii_tensor.is_valid() ? &resources.ellipsoid_radii_tensor : nullptr,
-                    request.filters.ellipsoid_region ? request.filters.ellipsoid_region->inverse : false,
-                    request.filters.ellipsoid_region ? request.filters.ellipsoid_region->desaturate : false,
-                    request.filters.ellipsoid_region ? request.filters.ellipsoid_region->parent_node_index : -1,
-                    resources.view_volume_transform_tensor.is_valid() ? &resources.view_volume_transform_tensor : nullptr,
-                    resources.view_volume_min_tensor.is_valid() ? &resources.view_volume_min_tensor : nullptr,
-                    resources.view_volume_max_tensor.is_valid() ? &resources.view_volume_max_tensor : nullptr,
-                    request.filters.cull_outside_view_volume,
-                    nullptr,
-                    request.hovered_depth_id,
-                    request.overlay.emphasis.focused_gaussian_id,
-                    request.frame_view.far_plane,
-                    request.overlay.emphasis.emphasized_node_mask,
-                    request.overlay.emphasis.dim_non_emphasized,
-                    request.scene.node_visibility_mask,
-                    request.overlay.emphasis.flash_intensity,
-                    request.frame_view.orthographic,
-                    request.frame_view.ortho_scale,
-                    request.mip_filter,
-                    request.transparent_background);
-
-                return RasterImageResult{
-                    .image = std::move(image),
-                    .depth = std::move(depth),
-                    .valid = true,
-                    .far_plane = request.frame_view.far_plane,
-                    .orthographic = request.frame_view.orthographic,
-                    .color_has_alpha = request.transparent_background};
-            } catch (const std::exception& e) {
-                return std::unexpected(std::format("Rasterization failed: {}", e.what()));
-            }
-        }
-
-        [[nodiscard]] bool ensureHoveredDepthQueryBuffersAllocated() {
-            if (!hovered_depth_id_device_ &&
-                cudaMalloc(&hovered_depth_id_device_, sizeof(unsigned long long)) != cudaSuccess) {
-                hovered_depth_id_device_ = nullptr;
-                return false;
-            }
-            if (!hovered_depth_id_host_ &&
-                cudaMallocHost(&hovered_depth_id_host_, sizeof(unsigned long long)) != cudaSuccess) {
-                if (hovered_depth_id_device_) {
-                    cudaFree(hovered_depth_id_device_);
-                    hovered_depth_id_device_ = nullptr;
-                }
-                hovered_depth_id_host_ = nullptr;
-                return false;
-            }
-            return true;
-        }
-
-        Tensor background_;
-        bool raster_initialized_ = false;
-        unsigned long long* hovered_depth_id_device_ = nullptr;
-        unsigned long long* hovered_depth_id_host_ = nullptr;
+        bool initialized_ = false;
         unsigned int next_tensor_frame_id_ = 1;
         unsigned int cached_tensor_frame_id_ = 0;
         std::shared_ptr<lfs::core::Tensor> cached_tensor_frame_image_;
@@ -2464,13 +983,8 @@ namespace lfs::rendering {
     };
 
     std::unique_ptr<RenderingEngine> RenderingEngine::create() {
-        LOG_DEBUG("Creating default raster-only RenderingEngine instance");
-        return createRasterOnly();
-    }
-
-    std::unique_ptr<RenderingEngine> RenderingEngine::createRasterOnly() {
-        LOG_DEBUG("Creating raster-only RenderingEngine instance");
-        return std::make_unique<RasterOnlyRenderingEngine>();
+        LOG_DEBUG("Creating utility RenderingEngine instance");
+        return std::make_unique<UtilityRenderingEngine>();
     }
 
 } // namespace lfs::rendering

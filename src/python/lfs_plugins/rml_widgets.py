@@ -19,7 +19,87 @@ Usage in Panel.on_mount():
 """
 
 from dataclasses import dataclass
+import math
 from typing import Any, Callable
+
+
+def clamp_unit_channel(value):
+    try:
+        channel = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(channel):
+        return 0.0
+    return max(0.0, min(1.0, channel))
+
+
+def color_channel_byte(color, index):
+    try:
+        value = color[index]
+    except (IndexError, TypeError):
+        value = 0.0
+    return max(
+        0,
+        min(255, int(round(clamp_unit_channel(value) * 255.0))),
+    )
+
+
+def color_channel_text(color, index):
+    return str(color_channel_byte(color, index))
+
+
+def color_to_hex(color):
+    return (
+        f"#{color_channel_byte(color, 0):02x}"
+        f"{color_channel_byte(color, 1):02x}"
+        f"{color_channel_byte(color, 2):02x}"
+    )
+
+
+def hex_to_color(value):
+    text = str(value or "").strip().lstrip("#")
+    if len(text) != 6:
+        return None
+    try:
+        return (
+            int(text[0:2], 16) / 255.0,
+            int(text[2:4], 16) / 255.0,
+            int(text[4:6], 16) / 255.0,
+        )
+    except ValueError:
+        return None
+
+
+def parse_color_channel(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if ":" in text:
+        text = text.split(":", 1)[1].strip()
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    if "." in text and 0.0 <= parsed <= 1.0:
+        parsed *= 255.0
+    byte_value = max(0, min(255, int(round(parsed))))
+    return byte_value / 255.0
+
+
+def normalize_color(color):
+    channels = []
+    for index in range(3):
+        try:
+            channels.append(clamp_unit_channel(color[index]))
+        except (IndexError, TypeError):
+            channels.append(0.0)
+    return tuple(channels)
+
+
+def color_component_label(prefix, color, index):
+    return f"{prefix}:{color_channel_byte(color, index):>3d}"
 
 
 def find_ancestor_with_attribute(element, attribute, stop=None):
@@ -49,6 +129,48 @@ def bind_select_all_on_focus(element):
 
     element.set_attribute("data-select-all-bound", "1")
     element.add_event_listener("focus", lambda _event, el=element: _select_all_text(el))
+    return element
+
+
+def bind_committed_text_input(
+    element,
+    key,
+    *,
+    escape_revert=None,
+    capture=None,
+    restore=None,
+    commit=None,
+    on_focus=None,
+    on_blur=None,
+):
+    """Bind common panel-style text input behavior to a retained input element."""
+    if element is None:
+        return None
+
+    bind_select_all_on_focus(element)
+
+    if escape_revert is not None and capture is not None and restore is not None:
+        escape_revert.bind(element, key, capture, restore)
+
+    if on_focus is not None:
+        element.add_event_listener("focus", lambda _event, k=str(key): on_focus(k))
+
+    if commit is not None:
+        def _commit_on_linebreak(event, k=str(key)):
+            if not event.get_bool_parameter("linebreak", False):
+                return
+            commit(k)
+
+        def _commit_on_blur(_event, k=str(key)):
+            commit(k)
+            if on_blur is not None:
+                on_blur(k)
+
+        element.add_event_listener("change", _commit_on_linebreak)
+        element.add_event_listener("blur", _commit_on_blur)
+    elif on_blur is not None:
+        element.add_event_listener("blur", lambda _event, k=str(key): on_blur(k))
+
     return element
 
 
@@ -471,3 +593,12 @@ def icon_button(container, id, icon_src, selected=False,
         btn.set_attribute("title", tooltip)
 
     return btn
+
+
+def request_model_update(handle):
+    """Schedule a dirty-policy panel update without dirtying every model variable."""
+    request_update = getattr(handle, "request_update", None)
+    if callable(request_update):
+        request_update()
+    else:
+        handle.dirty_all()

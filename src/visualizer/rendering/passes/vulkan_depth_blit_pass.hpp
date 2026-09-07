@@ -4,12 +4,11 @@
 
 #pragma once
 
-#include "config.h"
+#include "core/tensor_fwd.hpp"
 
-#ifdef LFS_VULKAN_VIEWER_ENABLED
-#include "core/tensor.hpp"
-
+#include <cstddef>
 #include <cstdint>
+#include <glm/glm.hpp>
 #include <memory>
 #include <vulkan/vulkan.h>
 
@@ -23,10 +22,13 @@ namespace lfs::vis {
         bool flip_y = false;
         float near_plane = 0.1f;
         float far_plane = 1000.0f;
-        // When set, the pass binds this VkImageView (a CUDA/Vulkan interop slot owned
-        // by gui_manager) and skips the staging upload path.
+        // When set, the pass binds this VkImageView (a CUDA/Vulkan interop depth view
+        // published by the viewport interop path) and skips the staging upload path.
         VkImageView external_image_view = VK_NULL_HANDLE;
         std::uint64_t external_image_generation = 0;
+        // Valid-region UV for padded depth images (default identity).
+        glm::vec2 uv_scale{1.0f, 1.0f};
+        glm::vec2 uv_clamp_max{1.0f, 1.0f};
     };
 
     // Writes a sampled depth value into the framebuffer's depth attachment via
@@ -43,11 +45,16 @@ namespace lfs::vis {
 
         [[nodiscard]] bool init(VulkanContext& context, VkFormat color_format,
                                 VkFormat depth_format, VkBuffer screen_quad_buffer);
-        void prepare(const VulkanDepthBlitParams& params);
-        void record(VkCommandBuffer cb, VkRect2D rect, const VulkanDepthBlitParams& params);
+        void prepare(const VulkanDepthBlitParams& params, std::size_t frame_slot);
+        void record(VkCommandBuffer cb, VkRect2D rect, const VulkanDepthBlitParams& params,
+                    std::size_t frame_slot);
         void shutdown();
 
-        [[nodiscard]] bool hasDepth() const;
+        [[nodiscard]] bool hasDepth(std::size_t frame_slot) const;
+
+        // Bound after prepare(). Lets other passes sample the splat depth
+        // surface without re-uploading it.
+        [[nodiscard]] VkImageView depthView(std::size_t frame_slot) const;
 
     private:
         struct Impl;
@@ -55,4 +62,3 @@ namespace lfs::vis {
     };
 
 } // namespace lfs::vis
-#endif

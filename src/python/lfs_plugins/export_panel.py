@@ -3,6 +3,7 @@
 """Export panel for exporting scene nodes."""
 
 import html
+from pathlib import Path
 from typing import Set
 from enum import IntEnum
 
@@ -10,14 +11,8 @@ import lichtfeld as lf
 from . import rml_widgets
 from .scrub_fields import ScrubFieldController, ScrubFieldSpec
 from .types import Panel
-
-# Asset Manager integration (optional)
-try:
-    from .asset_manager_integration import register_catalog_asset_path
-
-    ASSET_MANAGER_AVAILABLE = True
-except ImportError:
-    ASSET_MANAGER_AVAILABLE = False
+from .panels import panel_class
+from .ui import RuntimeState, native_value as _native_store_value
 
 __lfs_panel_classes__ = ["ExportPanel"]
 __lfs_panel_ids__ = ["lfs.export"]
@@ -31,6 +26,7 @@ class ExportFormat(IntEnum):
     USD = 4
     NUREC_USDZ = 5
     RAD = 6
+    COLMAP = 7
 
 
 FORMAT_INFO = (
@@ -41,6 +37,7 @@ FORMAT_INFO = (
     (ExportFormat.USD, "export.format.usd_openusd"),
     (ExportFormat.NUREC_USDZ, "export.format.usdz_nurec"),
     (ExportFormat.HTML_VIEWER, "export.format.html_viewer"),
+    (ExportFormat.COLMAP, "export.format.colmap_sparse"),
 )
 
 EXPORT_PROGRESS_FORMAT_NAMES = {
@@ -51,6 +48,7 @@ EXPORT_PROGRESS_FORMAT_NAMES = {
     ExportFormat.USD: "USD",
     ExportFormat.NUREC_USDZ: "USDZ",
     ExportFormat.RAD: "RAD",
+    ExportFormat.COLMAP: "COLMAP",
 }
 
 SCRUB_FIELD_DEFS = {
@@ -66,15 +64,8 @@ def _progress_format_name(fmt):
     return EXPORT_PROGRESS_FORMAT_NAMES.get(fmt, "file")
 
 
+@panel_class("export")
 class ExportPanel(Panel):
-    id = "lfs.export"
-    label = "Export"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 10
-    template = "rmlui/export_panel.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
-    size = (320, 0)
-    update_interval_ms = 100
 
     def __init__(self):
         self._format = ExportFormat.PLY
@@ -82,9 +73,12 @@ class ExportPanel(Panel):
         self._max_export_sh_degree = 3
         self._export_sh_degree = 3
         self._pinned_sh_degree = True
+        self._spz_version = 4  # SPZ container: 4 (zstd) or 3 (legacy gzip)
         self._selection_seeded = False
         self._handle = None
         self._last_node_key = None
+        self._last_colmap_key = None
+        self._last_colmap_source_path = ""
         self._last_lang = ""
         self._exporting = False
         self._last_progress = -1.0
@@ -98,13 +92,10 @@ class ExportPanel(Panel):
         )
         # RAD export settings
         self._rad_flip_y = False  # Y-flip checkbox (off by default)
-        self._rad_customize_lod = False
-        self._rad_lod_list: list[int] = [100]  # Default to 100%
-        self._rad_new_lod_str = "100"
-        self._rad_lod_collapsed = True  # Whether LOD levels section is collapsed
+        self._rad_streamable = True
+        self._include_provenance = True
         self._doc = None  # Document reference for DOM access
-        self._last_export_path = None  # Track last export path for Asset Manager
-        self._last_export_format = None  # Track last export format for Asset Manager
+        self._reactive_unsubscribers = []
 
     # ── Data model ────────────────────────────────────────────
 
@@ -116,13 +107,22 @@ class ExportPanel(Panel):
         model.bind_func("panel_label", lambda: lf.ui.tr("export.export"))
         model.bind_func("export_label", self._get_export_label)
         model.bind_func("show_no_models", lambda: not self._has_models)
-        model.bind_func("can_export", lambda: bool(self._selected_nodes))
+        model.bind_func("show_model_selection", lambda: self._format != ExportFormat.COLMAP)
+        model.bind_func("show_sh_degree", lambda: self._format != ExportFormat.COLMAP)
+        model.bind_func("show_spz_version", lambda: self._format == ExportFormat.SPZ)
+        model.bind_func("export_error_text", self._get_export_error_text)
+        model.bind_func("can_export", self._can_export)
         model.bind_func("progress_value", lambda: self._progress_value)
 
         model.bind(
             "sh_degree",
             lambda: str(self._export_sh_degree),
             self._set_sh_degree,
+        )
+        model.bind(
+            "spz_version",
+            lambda: str(self._spz_version),
+            self._set_spz_version,
         )
 
         model.bind_func("show_form", lambda: not self._exporting)
@@ -134,20 +134,15 @@ class ExportPanel(Panel):
         # RAD export settings bindings
         model.bind_func("show_rad_settings", lambda: self._format == ExportFormat.RAD)
         model.bind_func("rad_flip_y", lambda: self._rad_flip_y)
-        model.bind_event("toggle_rad_flip_y", self._on_toggle_rad_flip_y)
-        model.bind_func("rad_customize_lod", lambda: self._rad_customize_lod)
-        model.bind_record_list("rad_lod_list")  # Record list for editable values
         model.bind(
-            "rad_new_lod_str",
-            lambda: self._rad_new_lod_str,
-            self._set_rad_new_lod_str,
+            "rad_export_mode",
+            lambda: "stream" if self._rad_streamable else "non_stream",
+            self._set_rad_export_mode,
         )
-        model.bind_event("toggle_rad_customize_lod", self._on_toggle_rad_customize_lod)
-        model.bind_event("add_rad_lod", self._on_add_rad_lod)
-        model.bind_event("remove_rad_lod", self._on_remove_rad_lod)
-        model.bind_event("num_step_rad_lod", self._on_num_step_rad_lod)
-        model.bind_event("update_lod_value", self._on_update_lod_value)
-        model.bind_event("toggle_section", self._on_toggle_section)
+        model.bind_event("toggle_rad_flip_y", self._on_toggle_rad_flip_y)
+        model.bind_func("include_provenance", lambda: self._include_provenance)
+        model.bind_func("show_include_provenance", self._show_include_provenance)
+        model.bind_event("toggle_include_provenance", self._on_toggle_include_provenance)
 
         model.bind_event("do_cancel", self._on_cancel)
         model.bind_event("do_cancel_export", self._on_cancel_export)
@@ -212,146 +207,37 @@ class ExportPanel(Panel):
             self._export_sh_degree = new_value
             self._dirty_model("sh_degree")
 
-    def _set_rad_new_lod_str(self, v):
-        self._rad_new_lod_str = v if v else ""
-
-    def _update_rad_lod_list(self):
-        """Update the RAD LOD record list in the data model."""
-        if self._handle:
-            self._handle.update_record_list(
-                "rad_lod_list", [{"value": str(lod)} for lod in self._rad_lod_list]
-            )
-
     def _on_toggle_rad_flip_y(self, _handle, _ev, _args):
         self._rad_flip_y = not self._rad_flip_y
         self._dirty_model("rad_flip_y")
 
-    def _on_toggle_rad_customize_lod(self, _handle, _ev, _args):
-        self._rad_customize_lod = not self._rad_customize_lod
-        self._update_rad_lod_list()
-        self._dirty_model("rad_customize_lod")
+    def _show_include_provenance(self):
+        if self._format == ExportFormat.COLMAP:
+            return False
+        if self._format == ExportFormat.SPZ and self._spz_version == 3:
+            return False
+        return True
 
-    def _on_toggle_section(self, _handle, _event, args):
-        """Toggle collapsible section visibility."""
-        if not args:
+    def _on_toggle_include_provenance(self, _handle, _ev, _args):
+        self._include_provenance = not self._include_provenance
+        self._dirty_model("include_provenance")
+
+    def _set_rad_export_mode(self, value):
+        streamable = str(value) != "non_stream"
+        if streamable == self._rad_streamable:
             return
-        section = str(args[0])
-        if section != "rad_lod":
-            return
+        self._rad_streamable = streamable
+        self._dirty_model("rad_export_mode")
 
-        if not self._doc:
-            return
-
-        # Find the arrow and content elements
-        arrow = self._doc.get_element_by_id("arrow-rad-lod")
-        content = self._doc.get_element_by_id("sec-rad-lod")
-        header = self._doc.get_element_by_id("hdr-rad-lod")
-
-        if content is None:
-            return
-
-        # Toggle the collapsed state
-        expanding = self._rad_lod_collapsed
-        self._rad_lod_collapsed = not expanding
-
-        # Animate the section toggle
-        rml_widgets.animate_section_toggle(
-            content, expanding, arrow, header_element=header
-        )
-
-    def _sync_rad_lod_section_state(self):
-        """Initialize the RAD LOD section visual state."""
-        if not self._doc:
-            return
-        header = self._doc.get_element_by_id("hdr-rad-lod")
-        arrow = self._doc.get_element_by_id("arrow-rad-lod")
-        content = self._doc.get_element_by_id("sec-rad-lod")
-        if content:
-            rml_widgets.sync_section_state(
-                content, not self._rad_lod_collapsed, header, arrow
-            )
-
-    def _on_add_rad_lod(self, _handle, _ev, _args):
+    def _set_spz_version(self, value):
         try:
-            value = int(self._rad_new_lod_str)
+            version = int(float(value))
         except (ValueError, TypeError):
             return
-        # Clamp to 1-100 range
-        value = max(1, min(100, value))
-        # Avoid duplicates
-        if value not in self._rad_lod_list:
-            self._rad_lod_list.append(value)
-            self._rad_lod_list.sort()
-            self._update_rad_lod_list()
-
-    def _on_remove_rad_lod(self, _handle, _ev, args):
-        try:
-            index = int(args[0]) if args else -1
-        except (ValueError, TypeError):
+        if version not in (3, 4) or version == self._spz_version:
             return
-        if 0 <= index < len(self._rad_lod_list):
-            self._rad_lod_list.pop(index)
-            # Ensure at least one LOD remains (default to 100 if empty)
-            if not self._rad_lod_list:
-                self._rad_lod_list = [100]
-            self._update_rad_lod_list()
-
-    def _on_update_lod_value(self, _handle, event, _args):
-        """Update a specific LOD value when edited."""
-        # Get the index from the parent row element
-        target = event.current_target()
-        if target is None:
-            return
-
-        # Find the parent row element with data-lod-index
-        parent = target.parent_node()
-        if parent is None:
-            return
-
-        try:
-            index = int(parent.get_attribute("data-lod-index", "-1"))
-        except (ValueError, TypeError):
-            return
-
-        if index < 0 or index >= len(self._rad_lod_list):
-            return
-
-        # Get the new value from the input
-        try:
-            new_value_str = target.get_attribute("value", "")
-            new_value = int(new_value_str)
-        except (ValueError, TypeError):
-            return
-
-        # Clamp to 1-100 range (values outside this range are not allowed)
-        original_value = self._rad_lod_list[index]
-        clamped_value = max(1, min(100, new_value))
-
-        # Check for duplicates (excluding the current index)
-        if (
-            clamped_value in self._rad_lod_list
-            and self._rad_lod_list.index(clamped_value) != index
-        ):
-            # Duplicate found - revert to original value
-            self._update_rad_lod_list()
-            return
-
-        self._rad_lod_list[index] = clamped_value
-        self._rad_lod_list.sort()
-        self._update_rad_lod_list()
-
-    def _on_num_step_rad_lod(self, _handle, _ev, args):
-        try:
-            delta = int(args[0]) if args else 0
-        except (ValueError, TypeError):
-            return
-        try:
-            current = int(self._rad_new_lod_str)
-        except (ValueError, TypeError):
-            current = 100
-        new_value = max(1, min(100, current + delta))
-        self._rad_new_lod_str = str(new_value)
-        self._dirty_model("rad_new_lod_str")
+        self._spz_version = version
+        self._dirty_model("spz_version", "show_include_provenance")
 
     def _get_scrub_value(self, prop):
         del prop
@@ -371,6 +257,7 @@ class ExportPanel(Panel):
         self._cached_export_state = {}
         self._selection_seeded = False
         self._last_node_key = None
+        self._last_colmap_source_path = ""
         self._last_lang = lf.ui.get_current_language()
 
         export_form = doc.get_element_by_id("export-form")
@@ -396,9 +283,36 @@ class ExportPanel(Panel):
 
         self._rebuild_format_records()
         self._rebuild_model_records(self._get_splat_nodes())
-        self._update_rad_lod_list()
-        self._sync_rad_lod_section_state()
         self._scrub_fields.mount(doc)
+        self._subscribe_reactive_state()
+
+    def _subscribe_reactive_state(self):
+        if self._reactive_unsubscribers:
+            return
+
+        self._reactive_unsubscribers = [
+            RuntimeState.scene_generation.subscribe(lambda _value: self._request_scene_update()),
+            RuntimeState.export_progress_state.subscribe(lambda _value: self._request_reactive_update()),
+            RuntimeState.language_generation.subscribe(lambda _value: self._request_reactive_update()),
+        ]
+
+    def _unsubscribe_reactive_state(self):
+        for unsubscribe in self._reactive_unsubscribers:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+        self._reactive_unsubscribers = []
+
+    def _request_scene_update(self):
+        self._last_node_key = None
+        self._last_colmap_key = None
+        self._last_colmap_source_path = ""
+        self._request_reactive_update()
+
+    def _request_reactive_update(self):
+        if self._handle:
+            rml_widgets.request_model_update(self._handle)
 
     def on_update(self, doc):
         if self._exporting:
@@ -424,16 +338,28 @@ class ExportPanel(Panel):
 
         nodes = self._get_splat_nodes()
         node_key = tuple((n.name, n.gaussian_count) for n in nodes)
+        colmap_source_path = self._get_colmap_sparse_path_raw()
+
+        if colmap_source_path != self._last_colmap_source_path:
+            self._last_colmap_source_path = colmap_source_path
+            self._dirty_model("can_export", "export_error_text")
+            dirty = True
 
         if self._sync_selection(nodes):
             self._rebuild_model_records(nodes)
-            self._dirty_model("export_label", "can_export")
+            self._dirty_model("export_label", "can_export", "export_error_text")
             dirty = True
 
         if node_key != self._last_node_key:
             self._last_node_key = node_key
             self._rebuild_model_records(nodes)
-            self._dirty_model("show_no_models", "can_export")
+            self._dirty_model("show_no_models", "can_export", "export_error_text")
+            dirty = True
+
+        colmap_key = (self._format, self._can_export_colmap())
+        if colmap_key != self._last_colmap_key:
+            self._last_colmap_key = colmap_key
+            self._dirty_model("can_export", "export_error_text")
             dirty = True
 
         dirty |= self._scrub_fields.sync_all()
@@ -441,8 +367,11 @@ class ExportPanel(Panel):
 
     def on_scene_changed(self, doc):
         self._last_node_key = None
+        self._last_colmap_key = None
+        self._last_colmap_source_path = ""
 
     def on_unmount(self, doc):
+        self._unsubscribe_reactive_state()
         doc.remove_data_model("export")
         self._handle = None
         self._doc = None
@@ -461,9 +390,71 @@ class ExportPanel(Panel):
 
     def _get_export_label(self):
         tr = lf.ui.tr
+        if self._format == ExportFormat.COLMAP:
+            return tr("export.export")
         if len(self._selected_nodes) > 1:
             return tr("export_dialog.export_merged")
         return tr("export.export")
+
+    def _get_colmap_sparse_path_raw(self):
+        try:
+            return lf.get_colmap_sparse_source_path() or ""
+        except Exception:
+            return ""
+
+    def _get_colmap_export_extension(self):
+        source_path = self._get_colmap_sparse_path_raw()
+        if not source_path:
+            return "txt"
+
+        path = Path(source_path)
+        try:
+            has_binary_metadata = (path / "cameras.bin").exists() and (path / "images.bin").exists()
+        except OSError:
+            has_binary_metadata = False
+        return "bin" if has_binary_metadata else "txt"
+
+    def _get_colmap_suggested_export_path_raw(self):
+        source_path = self._get_colmap_sparse_path_raw()
+        if not source_path:
+            return ""
+
+        path = Path(source_path)
+        if path.parent.name == "sparse":
+            return str(path.parent)
+        return source_path
+
+    def _colmap_sparse_data_exists(self, folder):
+        path = Path(folder)
+        for file_name in (
+            "cameras.bin",
+            "images.bin",
+            "points3D.bin",
+            "cameras.txt",
+            "images.txt",
+            "points3D.txt",
+        ):
+            if (path / file_name).exists():
+                return True
+        return False
+
+    def _get_export_error_text(self):
+        tr = lf.ui.tr
+        if self._format != ExportFormat.COLMAP:
+            return tr("export.select_at_least_one")
+
+        try:
+            if lf.ui.get_content_type() != "dataset":
+                return tr("export_dialog.colmap_requires_dataset")
+            if not self._get_colmap_sparse_path_raw():
+                return tr("export_dialog.colmap_no_sparse")
+            scene = lf.get_scene()
+            if scene is None or int(getattr(scene, "active_camera_count", 0)) <= 0:
+                return tr("export_dialog.colmap_no_cameras")
+        except Exception:
+            return tr("export_dialog.colmap_unavailable")
+
+        return ""
 
     def _sync_selection(self, nodes):
         node_names = {node.name for node in nodes}
@@ -479,7 +470,7 @@ class ExportPanel(Panel):
             self._selected_nodes = node_names
             self._pinned_sh_degree = True
             self._selection_seeded = True
-            self._dirty_model("sh_degree")
+            self._refresh_sh_degree_bounds(nodes)
             return True
 
         selected_nodes = self._selected_nodes & node_names
@@ -566,9 +557,19 @@ class ExportPanel(Panel):
 
         self._format = new_format
         self._rebuild_format_records()
-        # Dirty RAD settings visibility when format changes
+        # Dirty format-dependent settings visibility when format changes
         self._dirty_model(
-            "show_rad_settings", "rad_flip_y", "rad_customize_lod", "no_rad_lod"
+            "show_rad_settings",
+            "show_model_selection",
+            "show_sh_degree",
+            "show_spz_version",
+            "show_include_provenance",
+            "export_error_text",
+            "rad_flip_y",
+            "rad_export_mode",
+            "spz_version",
+            "can_export",
+            "export_label",
         )
 
     def _on_model_toggle(self, ev):
@@ -582,26 +583,26 @@ class ExportPanel(Panel):
             self._selected_nodes.discard(node_name)
 
         self._rebuild_model_records(self._get_splat_nodes())
-        self._dirty_model("can_export", "export_label")
+        self._dirty_model("can_export", "export_label", "export_error_text")
 
     def _on_select_all(self, _ev):
         nodes = self._get_splat_nodes()
         self._selected_nodes = {node.name for node in nodes}
         self._rebuild_model_records(nodes)
-        self._dirty_model("can_export", "export_label")
+        self._dirty_model("can_export", "export_label", "export_error_text")
 
     def _on_select_none(self, _ev):
         self._selected_nodes.clear()
         self._rebuild_model_records(self._get_splat_nodes())
-        self._dirty_model("can_export", "export_label")
+        self._dirty_model("can_export", "export_label", "export_error_text")
 
     def _on_export(self, _handle, _ev, _args):
-        if not self._selected_nodes:
+        if not self._can_export():
             return
         self._do_export()
 
     def _on_export_submit(self, ev):
-        if self._selected_nodes:
+        if self._can_export():
             self._do_export()
         ev.stop_propagation()
 
@@ -629,6 +630,25 @@ class ExportPanel(Panel):
             pass
         return nodes
 
+    def _can_export_colmap(self):
+        try:
+            if lf.ui.get_content_type() != "dataset":
+                return False
+            scene = lf.get_scene()
+            source_path = self._get_colmap_sparse_path_raw()
+            return (
+                bool(source_path)
+                and scene is not None
+                and int(getattr(scene, "active_camera_count", 0)) > 0
+            )
+        except Exception:
+            return False
+
+    def _can_export(self):
+        if self._format == ExportFormat.COLMAP:
+            return self._can_export_colmap()
+        return bool(self._selected_nodes)
+
     def _get_selected_node_names(self):
         selected = []
         for node in self._get_splat_nodes():
@@ -651,43 +671,75 @@ class ExportPanel(Panel):
             return lf.ui.save_html_file_dialog(default_name)
         if self._format == ExportFormat.RAD:
             return lf.ui.save_rad_file_dialog(default_name)
+        if self._format == ExportFormat.COLMAP:
+            try:
+                default_path = self._get_colmap_suggested_export_path_raw()
+                return lf.ui.select_colmap_sparse_folder_dialog(default_path)
+            except Exception:
+                return ""
         return None
 
+    def _confirm_colmap_overwrite(self, path, selected_nodes):
+        tr = lf.ui.tr
+        from .localization import safe_format
+
+        written_files = safe_format(
+            tr("export_dialog.colmap_writes_sparse"),
+            self._get_colmap_export_extension(),
+        )
+        message = (
+            f"{tr('runtime.colmap_overwrite_message')}\n"
+            f"{path}\n\n"
+            f"{written_files}."
+        )
+        overwrite_label = tr("export.overwrite")
+
+        def on_result(button_label):
+            if button_label == overwrite_label:
+                self._start_export(path, selected_nodes)
+
+        lf.ui.confirm_dialog(
+            tr("export.format.colmap_sparse"),
+            message,
+            [overwrite_label, tr("common.cancel")],
+            on_result,
+        )
+
     def _do_export(self):
-        selected_nodes = self._get_selected_node_names()
-        if not selected_nodes:
-            self._dirty_model("can_export")
+        if not self._can_export():
+            self._dirty_model("can_export", "export_error_text")
             return
 
-        default_name = selected_nodes[0]
+        selected_nodes = [] if self._format == ExportFormat.COLMAP else self._get_selected_node_names()
+        if self._format == ExportFormat.COLMAP:
+            default_name = "colmap_sparse"
+        else:
+            default_name = selected_nodes[0]
+            try:
+                iteration = lf.trainer_current_iteration()
+                if iteration > 0:
+                    default_name = f"{default_name}_{iteration}"
+            except Exception:
+                pass
         path = self._get_save_path(default_name)
 
         if path:
-            # Store export info for Asset Manager registration
-            self._last_export_path = path
-            self._last_export_format = self._format
+            if self._format == ExportFormat.COLMAP:
+                if self._colmap_sparse_data_exists(path):
+                    self._confirm_colmap_overwrite(path, selected_nodes)
+                    return
 
-            # Prepare RAD LOD settings if applicable
-            rad_lod_ratios = None
-            if self._format == ExportFormat.RAD and self._rad_customize_lod:
-                # Convert percentages to ratios (e.g., 100 -> 1.0, 50 -> 0.5)
-                rad_lod_ratios = [lod / 100.0 for lod in self._rad_lod_list]
+            self._start_export(path, selected_nodes)
 
-            lf.export_scene(
-                int(self._format),
-                path,
-                selected_nodes,
-                self._export_sh_degree,
-                rad_lod_ratios=rad_lod_ratios,
-                rad_flip_y=self._rad_flip_y,
-            )
+    def _start_export(self, path, selected_nodes):
+        if path:
             self._exporting = True
             self._last_progress = -1.0
             self._progress_value = "0"
             self._cached_export_state = {
                 "active": True,
                 "progress": 0.0,
-                "stage": "Starting",
+                "stage": lf.ui.tr("runtime.task_starting"),
                 "format": _progress_format_name(self._format),
             }
             self._dirty_model(
@@ -698,6 +750,20 @@ class ExportPanel(Panel):
                 "progress_stage",
                 "progress_value",
             )
+
+            try:
+                lf.export_scene(
+                    int(self._format),
+                    path,
+                    selected_nodes,
+                    self._export_sh_degree,
+                    rad_flip_y=self._rad_flip_y,
+                    rad_streamable=self._rad_streamable,
+                    spz_version=self._spz_version,
+                    include_provenance=self._include_provenance,
+                )
+            finally:
+                self._request_reactive_update()
 
     # ── Progress helpers ─────────────────────────────────────
 
@@ -711,76 +777,55 @@ class ExportPanel(Panel):
     def _get_progress_stage(self):
         return self._cached_export_state.get("stage", "")
 
+    def _export_state(self):
+        state = _native_store_value("export_progress_state", None)
+        if isinstance(state, dict):
+            return dict(state)
+        return lf.ui.get_export_state()
+
     def _update_export_progress(self):
-        state = lf.ui.get_export_state()
+        state = self._export_state()
         previous_format = self._cached_export_state.get("format")
         previous_stage = self._cached_export_state.get("stage")
         self._cached_export_state = state
         if not state.get("active", False):
             self._exporting = False
             self._selection_seeded = False
-            # Register export with Asset Manager if successful
-            if self._last_export_path and self._last_export_format is not None:
-                self._register_export(self._last_export_path, self._last_export_format)
-                self._last_export_path = None
-                self._last_export_format = None
+            self._last_progress = -1.0
+            self._progress_value = "0"
+            self._dirty_model(
+                "show_form",
+                "show_progress",
+                "progress_value",
+                "progress_title",
+                "progress_pct",
+                "progress_stage",
+            )
             lf.ui.set_panel_enabled("lfs.export", False)
             return True
 
         progress = state.get("progress", 0.0)
         current_format = state.get("format", "file")
         current_stage = state.get("stage", "")
+        was_exporting = self._exporting
+        self._exporting = True
+        self._request_reactive_update()
         if (
             progress != self._last_progress
             or current_format != previous_format
             or current_stage != previous_stage
+            or not was_exporting
         ):
             self._last_progress = progress
             self._progress_value = str(progress)
-            self._dirty_model("progress_value", "progress_title", "progress_pct", "progress_stage")
+            self._dirty_model(
+                "show_form",
+                "show_progress",
+                "progress_value",
+                "progress_title",
+                "progress_pct",
+                "progress_stage",
+            )
             return True
 
         return False
-
-    def _format_to_asset_type(self, fmt: ExportFormat) -> str:
-        """Map ExportFormat to asset type string for Asset Manager."""
-        mapping = {
-            ExportFormat.PLY: "ply",
-            ExportFormat.SOG: "sog",
-            ExportFormat.SPZ: "spz",
-            ExportFormat.RAD: "rad",
-            ExportFormat.USD: "usd",
-            ExportFormat.NUREC_USDZ: "usdz",
-            ExportFormat.HTML_VIEWER: "html",
-        }
-        return mapping.get(fmt, "unknown")
-
-    def _register_export(self, path: str, fmt: ExportFormat):
-        """Register exported file with Asset Manager catalog.
-
-        Called after successful export to add/update the asset in the catalog
-        and refresh the Asset Manager UI if open.
-
-        Args:
-            path: Output file path
-            fmt: Export format used
-        """
-        if not ASSET_MANAGER_AVAILABLE:
-            return
-
-        try:
-            # Determine asset type from format
-            asset_type = self._format_to_asset_type(fmt)
-
-            role = "trained_output" if lf.trainer_current_iteration() > 0 else "export"
-            register_catalog_asset_path(
-                path,
-                asset_type=asset_type,
-                role=role,
-                select=True,
-            )
-
-        except Exception:
-            # Asset Manager integration is non-intrusive
-            # Log error but don't fail the export
-            pass

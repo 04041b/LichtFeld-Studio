@@ -248,6 +248,17 @@ TEST(UndistortPinhole, StrongPincushionDistortion) {
     run_image_undistort(params);
 }
 
+TEST(UndistortDiagnostics, ReportsCropSolveFailure) {
+    const auto params = compute_undistort_params(
+        TEST_FX, TEST_FY, TEST_CX, TEST_CY, 0, 0,
+        Tensor::from_vector({0.1f, -0.02f, 0.003f, -0.0004f}, {4}, Device::CPU),
+        Tensor(), CameraModelType::FISHEYE);
+
+    EXPECT_TRUE(params.crop_solve_failed);
+    EXPECT_EQ(params.dst_width, 0);
+    EXPECT_EQ(params.dst_height, 0);
+}
+
 // ====================== Fisheye model tests ======================
 
 TEST(UndistortFisheye, SimpleRadialFisheye) {
@@ -478,7 +489,7 @@ protected:
 
         auto result = lfs::io::read_colmap_cameras_and_images(base_path_, "images_4");
         ASSERT_TRUE(result.has_value()) << "Failed to load COLMAP data";
-        auto& [cams, center] = *result;
+        auto& [cams, center] = result->value;
         cameras_ = std::move(cams);
         ASSERT_GT(cameras_.size(), 0u);
     }
@@ -567,21 +578,25 @@ TEST_F(UndistortCameraTest, FisheyeCameraModel) {
     EXPECT_EQ(p.model_type, CameraModelType::FISHEYE);
 }
 
-TEST_F(UndistortCameraTest, NonPinholeModelDetectsDistortion) {
+TEST_F(UndistortCameraTest, EquirectangularModelDoesNotUseUndistortion) {
     auto& cam = cameras_[0];
     auto R = cam->R();
     auto T = cam->T();
 
-    // Even with no distortion coefficients, a non-pinhole model means distortion
+    auto radial = Tensor::from_vector({0.05f}, TensorShape({1}), Device::CPU);
+    auto tangential = Tensor::from_vector({0.01f, -0.02f}, TensorShape({2}), Device::CPU);
+
     Camera equirect_cam(R, T,
                         cam->focal_x(), cam->focal_y(),
                         cam->center_x(), cam->center_y(),
-                        Tensor(), Tensor(),
+                        radial, tangential,
                         CameraModelType::EQUIRECTANGULAR,
                         "test_equirect", cam->image_path(), "",
                         cam->camera_width(), cam->camera_height(), 996);
 
-    EXPECT_TRUE(equirect_cam.has_distortion());
+    EXPECT_FALSE(equirect_cam.has_distortion());
+    equirect_cam.prepare_undistortion();
+    EXPECT_FALSE(equirect_cam.is_undistort_prepared());
 }
 
 TEST(UndistortScale, ScaleUndistortParams) {

@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/cuda_error.hpp"
 #include "image_kernels.hpp"
 
 #include "cuda.h"
@@ -12,20 +13,19 @@
 #include <device_launch_parameters.h>
 #include <type_traits>
 
+#include "kernel_stream.hpp"
+
 namespace lfs::filters {
 
-    // Adapted from spirulae-splat Densify.cu canny_edge_filter_kernel
-    // (Apache-2.0, commit 8f2ecddc76e6de2e04f88ba8ee5f03b2439766d4):
-    // https://github.com/harry7557558/spirulae-splat/blob/8f2ecddc76e6de2e04f88ba8ee5f03b2439766d4/spirulae_splat/splat/cuda/csrc/Densify.cu#L663
-    // Changes here: raw CHW input/output pointers instead of Spirulae's batched HWC TensorView.
-    __constant__ float SPIRULAE_BLUR_5x5[25] = {
+    // Adapted from a reference Canny edge filter implementation (Apache-2.0); raw CHW input/output pointers instead of batched HWC.
+    __constant__ float CANNY_GAUSSIAN_BLUR_5x5[25] = {
         2.f / 159.f, 4.f / 159.f, 5.f / 159.f, 4.f / 159.f, 2.f / 159.f,
         4.f / 159.f, 9.f / 159.f, 12.f / 159.f, 9.f / 159.f, 4.f / 159.f,
         5.f / 159.f, 12.f / 159.f, 15.f / 159.f, 12.f / 159.f, 5.f / 159.f,
         4.f / 159.f, 9.f / 159.f, 12.f / 159.f, 9.f / 159.f, 4.f / 159.f,
         2.f / 159.f, 4.f / 159.f, 5.f / 159.f, 4.f / 159.f, 2.f / 159.f};
 
-    __constant__ float SPIRULAE_CANNY_3x3[9] = {
+    __constant__ float CANNY_SOBEL_3x3[9] = {
         -1.0f, 0.0f, 1.0f,
         -2.0f, 0.0f, 2.0f,
         -1.0f, 0.0f, 1.0f};
@@ -93,7 +93,7 @@ namespace lfs::training::kernels {
             for (int cy = -2; cy <= 2; ++cy) {
 #pragma unroll
                 for (int cx = -2; cx <= 2; ++cx) {
-                    const float conv_weight = lfs::filters::SPIRULAE_BLUR_5x5[(cy + 2) * 5 + (cx + 2)];
+                    const float conv_weight = lfs::filters::CANNY_GAUSSIAN_BLUR_5x5[(cy + 2) * 5 + (cx + 2)];
                     const int yi = y - HALO1 + cy;
                     const int xi = x - HALO1 + cx;
                     total += conv_weight * shared_pixels[yi + HALO][xi + HALO];
@@ -119,8 +119,8 @@ namespace lfs::training::kernels {
             for (int cy = -1; cy <= 1; ++cy) {
 #pragma unroll
                 for (int cx = -1; cx <= 1; ++cx) {
-                    const float conv_weight_1 = lfs::filters::SPIRULAE_CANNY_3x3[(cy + 1) * 3 + (cx + 1)];
-                    const float conv_weight_2 = lfs::filters::SPIRULAE_CANNY_3x3[(cx + 1) * 3 + (cy + 1)];
+                    const float conv_weight_1 = lfs::filters::CANNY_SOBEL_3x3[(cy + 1) * 3 + (cx + 1)];
+                    const float conv_weight_2 = lfs::filters::CANNY_SOBEL_3x3[(cx + 1) * 3 + (cy + 1)];
                     const int yi = y - HALO2 + cy;
                     const int xi = x - HALO2 + cx;
                     const float value = shared_blurred[yi + HALO1][xi + HALO1];
@@ -152,8 +152,13 @@ namespace lfs::training::kernels {
     __global__ void normalize_by_device_scalar_kernel(
         float* __restrict__ data,
         const std::size_t n,
-        const float* __restrict__ scalar) {
-        const float divisor = fmaxf(*scalar, 1e-9f);
+        const float* __restrict__ scalar,
+        const float skip_below) {
+        const float value = *scalar;
+        if (value <= skip_below) {
+            return;
+        }
+        const float divisor = fmaxf(value, 1e-9f);
         const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
         for (std::size_t i = idx; i < n; i += stride) {
@@ -172,12 +177,14 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         dim3 blockDim(32, 32, 1);
         dim3 gridDim((width + blockDim.x - 1) / blockDim.x,
                      (height + blockDim.y - 1) / blockDim.y);
 
         fused_canny_edge_filter_chw_kernel<InputT><<<gridDim, blockDim, 0, stream>>>(
             d_input_chw, d_output_hw, height, width);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.image.canny_edge_chw");
     }
 
     void launch_fused_canny_edge_filter_chw(
@@ -186,6 +193,7 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
     }
 
@@ -195,6 +203,7 @@ namespace lfs::training::kernels {
         const int height,
         const int width,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
     }
 
@@ -202,14 +211,16 @@ namespace lfs::training::kernels {
         float* d_data,
         const std::size_t n,
         const float* d_scalar,
+        const float skip_below,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         if (n == 0) {
             return;
         }
 
         constexpr int block_size = 256;
         const int grid_size = static_cast<int>(std::min<std::size_t>((n + block_size - 1) / block_size, 4096));
-        normalize_by_device_scalar_kernel<<<grid_size, block_size, 0, stream>>>(d_data, n, d_scalar);
-        cudaStreamSynchronize(stream);
+        normalize_by_device_scalar_kernel<<<grid_size, block_size, 0, stream>>>(d_data, n, d_scalar, skip_below);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.image.normalize_by_scalar");
     }
 } // namespace lfs::training::kernels

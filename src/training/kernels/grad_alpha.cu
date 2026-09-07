@@ -1,8 +1,12 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/cuda/sh_layout.cuh"
+#include "core/cuda_error.hpp"
 #include "grad_alpha.hpp"
 #include <cstdint>
+
+#include "kernel_stream.hpp"
 
 namespace lfs::training::kernels {
 
@@ -15,6 +19,36 @@ namespace lfs::training::kernels {
 
         [[nodiscard]] inline unsigned int num_blocks_1d(const int64_t total) {
             return static_cast<unsigned int>((total + kThreadsPerBlock - 1) / kThreadsPerBlock);
+        }
+
+        __device__ __forceinline__ int64_t sh_swizzled_float_offset(
+            const int64_t primitive_idx,
+            const int64_t packed_coeff_channel_offset,
+            const int64_t slots_per_primitive) {
+            const int64_t slot = packed_coeff_channel_offset / 4;
+            const int64_t component = packed_coeff_channel_offset % 4;
+            const int64_t block = primitive_idx / lfs::core::kShReorderSize;
+            const int64_t lane = primitive_idx % lfs::core::kShReorderSize;
+            const int64_t float4_index =
+                block * (slots_per_primitive * lfs::core::kShReorderSize) +
+                slot * lfs::core::kShReorderSize +
+                lane;
+            return float4_index * 4 + component;
+        }
+
+        // Device mirror of lfs::core::sh_float4_slots_for_rest. That host helper is not __device__
+        // (it routes through std::min), so calling it from a kernel under --expt-relaxed-constexpr
+        // emits a host call that traps at runtime with a runtime argument.
+        __device__ __forceinline__ int sh_layout_slots(const uint32_t coeffs_rest) {
+            if (coeffs_rest == 0u)
+                return 0;
+            const uint32_t clamped = coeffs_rest > lfs::core::kShMaxCoeffsRest
+                                         ? lfs::core::kShMaxCoeffsRest
+                                         : coeffs_rest;
+            const uint32_t slots = (clamped * lfs::core::kShChannels + 3u) / 4u;
+            return static_cast<int>(slots > lfs::core::kShRestFloat4PerPrimitive
+                                        ? lfs::core::kShRestFloat4PerPrimitive
+                                        : slots);
         }
 
         template <bool kUseImage, bool kSubtract>
@@ -112,12 +146,14 @@ namespace lfs::training::kernels {
         int H, int W,
         bool is_chw_layout,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int total = H * W;
         const unsigned int blocks = num_blocks_1d(total);
 
         if (is_chw_layout) {
             fused_grad_alpha_chw_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
                 grad_image, bg_color, grad_alpha, H, W);
+            LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.fused_chw");
         } else {
             bool is_aligned = (reinterpret_cast<uintptr_t>(grad_image) % 16 == 0) &&
                               (reinterpret_cast<uintptr_t>(bg_color) % 16 == 0);
@@ -128,9 +164,11 @@ namespace lfs::training::kernels {
                     reinterpret_cast<const float3*>(bg_color),
                     grad_alpha,
                     H, W);
+                LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.fused_hwc_vec");
             } else {
                 fused_grad_alpha_hwc_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
                     grad_image, bg_color, grad_alpha, H, W);
+                LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.fused_hwc");
             }
         }
     }
@@ -161,11 +199,13 @@ namespace lfs::training::kernels {
         float* grad_alpha,
         int H, int W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int total = H * W;
         const unsigned int blocks = num_blocks_1d(total);
 
         fused_grad_alpha_with_image_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             grad_image, bg_image, grad_alpha, H, W);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.fused_with_image");
     }
 
     void launch_fused_background_blend(
@@ -175,10 +215,12 @@ namespace lfs::training::kernels {
         float* output,
         int H, int W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int total = H * W;
         const unsigned int blocks = num_blocks_1d(total);
         fused_background_compose_kernel<false, false><<<blocks, kThreadsPerBlock, 0, stream>>>(
             image, alpha, bg_color, output, H, W);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.bg_blend");
     }
 
     void launch_fused_background_blend_with_image(
@@ -188,10 +230,12 @@ namespace lfs::training::kernels {
         float* output,
         int H, int W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int total = H * W;
         const unsigned int blocks = num_blocks_1d(total);
         fused_background_compose_kernel<true, false><<<blocks, kThreadsPerBlock, 0, stream>>>(
             image, alpha, bg_image, output, H, W);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.bg_blend_image");
     }
 
     void launch_fused_background_unblend(
@@ -200,10 +244,12 @@ namespace lfs::training::kernels {
         const float* bg_color,
         int H, int W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int total = H * W;
         const unsigned int blocks = num_blocks_1d(total);
         fused_background_compose_kernel<false, true><<<blocks, kThreadsPerBlock, 0, stream>>>(
             image, alpha, bg_color, image, H, W);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.bg_unblend");
     }
 
     void launch_fused_background_unblend_with_image(
@@ -212,125 +258,12 @@ namespace lfs::training::kernels {
         const float* bg_image,
         int H, int W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int total = H * W;
         const unsigned int blocks = num_blocks_1d(total);
         fused_background_compose_kernel<true, true><<<blocks, kThreadsPerBlock, 0, stream>>>(
             image, alpha, bg_image, image, H, W);
-    }
-
-    // ==================== Sigmoid Backward ====================
-    // Computes in-place: v_opacities *= sigmoid * (1 - sigmoid)
-    __global__ void sigmoid_backward_kernel(
-        float* __restrict__ v_opacities,
-        const float* __restrict__ sigmoid,
-        int64_t N) {
-        int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (idx >= N)
-            return;
-
-        float s = sigmoid[idx];
-        float deriv = s * (1.0f - s);
-        v_opacities[idx] *= deriv;
-    }
-
-    void launch_sigmoid_backward(
-        float* v_opacities,
-        const float* sigmoid,
-        int64_t N,
-        cudaStream_t stream) {
-        const unsigned int blocks = num_blocks_1d(N);
-        sigmoid_backward_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            v_opacities, sigmoid, N);
-    }
-
-    // ==================== Exp Backward ====================
-    // Computes in-place: v_scales *= scales (for all 3 components per Gaussian)
-    __global__ void exp_backward_kernel(
-        float* __restrict__ v_scales,
-        const float* __restrict__ scales,
-        int64_t N) {
-        int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        int64_t total = N * 3; // N Gaussians, 3 scale components each
-        if (idx >= total)
-            return;
-
-        v_scales[idx] *= scales[idx];
-    }
-
-    void launch_exp_backward(
-        float* v_scales,
-        const float* scales,
-        int64_t N,
-        cudaStream_t stream) {
-        const int64_t total = N * 3;
-        const unsigned int blocks = num_blocks_1d(total);
-        exp_backward_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            v_scales, scales, N);
-    }
-
-    // ==================== Quaternion Normalize Backward ====================
-    // Computes in-place: v_raw = (v_activated - q_norm * dot(q_norm, v_activated)) / ||q_raw||
-    // This is the Jacobian of f(q) = q / ||q||
-    __global__ void quat_normalize_backward_kernel(
-        float* __restrict__ v_quats,      // [N, 4] - modified in-place
-        const float* __restrict__ q_norm, // [N, 4] - normalized quaternions
-        const float* __restrict__ q_raw,  // [N, 4] - raw quaternions
-        int64_t N) {
-        int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (idx >= N)
-            return;
-
-        // Load all 4 components of this quaternion
-        int64_t base = idx * 4;
-
-        // Load normalized quaternion components
-        float qn0 = q_norm[base + 0];
-        float qn1 = q_norm[base + 1];
-        float qn2 = q_norm[base + 2];
-        float qn3 = q_norm[base + 3];
-
-        // Load gradients w.r.t. normalized quaternions
-        float v0 = v_quats[base + 0];
-        float v1 = v_quats[base + 1];
-        float v2 = v_quats[base + 2];
-        float v3 = v_quats[base + 3];
-
-        // Load raw quaternion and compute its norm
-        float qr0 = q_raw[base + 0];
-        float qr1 = q_raw[base + 1];
-        float qr2 = q_raw[base + 2];
-        float qr3 = q_raw[base + 3];
-        float norm = sqrtf(qr0 * qr0 + qr1 * qr1 + qr2 * qr2 + qr3 * qr3);
-
-        // Avoid division by zero
-        if (norm < 1e-12f) {
-            v_quats[base + 0] = 0.0f;
-            v_quats[base + 1] = 0.0f;
-            v_quats[base + 2] = 0.0f;
-            v_quats[base + 3] = 0.0f;
-            return;
-        }
-
-        // Compute dot product: dot(q_norm, v)
-        float dot = qn0 * v0 + qn1 * v1 + qn2 * v2 + qn3 * v3;
-
-        // Compute: v_raw = (v - q_norm * dot) / norm
-        float inv_norm = 1.0f / norm;
-        v_quats[base + 0] = (v0 - qn0 * dot) * inv_norm;
-        v_quats[base + 1] = (v1 - qn1 * dot) * inv_norm;
-        v_quats[base + 2] = (v2 - qn2 * dot) * inv_norm;
-        v_quats[base + 3] = (v3 - qn3 * dot) * inv_norm;
-    }
-
-    void launch_quat_normalize_backward(
-        float* v_quats,
-        const float* quats_normalized,
-        const float* quats_raw,
-        int64_t N,
-        cudaStream_t stream) {
-        const unsigned int blocks = num_blocks_1d(N);
-        quat_normalize_backward_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            v_quats, quats_normalized, quats_raw, N);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.bg_unblend_image");
     }
 
     // ==================== Gradient Accumulation ====================
@@ -351,9 +284,11 @@ namespace lfs::training::kernels {
         const float* src,
         int64_t n_elements,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const unsigned int blocks = num_blocks_1d(n_elements);
         grad_accumulate_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             dst, src, n_elements);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.grad_accumulate");
     }
 
     // Accumulate with unsqueeze: src [N] -> dst [N, 1]
@@ -363,62 +298,59 @@ namespace lfs::training::kernels {
         const float* src,
         int64_t N,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         // [N] and [N, 1] have the same memory layout
         launch_grad_accumulate(dst, src, N, stream);
     }
 
-    // ==================== SH Gradient Split and Accumulate ====================
-    // src [N, K_src, 3] -> dst_sh0 [N, 1, 3] (first coeff), dst_shN [N, K_dst, 3] (rest)
-    // K_src: number of active SH coefficients in source (from gsplat backward)
-    // K_dst: number of SH coefficients in destination buffer (max_sh_degree^2 - 1)
-    __global__ void grad_accumulate_sh_kernel(
-        float* __restrict__ dst_sh0,   // [N, 1, 3] = [N, 3] contiguous
-        float* __restrict__ dst_shN,   // [N, K_dst, 3] or nullptr
-        const float* __restrict__ src, // [N, K_src, 3]
+    __global__ void grad_accumulate_sh_swizzled_kernel(
+        float* __restrict__ dst_sh0,
+        float* __restrict__ dst_shN,
+        const float* __restrict__ src,
         int64_t N,
-        int64_t K_src, // Source SH coefficients (active)
-        int64_t K_dst  // Destination buffer width (may be larger)
-    ) {
-        int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        int64_t K_src,
+        uint32_t shN_layout_rest) {
+        const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (idx >= N)
             return;
 
-        // Source layout: [N, K_src, 3] -> index [n, k, c] = n * K_src * 3 + k * 3 + c
-        // sh0 is at k=0
-        int64_t src_sh0_base = idx * K_src * 3;
-        int64_t dst_sh0_base = idx * 3; // [N, 1, 3] = [N, 3]
+        const int64_t src_base = idx * K_src * 3;
+        const int64_t dst_sh0_base = idx * 3;
+        dst_sh0[dst_sh0_base + 0] += src[src_base + 0];
+        dst_sh0[dst_sh0_base + 1] += src[src_base + 1];
+        dst_sh0[dst_sh0_base + 2] += src[src_base + 2];
 
-        // Accumulate sh0 (3 values)
-        dst_sh0[dst_sh0_base + 0] += src[src_sh0_base + 0];
-        dst_sh0[dst_sh0_base + 1] += src[src_sh0_base + 1];
-        dst_sh0[dst_sh0_base + 2] += src[src_sh0_base + 2];
+        if (dst_shN == nullptr || K_src <= 1)
+            return;
 
-        // Accumulate shN if K_src > 1
-        if (dst_shN != nullptr && K_src > 1) {
-            // shN is at k=1..K_src-1 in source
-            // Destination has K_dst coefficients per Gaussian
-            for (int64_t k = 1; k < K_src; ++k) {
-                int64_t src_offset = src_sh0_base + k * 3;
-                // Use K_dst for destination stride, not K_src-1
-                int64_t dst_offset = idx * K_dst * 3 + (k - 1) * 3;
-                dst_shN[dst_offset + 0] += src[src_offset + 0];
-                dst_shN[dst_offset + 1] += src[src_offset + 1];
-                dst_shN[dst_offset + 2] += src[src_offset + 2];
-            }
+        const int64_t max_rest = K_src - 1 < lfs::core::kShMaxCoeffsRest
+                                     ? K_src - 1
+                                     : lfs::core::kShMaxCoeffsRest;
+        const int64_t slots_per_primitive = sh_layout_slots(shN_layout_rest);
+        if (slots_per_primitive == 0)
+            return;
+        for (int64_t k = 0; k < max_rest; ++k) {
+            const int64_t src_coeff = src_base + (k + 1) * 3;
+            const int64_t packed_offset = k * 3;
+            dst_shN[sh_swizzled_float_offset(idx, packed_offset + 0, slots_per_primitive)] += src[src_coeff + 0];
+            dst_shN[sh_swizzled_float_offset(idx, packed_offset + 1, slots_per_primitive)] += src[src_coeff + 1];
+            dst_shN[sh_swizzled_float_offset(idx, packed_offset + 2, slots_per_primitive)] += src[src_coeff + 2];
         }
     }
 
-    void launch_grad_accumulate_sh(
+    void launch_grad_accumulate_sh_swizzled(
         float* dst_sh0,
         float* dst_shN,
         const float* src,
         int64_t N,
         int64_t K_src,
-        int64_t K_dst,
+        uint32_t shN_layout_rest,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const unsigned int blocks = num_blocks_1d(N);
-        grad_accumulate_sh_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            dst_sh0, dst_shN, src, N, K_src, K_dst);
+        grad_accumulate_sh_swizzled_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+            dst_sh0, dst_shN, src, N, K_src, shN_layout_rest);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.grad_accumulate_sh");
     }
 
     // ==================== Gradient Norm Accumulate ====================
@@ -449,83 +381,11 @@ namespace lfs::training::kernels {
         const float* grad_means,
         int64_t N,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const unsigned int blocks = num_blocks_1d(N);
         grad_norm_accumulate_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             densification_info, grad_means, N);
-    }
-
-    // ==================== CHW to HWC Permute ====================
-    // Converts [C, H, W] to [H, W, C] layout
-    __global__ void permute_chw_to_hwc_kernel(
-        const float* __restrict__ src, // [C, H, W]
-        float* __restrict__ dst,       // [H, W, C]
-        int C, int H, int W) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        int total = H * W;
-
-        if (idx >= total)
-            return;
-
-        int HW = H * W;
-        int dst_base = idx * C; // [H, W, C] -> index h*W*C + w*C + c = (h*W + w)*C + c = idx*C + c
-
-        // Copy all channels for this spatial position
-        for (int c = 0; c < C; ++c) {
-            dst[dst_base + c] = src[c * HW + idx];
-        }
-    }
-
-    void launch_permute_chw_to_hwc(
-        const float* src,
-        float* dst,
-        int C, int H, int W,
-        cudaStream_t stream) {
-        const int total = H * W;
-        const unsigned int blocks = num_blocks_1d(total);
-        permute_chw_to_hwc_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            src, dst, C, H, W);
-    }
-
-    // ==================== HWC to CHW Permute ====================
-    // Converts [H, W, C] to [C, H, W] layout
-    __global__ void permute_hwc_to_chw_kernel(
-        const float* __restrict__ src, // [H, W, C]
-        float* __restrict__ dst,       // [C, H, W]
-        int C, int H, int W) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        int total = H * W;
-        if (idx >= total) {
-            return;
-        }
-
-        int dst_hw = H * W;
-        int src_base = idx * C;
-        for (int c = 0; c < C; ++c) {
-            dst[c * dst_hw + idx] = src[src_base + c];
-        }
-    }
-
-    void launch_permute_hwc_to_chw(
-        const float* src,
-        float* dst,
-        int C, int H, int W,
-        cudaStream_t stream) {
-        const int total = H * W;
-        const unsigned int blocks = num_blocks_1d(total);
-        permute_hwc_to_chw_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            src, dst, C, H, W);
-    }
-
-    // ==================== 1HW to HW Squeeze ====================
-    // Removes leading dimension of 1: [1, H, W] -> [H, W]
-    // This is just a copy since memory layout is the same
-    void launch_squeeze_1hw_to_hw(
-        const float* src, // [1, H, W]
-        float* dst,       // [H, W]
-        int H, int W,
-        cudaStream_t stream) {
-        // Memory layout is identical, just copy
-        cudaMemcpyAsync(dst, src, H * W * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.grad_norm_accumulate");
     }
 
     // ==================== Bilinear Resize for CHW Tensors ====================
@@ -589,10 +449,12 @@ namespace lfs::training::kernels {
         int src_H, int src_W,
         int dst_H, int dst_W,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int total = dst_H * dst_W;
         const unsigned int blocks = num_blocks_1d(total);
         bilinear_resize_chw_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             src, dst, C, src_H, src_W, dst_H, dst_W);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.bilinear_resize_chw");
     }
 
     __device__ __forceinline__ uint32_t pcg_hash(uint32_t v) {
@@ -625,10 +487,12 @@ namespace lfs::training::kernels {
         const int H, const int W,
         const uint64_t seed,
         cudaStream_t stream) {
+        stream = resolve_stream(stream);
         const int HW = H * W;
         const unsigned int blocks = num_blocks_1d(HW);
         random_background_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             output, HW, static_cast<uint32_t>(seed));
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.grad_alpha.random_background");
     }
 
 } // namespace lfs::training::kernels

@@ -21,7 +21,6 @@
 namespace lfs::core {
     class SplatData;
     struct PointCloud;
-    struct MeshData;
     class Camera;
     class Tensor;
 } // namespace lfs::core
@@ -30,6 +29,14 @@ namespace lfs::rendering {
 
     // Import Tensor into this namespace for convenience
     using lfs::core::Tensor;
+
+    // A mesh layer rasterized ahead of the composite. Defined here rather than beside
+    // its GPU producer in lfs::vis so this layer does not have to include a header from
+    // the layer above it.
+    struct MeshLayer {
+        Tensor rgba;       // [4,H,W] float32; alpha is 1 where a mesh was drawn.
+        Tensor view_depth; // [H,W] float32; positive linear view depth or +INF.
+    };
 
     // Error handling with std::expected (C++23)
     template <typename T>
@@ -93,6 +100,8 @@ namespace lfs::rendering {
     struct GaussianFilterState {
         std::optional<GaussianScopedBoxFilter> crop_region;
         std::optional<GaussianScopedEllipsoidFilter> ellipsoid_region;
+        std::vector<GaussianScopedBoxFilter> crop_regions;
+        std::vector<GaussianScopedEllipsoidFilter> ellipsoid_regions;
         std::optional<BoundingBox> view_volume;
         bool cull_outside_view_volume = false;
     };
@@ -127,7 +136,8 @@ namespace lfs::rendering {
 
     inline constexpr std::size_t kSelectionGroupColorCount = 256;
     inline constexpr std::size_t kSelectionPreviewColorIndex = kSelectionGroupColorCount;
-    inline constexpr std::size_t kSelectionColorTableCount = kSelectionGroupColorCount + 1;
+    inline constexpr std::size_t kSelectionSelectedHoverColorIndex = kSelectionGroupColorCount + 1;
+    inline constexpr std::size_t kSelectionColorTableCount = kSelectionGroupColorCount + 2;
 
     [[nodiscard]] inline std::array<glm::vec4, kSelectionColorTableCount> defaultSelectionColorTable() {
         std::array<glm::vec4, kSelectionColorTableCount> colors{};
@@ -146,6 +156,7 @@ namespace lfs::rendering {
             colors[group] = glm::vec4(palette[(group - 1) % palette.size()], 1.0f);
         }
         colors[kSelectionPreviewColorIndex] = glm::vec4(0.0f, 0.871f, 0.298f, 1.0f);
+        colors[kSelectionSelectedHoverColorIndex] = glm::vec4(1.0f, 0.08f, 0.08f, 1.0f);
         return colors;
     }
 
@@ -153,7 +164,33 @@ namespace lfs::rendering {
         GaussianMarkerOverlayState markers;
         GaussianCursorOverlayState cursor;
         GaussianEmphasisOverlayState emphasis;
+        // Host-side non-empty committed selection for this frame snapshot.
+        // Independent of emphasis.mask pointer validity so an empty/stale mask
+        // tensor cannot keep the slow overlay raster path pinned.
+        bool has_selection = false;
         std::array<glm::vec4, kSelectionColorTableCount> selection_colors = defaultSelectionColorTable();
+    };
+
+    struct GaussianLodGpuTraversalState {
+        bool enabled = false;
+        size_t output_capacity = 0;
+        size_t node_count = 0;
+        float pixel_scale_limit = 0.0f;
+        float object_scale = 1.0f;
+        float behind_camera_penalty = 0.2f;
+        float cone_foveation = 0.4f;
+        float cone_inner_degrees = 90.0f;
+        float cone_outer_degrees = 120.0f;
+        float outside_view_foveation = 0.05f;
+        float viewport_half_tan_x = 0.0f;
+        float viewport_half_tan_y = 0.0f;
+        float ortho_half_width = 0.0f;
+        float ortho_half_height = 0.0f;
+        glm::vec3 view_origin{0.0f};
+        glm::vec3 view_forward{0.0f, 0.0f, -1.0f};
+        glm::mat4 object_to_view{1.0f};
+        bool viewport_foveation = true;
+        bool orthographic = false;
     };
 
     struct ViewportRenderRequest {
@@ -162,32 +199,30 @@ namespace lfs::rendering {
         bool antialiasing = false;
         bool mip_filter = false;
         int sh_degree = 3;
-        GaussianRasterBackend raster_backend = GaussianRasterBackend::FastGs;
+        GaussianRasterBackend raster_backend = GaussianRasterBackend::ThreeDgs;
         bool gut = false;
         bool equirectangular = false;
         GaussianSceneState scene;
         GaussianFilterState filters;
         GaussianOverlayState overlay;
         bool transparent_background = false;
-    };
+        bool depth_view = false;
+        float depth_view_min = DEFAULT_DEPTH_VIEW_MIN;
+        float depth_view_max = DEFAULT_DEPTH_VIEW_MAX;
+        DepthVisualizationMode depth_visualization_mode = DepthVisualizationMode::Palette;
 
-    struct HoveredGaussianQueryRequest {
-        FrameView frame_view;
-        float scaling_modifier = 1.0f;
-        bool mip_filter = false;
-        int sh_degree = 3;
-        GaussianRasterBackend raster_backend = GaussianRasterBackend::FastGs;
-        bool gut = false;
-        bool equirectangular = false;
-        GaussianSceneState scene;
-        GaussianFilterState filters;
-        glm::vec2 cursor{0.0f, 0.0f};
-    };
-
-    struct ScreenPositionRenderRequest {
-        FrameView frame_view;
-        bool equirectangular = false;
-        GaussianSceneState scene;
+        // LOD index indirection (optional)
+        const uint32_t* lod_indices = nullptr;
+        const uint32_t* lod_logical_indices = nullptr;
+        const uint32_t* lod_levels = nullptr;
+        const float* lod_weights = nullptr;
+        size_t lod_count = 0;
+        uint64_t lod_selection_hash = 0;
+        uint64_t lod_generation = 0;
+        const uint32_t* lod_touched_chunks = nullptr;
+        size_t lod_touched_chunk_count = 0;
+        GaussianLodGpuTraversalState lod_gpu_traversal = {};
+        bool lod_debug_mode = false;
     };
 
     struct PointCloudSceneState {
@@ -198,6 +233,7 @@ namespace lfs::rendering {
 
     struct PointCloudFilterState {
         std::optional<BoundingBox> crop_box;
+        std::optional<Ellipsoid> crop_ellipsoid;
         bool crop_inverse = false;
         bool crop_desaturate = false;
     };
@@ -208,11 +244,18 @@ namespace lfs::rendering {
         bool equirectangular = false;
     };
 
+    struct PointCloudOverlayState {
+        std::shared_ptr<lfs::core::Tensor> selection_mask;
+        GaussianTransientMaskOverlayState transient_mask;
+        std::array<glm::vec4, kSelectionColorTableCount> selection_colors = defaultSelectionColorTable();
+    };
+
     struct PointCloudRenderRequest {
         FrameView frame_view;
         PointCloudRenderState render;
         PointCloudSceneState scene;
         PointCloudFilterState filters;
+        PointCloudOverlayState overlay;
         bool transparent_background = false;
     };
 
@@ -232,30 +275,16 @@ namespace lfs::rendering {
         bool valid = false;
         // Depth conversion parameters (needed for proper depth buffer writing)
         bool depth_is_ndc = false; // True if depth is already normalized device depth (0-1).
-        glm::vec2 depth_texcoord_scale{1.0f, 1.0f};
         // Presentation orientation for the screen quad.
         bool flip_y = false;
         float near_plane = DEFAULT_NEAR_PLANE;
         float far_plane = DEFAULT_FAR_PLANE;
         bool orthographic = false;
-        bool color_has_alpha = false;
 
         [[nodiscard]] const std::shared_ptr<lfs::core::Tensor>& primaryDepth() const {
             return depth_panels[0].depth;
         }
     };
-
-    struct GaussianGpuFrameResult {
-        GpuFrame frame;
-        FrameMetadata metadata;
-    };
-
-    struct GaussianImageResult {
-        std::shared_ptr<lfs::core::Tensor> image;
-        FrameMetadata metadata;
-    };
-
-    using DualGaussianImageResult = std::array<GaussianImageResult, 2>;
 
     struct PointCloudImageResult {
         std::shared_ptr<lfs::core::Tensor> image;
@@ -275,7 +304,7 @@ namespace lfs::rendering {
         bool antialiasing = false;
         bool mip_filter = false;
         int sh_degree = 3;
-        GaussianRasterBackend raster_backend = GaussianRasterBackend::FastGs;
+        GaussianRasterBackend raster_backend = GaussianRasterBackend::ThreeDgs;
         bool gut = false;
         bool equirectangular = false;
         GaussianSceneState scene;
@@ -288,6 +317,7 @@ namespace lfs::rendering {
         PointCloudRenderState render;
         PointCloudSceneState scene;
         PointCloudFilterState filters;
+        PointCloudOverlayState overlay;
     };
 
     struct SplitViewPanelContent {
@@ -321,13 +351,6 @@ namespace lfs::rendering {
         glm::vec4 divider_color{0.29f, 0.33f, 0.42f, 1.0f};
         bool letterbox = false;
         glm::ivec2 content_size{0, 0};
-    };
-
-    struct SplitViewRequest {
-        std::array<SplitViewPanel, 2> panels;
-        SplitViewCompositeState composite;
-        SplitViewPresentationState presentation;
-        bool prefer_batched_gaussian_render = false;
     };
 
     // Render modes
@@ -364,18 +387,12 @@ namespace lfs::rendering {
         bool equirectangular = false;
     };
 
-    struct MeshFrameItem {
-        const lfs::core::MeshData* mesh = nullptr;
-        glm::mat4 transform{1.0f};
-        MeshRenderOptions options{};
-    };
-
     struct VideoCompositeFrameRequest {
         ViewportData viewport;
         FrameView frame_view;
         glm::vec3 background_color{0.0f};
         EnvironmentRenderOptions environment;
-        std::vector<MeshFrameItem> meshes;
+        const MeshLayer* prerendered_meshes = nullptr;
     };
 
     struct CameraFrustumPickRequest {
@@ -392,36 +409,13 @@ namespace lfs::rendering {
     class RenderingEngine {
     public:
         static std::unique_ptr<RenderingEngine> create();
-        static std::unique_ptr<RenderingEngine> createRasterOnly();
 
         virtual ~RenderingEngine() = default;
 
         // Lifecycle
         virtual Result<void> initialize() = 0;
-        virtual Result<void> initializeRasterOnly() = 0;
         virtual void shutdown() = 0;
         virtual bool isInitialized() const = 0;
-        virtual bool isRasterInitialized() const = 0;
-
-        virtual Result<GaussianGpuFrameResult> renderGaussiansGpuFrame(
-            const lfs::core::SplatData& splat_data,
-            const ViewportRenderRequest& request) = 0;
-
-        virtual Result<GaussianImageResult> renderGaussiansImage(
-            const lfs::core::SplatData& splat_data,
-            const ViewportRenderRequest& request) = 0;
-
-        virtual Result<DualGaussianImageResult> renderGaussiansImagePair(
-            const lfs::core::SplatData& splat_data,
-            const std::array<ViewportRenderRequest, 2>& requests) = 0;
-
-        virtual Result<std::optional<int>> queryHoveredGaussianId(
-            const lfs::core::SplatData& splat_data,
-            const HoveredGaussianQueryRequest& request) = 0;
-
-        virtual Result<std::shared_ptr<lfs::core::Tensor>> renderGaussianScreenPositions(
-            const lfs::core::SplatData& splat_data,
-            const ScreenPositionRenderRequest& request) = 0;
 
         virtual Result<GpuFrame> renderPointCloudGpuFrame(
             const lfs::core::SplatData& splat_data,

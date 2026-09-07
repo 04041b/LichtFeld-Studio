@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/cuda/selection_ops.hpp"
+#include "core/cuda_error.hpp"
 #include "core/logger.hpp"
 #include <cassert>
 #include <cfloat>
@@ -204,6 +205,34 @@ namespace lfs::core::cuda {
             out_mask[idx] = (max_s <= max_scale) ? group_id : 0;
         }
 
+        // SH_C0 constant for decoding DC spherical harmonic component to RGB
+        constexpr float SH_C0 = 0.28209479177387814f;
+
+        __device__ inline float decode_sh_color(float sh_val) {
+            return fminf(1.0f, fmaxf(0.0f, 0.5f + sh_val * SH_C0));
+        }
+
+        __global__ void color_threshold_kernel(
+            const float* __restrict__ sh0,
+            uint8_t* __restrict__ out_mask,
+            float ref_r, float ref_g, float ref_b,
+            float threshold, uint8_t group_id,
+            int N) {
+            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= N)
+                return;
+
+            // SH0 is stored as [N, 1, 3] or [N, 3] — stride is always 3 floats per gaussian
+            const float r = decode_sh_color(sh0[idx * 3]);
+            const float g = decode_sh_color(sh0[idx * 3 + 1]);
+            const float b = decode_sh_color(sh0[idx * 3 + 2]);
+
+            const bool match = fabsf(r - ref_r) <= threshold &&
+                               fabsf(g - ref_g) <= threshold &&
+                               fabsf(b - ref_b) <= threshold;
+            out_mask[idx] = match ? group_id : 0;
+        }
+
         __device__ inline void atomicMinFloat(float* addr, float val) {
             int* addr_as_int = reinterpret_cast<int*>(addr);
             int old = *addr_as_int, assumed;
@@ -283,16 +312,21 @@ namespace lfs::core::cuda {
             auto aabb_buf = Tensor::empty({6}, Device::CUDA, DataType::Float32);
             {
                 float init[6] = {FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
-                auto err = cudaMemcpyAsync(aabb_buf.ptr<float>(), init, 6 * sizeof(float), cudaMemcpyHostToDevice, stream);
-                assert(err == cudaSuccess && "AABB init memcpy failed");
+                LFS_CUDA_CHECK_MSG(
+                    cudaMemcpyAsync(aabb_buf.ptr<float>(), init, 6 * sizeof(float), cudaMemcpyHostToDevice, stream),
+                    "build_grid: AABB init upload");
             }
 
             int blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const auto aabb_ticket = ::lfs::core::cuda_record_range(stream, "core.selection.build_grid.aabb_pipeline");
             compute_aabb_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(pos_ptr, aabb_buf.ptr<float>(), N);
+            LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.build_grid.compute_aabb");
 
             float aabb_host[6];
-            cudaMemcpyAsync(aabb_host, aabb_buf.ptr<float>(), 6 * sizeof(float), cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);
+            LFS_CUDA_CHECK_MSG(
+                cudaMemcpyAsync(aabb_host, aabb_buf.ptr<float>(), 6 * sizeof(float), cudaMemcpyDeviceToHost, stream),
+                "build_grid: AABB readback");
+            LFS_CUDA_AWAIT(aabb_ticket, cudaStreamSynchronize(stream), "core.selection.build_grid.aabb_readback");
 
             float3 grid_min = make_float3(aabb_host[0] - cell_size, aabb_host[1] - cell_size, aabb_host[2] - cell_size);
             float3 grid_max = make_float3(aabb_host[3] + cell_size, aabb_host[4] + cell_size, aabb_host[5] + cell_size);
@@ -320,10 +354,11 @@ namespace lfs::core::cuda {
             compute_cell_ids<<<blocks, BLOCK_SIZE, 0, stream>>>(
                 pos_ptr, cell_ids.ptr<int>(),
                 grid_min, inv_cell_size, grid_dims, N);
+            LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.build_grid.compute_cell_ids");
 
             // Initialize sorted indices
             thrust::device_ptr<int> si_ptr(sorted_indices.ptr<int>());
-            thrust::sequence(thrust::cuda::par.on(stream), si_ptr, si_ptr + N);
+            thrust::sequence(thrust::cuda::par_nosync.on(stream), si_ptr, si_ptr + N);
 
             // Sort by cell ID
             thrust::device_ptr<int> ci_ptr(cell_ids.ptr<int>());
@@ -332,15 +367,16 @@ namespace lfs::core::cuda {
             // Build cell start/end
             auto cell_start = Tensor::empty({static_cast<size_t>(num_cells)}, Device::CUDA, DataType::Int32);
             auto cell_end = Tensor::empty({static_cast<size_t>(num_cells)}, Device::CUDA, DataType::Int32);
-            thrust::fill(thrust::cuda::par.on(stream),
+            thrust::fill(thrust::cuda::par_nosync.on(stream),
                          thrust::device_ptr<int>(cell_start.ptr<int>()),
                          thrust::device_ptr<int>(cell_start.ptr<int>()) + num_cells, -1);
-            thrust::fill(thrust::cuda::par.on(stream),
+            thrust::fill(thrust::cuda::par_nosync.on(stream),
                          thrust::device_ptr<int>(cell_end.ptr<int>()),
                          thrust::device_ptr<int>(cell_end.ptr<int>()) + num_cells, -1);
 
             find_cell_starts<<<blocks, BLOCK_SIZE, 0, stream>>>(
                 cell_ids.ptr<int>(), cell_start.ptr<int>(), cell_end.ptr<int>(), N);
+            LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.build_grid.find_cell_starts");
 
             return SpatialGrid{
                 std::move(sorted_indices),
@@ -382,9 +418,7 @@ namespace lfs::core::cuda {
             grid.sorted_indices.ptr<int>(), grid.cell_start.ptr<int>(), grid.cell_end.ptr<int>(),
             grid.grid_min, grid.inv_cell_size, grid.grid_dims,
             radius * radius, group_id, N);
-
-        cudaError_t err = cudaGetLastError();
-        assert(err == cudaSuccess && "selection_grow kernel launch failed");
+        LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.grow");
 
         nvtxRangePop();
         return out_mask;
@@ -418,9 +452,7 @@ namespace lfs::core::cuda {
             grid.sorted_indices.ptr<int>(), grid.cell_start.ptr<int>(), grid.cell_end.ptr<int>(),
             grid.grid_min, grid.inv_cell_size, grid.grid_dims,
             radius * radius, N);
-
-        cudaError_t err = cudaGetLastError();
-        assert(err == cudaSuccess && "selection_shrink kernel launch failed");
+        LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.shrink");
 
         nvtxRangePop();
         return out_mask;
@@ -444,9 +476,7 @@ namespace lfs::core::cuda {
         opacity_threshold_kernel<<<blocks, BLOCK_SIZE, 0, opacity_raw.stream()>>>(
             opacity_raw.ptr<float>(), out_mask.ptr<uint8_t>(),
             min_opacity, max_opacity, group_id, N);
-
-        cudaError_t err = cudaGetLastError();
-        assert(err == cudaSuccess && "select_by_opacity kernel launch failed");
+        LFS_CUDA_LAUNCH_CHECK(opacity_raw.stream(), "core.selection.opacity_threshold");
 
         nvtxRangePop();
         return out_mask;
@@ -471,9 +501,34 @@ namespace lfs::core::cuda {
         scale_threshold_kernel<<<blocks, BLOCK_SIZE, 0, scale_raw.stream()>>>(
             scale_raw.ptr<float>(), out_mask.ptr<uint8_t>(),
             max_scale, group_id, N);
+        LFS_CUDA_LAUNCH_CHECK(scale_raw.stream(), "core.selection.scale_threshold");
 
-        cudaError_t err = cudaGetLastError();
-        assert(err == cudaSuccess && "select_by_scale kernel launch failed");
+        nvtxRangePop();
+        return out_mask;
+    }
+
+    Tensor select_by_color(const Tensor& sh0,
+                           float ref_r, float ref_g, float ref_b,
+                           float threshold, uint8_t group_id) {
+        assert(sh0.device() == Device::CUDA);
+        assert(sh0.dtype() == DataType::Float32);
+
+        nvtxRangePush("select_by_color");
+
+        // Support both [N, 1, 3] and [N, 3] layouts
+        const int N = static_cast<int>(sh0.size(0));
+        if (N == 0) {
+            nvtxRangePop();
+            return Tensor::empty({0}, Device::CUDA, DataType::UInt8);
+        }
+
+        auto out_mask = Tensor::empty({static_cast<size_t>(N)}, Device::CUDA, DataType::UInt8);
+
+        int blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        color_threshold_kernel<<<blocks, BLOCK_SIZE, 0, sh0.stream()>>>(
+            sh0.ptr<float>(), out_mask.ptr<uint8_t>(),
+            ref_r, ref_g, ref_b, threshold, group_id, N);
+        LFS_CUDA_LAUNCH_CHECK(sh0.stream(), "core.selection.color_threshold");
 
         nvtxRangePop();
         return out_mask;

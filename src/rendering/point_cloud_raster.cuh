@@ -18,17 +18,27 @@ namespace lfs::rendering::pcraster {
         bool desaturate;
     };
 
+    struct CropEllipsoid {
+        float to_local[16];
+        float radii[3];
+        bool inverse;
+        bool desaturate;
+    };
+
     struct LaunchParams {
         const float* positions;
         const float* colors;
         const float* transforms; // [n_transforms, 16] column-major or null
         const std::int32_t* transform_indices;
         const std::uint8_t* visibility_mask;
+        const bool* deleted_mask;
         std::size_t n_points;
         int n_transforms;
         int n_visibility;
         bool has_crop;
         CropBox crop;
+        bool has_crop_ellipsoid;
+        CropEllipsoid crop_ellipsoid;
         float view[16];
         float view_proj[16];
         int width;

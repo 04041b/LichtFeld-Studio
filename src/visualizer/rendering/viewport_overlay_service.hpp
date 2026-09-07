@@ -73,7 +73,7 @@ namespace lfs::vis {
         [[nodiscard]] const CursorPreviewState& cursorPreview() const { return cursor_preview_; }
 
         void setRect(float x0, float y0, float x1, float y1, bool add_mode,
-                     std::optional<SplitViewPanelId> panel) {
+                     std::optional<SplitViewPanelId> panel, bool track_cursor) {
             rect_.active = true;
             rect_.x0 = x0;
             rect_.y0 = y0;
@@ -81,11 +81,13 @@ namespace lfs::vis {
             rect_.y1 = y1;
             rect_.add_mode = add_mode;
             rect_.panel = panel;
+            rect_.track_cursor = track_cursor;
         }
 
         void clearRect() {
             rect_.active = false;
             rect_.panel.reset();
+            rect_.track_cursor = false;
         }
         [[nodiscard]] bool isRectPreviewActive() const { return rect_.active; }
         [[nodiscard]] float rectX0() const { return rect_.x0; }
@@ -94,6 +96,7 @@ namespace lfs::vis {
         [[nodiscard]] float rectY1() const { return rect_.y1; }
         [[nodiscard]] bool rectAddMode() const { return rect_.add_mode; }
         [[nodiscard]] std::optional<SplitViewPanelId> rectPanel() const { return rect_.panel; }
+        [[nodiscard]] bool rectTracksCursor() const { return rect_.track_cursor; }
 
         void setPolygon(const std::vector<std::pair<float, float>>& points, bool closed, bool add_mode,
                         std::optional<SplitViewPanelId> panel) {
@@ -135,30 +138,36 @@ namespace lfs::vis {
         [[nodiscard]] std::optional<SplitViewPanelId> polygonPanel() const { return polygon_.panel; }
 
         void setLasso(const std::vector<std::pair<float, float>>& points, bool add_mode,
-                      std::optional<SplitViewPanelId> panel) {
+                      std::optional<SplitViewPanelId> panel, bool track_cursor) {
             lasso_.active = true;
             lasso_.points = points;
             lasso_.add_mode = add_mode;
             lasso_.panel = panel;
+            lasso_.track_cursor = track_cursor;
         }
 
         void clearLasso() {
             lasso_.active = false;
             lasso_.points.clear();
             lasso_.panel.reset();
+            lasso_.track_cursor = false;
         }
 
         [[nodiscard]] bool isLassoPreviewActive() const { return lasso_.active; }
         [[nodiscard]] const std::vector<std::pair<float, float>>& lassoPoints() const { return lasso_.points; }
         [[nodiscard]] bool lassoAddMode() const { return lasso_.add_mode; }
         [[nodiscard]] std::optional<SplitViewPanelId> lassoPanel() const { return lasso_.panel; }
+        [[nodiscard]] bool lassoTracksCursor() const { return lasso_.track_cursor; }
 
         [[nodiscard]] int hoveredGaussianId() const { return hovered_gaussian_id_; }
         void setHoveredGaussianId(int hovered_gaussian_id) { hovered_gaussian_id_ = hovered_gaussian_id; }
 
         void setCropbox(bool active, const glm::vec3& min, const glm::vec3& max,
-                        const glm::mat4& world_transform) {
+                        const glm::mat4& world_transform, bool affects_render = true,
+                        int parent_node_index = -1) {
             cropbox_active_ = active;
+            cropbox_affects_render_ = affects_render;
+            cropbox_parent_node_index_ = parent_node_index;
             if (active) {
                 cropbox_min_ = min;
                 cropbox_max_ = max;
@@ -166,26 +175,44 @@ namespace lfs::vis {
             }
         }
 
-        void setEllipsoid(bool active, const glm::vec3& radii, const glm::mat4& world_transform) {
+        void setEllipsoid(bool active, const glm::vec3& radii, const glm::mat4& world_transform,
+                          bool affects_render = true, int parent_node_index = -1) {
             ellipsoid_active_ = active;
+            ellipsoid_affects_render_ = affects_render;
+            ellipsoid_parent_node_index_ = parent_node_index;
             if (active) {
                 ellipsoid_radii_ = radii;
                 ellipsoid_transform_ = world_transform;
             }
         }
 
-        void setCropboxActive(bool active) { cropbox_active_ = active; }
-        void setEllipsoidActive(bool active) { ellipsoid_active_ = active; }
-
+        void setCropboxActive(bool active) {
+            cropbox_active_ = active;
+            if (!active) {
+                cropbox_affects_render_ = true;
+                cropbox_parent_node_index_ = -1;
+            }
+        }
+        void setEllipsoidActive(bool active) {
+            ellipsoid_active_ = active;
+            if (!active) {
+                ellipsoid_affects_render_ = true;
+                ellipsoid_parent_node_index_ = -1;
+            }
+        }
         [[nodiscard]] GizmoState makeFrameGizmoState() const {
             return GizmoState{
                 .cropbox_active = cropbox_active_,
                 .cropbox_min = cropbox_min_,
                 .cropbox_max = cropbox_max_,
                 .cropbox_transform = cropbox_transform_,
+                .cropbox_affects_render = cropbox_affects_render_,
+                .cropbox_parent_node_index = cropbox_parent_node_index_,
                 .ellipsoid_active = ellipsoid_active_,
                 .ellipsoid_radii = ellipsoid_radii_,
                 .ellipsoid_transform = ellipsoid_transform_,
+                .ellipsoid_affects_render = ellipsoid_affects_render_,
+                .ellipsoid_parent_node_index = ellipsoid_parent_node_index_,
             };
         }
 
@@ -198,6 +225,7 @@ namespace lfs::vis {
             float y1 = 0.0f;
             bool add_mode = true;
             std::optional<SplitViewPanelId> panel;
+            bool track_cursor = false;
         };
 
         struct PolygonPreviewState {
@@ -215,6 +243,7 @@ namespace lfs::vis {
             std::vector<std::pair<float, float>> points;
             bool add_mode = true;
             std::optional<SplitViewPanelId> panel;
+            bool track_cursor = false;
         };
 
         CursorPreviewState cursor_preview_;
@@ -225,6 +254,10 @@ namespace lfs::vis {
 
         bool cropbox_active_ = false;
         bool ellipsoid_active_ = false;
+        bool cropbox_affects_render_ = true;
+        int cropbox_parent_node_index_ = -1;
+        bool ellipsoid_affects_render_ = true;
+        int ellipsoid_parent_node_index_ = -1;
         glm::vec3 cropbox_min_{0.0f};
         glm::vec3 cropbox_max_{0.0f};
         glm::mat4 cropbox_transform_{1.0f};

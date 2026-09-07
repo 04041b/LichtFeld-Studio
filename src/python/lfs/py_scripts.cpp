@@ -24,7 +24,7 @@ namespace lfs::python {
             []() {
                 auto& state = ScriptState::getInstance();
                 nb::list result;
-                for (const auto& s : state.scripts()) {
+                for (const auto& s : state.scriptsSnapshot()) {
                     nb::dict d;
                     d["path"] = lfs::core::path_to_utf8(s.path);
                     d["enabled"] = s.enabled;
@@ -70,14 +70,18 @@ namespace lfs::python {
                 for (const auto& p : paths) {
                     fs_paths.emplace_back(lfs::core::utf8_to_path(p));
                 }
-                auto result = lfs::python::run_scripts(fs_paths);
+                lfs::Result<void> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = lfs::python::run_scripts(fs_paths);
+                }
                 nb::dict ret;
                 if (result) {
                     ret["success"] = true;
                     ret["error"] = "";
                 } else {
                     ret["success"] = false;
-                    ret["error"] = result.error();
+                    ret["error"] = lfs::format_for_developer(result.error());
                 }
                 return ret;
             },
@@ -98,7 +102,7 @@ namespace lfs::python {
 
         scripts.def(
             "count",
-            []() { return ScriptState::getInstance().scripts().size(); },
+            []() { return ScriptState::getInstance().scriptsSnapshot().size(); },
             "Get number of loaded scripts");
     }
 

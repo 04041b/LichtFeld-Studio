@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <expected>
 #include <functional>
+#include <optional>
 #include <string>
 
 namespace lfs::mcp {
@@ -29,7 +30,7 @@ namespace lfs::app {
         std::function<bool()> is_visible;
         std::function<void(bool)> set_visible;
         std::function<python::SequencerUIStateData*()> ui_state;
-        std::function<void()> add_keyframe;
+        std::function<void(std::optional<float>)> add_keyframe;
         std::function<void()> update_selected_keyframe;
         std::function<void(size_t)> select_keyframe;
         std::function<void(size_t)> go_to_keyframe;
@@ -40,6 +41,9 @@ namespace lfs::app {
         std::function<bool(const std::string&)> save_path;
         std::function<bool(const std::string&)> load_path;
         std::function<void(float)> set_playback_speed;
+        std::function<void(const std::string&, float)> load_ply_sequence;
+        std::function<void(float)> scrub_to_time;
+        std::function<std::string()> ply_sequence_status;
     };
 
     void register_gui_sequencer_tools(

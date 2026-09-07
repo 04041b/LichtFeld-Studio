@@ -7,8 +7,10 @@ import threading
 from urllib.parse import parse_qs, quote, urlparse
 
 import lichtfeld as lf
+from . import rml_widgets
 from .http import urlopen
 from .types import Panel
+from .panels import panel_class
 
 __lfs_panel_classes__ = ["GettingStartedPanel"]
 __lfs_panel_ids__ = ["lfs.getting_started"]
@@ -54,17 +56,16 @@ def _download_thumbnail(video_id, on_done):
         pass
 
 
+@panel_class("getting_started")
 class GettingStartedPanel(Panel):
     """Floating panel displaying tutorial videos and documentation."""
 
-    id = "lfs.getting_started"
-    label = "Getting Started"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 99
-    template = "rmlui/getting_started.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
-    size = (560, 0)
-    update_interval_ms = 100
+    def __init__(self):
+        self._handle = None
+        self._ready_lock = threading.Lock()
+        self._ready_queue = []
+        self._thumb_card_map = {}
+        self._thumb_update_scheduled = False
 
     def on_bind_model(self, ctx):
         model = ctx.create_data_model("getting_started")
@@ -73,6 +74,7 @@ class GettingStartedPanel(Panel):
 
         model.bind_func("panel_label", lambda: lf.ui.tr("getting_started.title"))
         model.bind_event("open_url", self._on_open_url)
+        self._handle = model.get_handle()
 
     def on_mount(self, doc):
         super().on_mount(doc)
@@ -80,6 +82,7 @@ class GettingStartedPanel(Panel):
         self._ready_lock = threading.Lock()
         self._ready_queue = []
         self._thumb_card_map = {}
+        self._thumb_update_scheduled = False
 
         for card in doc.query_selector_all(".video-card"):
             url = card.get_attribute("data-url", "").strip()
@@ -104,8 +107,42 @@ class GettingStartedPanel(Panel):
             lf.ui.open_url(url)
 
     def _on_thumb_ready(self, video_id, path):
+        should_schedule = False
         with self._ready_lock:
             self._ready_queue.append((video_id, path))
+            if not self._thumb_update_scheduled:
+                self._thumb_update_scheduled = True
+                should_schedule = True
+
+        if should_schedule:
+            self._schedule_thumbnail_update()
+
+    def _schedule_thumbnail_update(self):
+        def request_update():
+            with self._ready_lock:
+                self._thumb_update_scheduled = False
+            if self._handle:
+                rml_widgets.request_model_update(self._handle)
+
+        scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+        if not callable(scheduler):
+            scheduler = getattr(lf.ui, "_run_on_ui_thread", None)
+
+        if callable(scheduler):
+            try:
+                scheduler(request_update)
+                return
+            except Exception:
+                pass
+
+        with self._ready_lock:
+            self._thumb_update_scheduled = False
+        request_redraw = getattr(lf.ui, "request_redraw", None)
+        if callable(request_redraw):
+            try:
+                request_redraw()
+            except Exception:
+                pass
 
     def on_update(self, doc):
         if not hasattr(self, "_ready_lock"):

@@ -7,11 +7,14 @@
 #include "gui/gui_focus_state.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
+#include "gui/rmlui/rml_input_utils.hpp"
 #include "gui/rmlui/rml_theme.hpp"
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
+#include "gui/rmlui/rmlui_vk_backend.hpp"
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
 #include "internal/resource_paths.hpp"
+#include "preferences.hpp"
 #include "python/python_runtime.hpp"
 #include "python/ui_hooks.hpp"
 #include "theme/theme.hpp"
@@ -19,11 +22,130 @@
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
 #include <RmlUi/Core/Input.h>
+#include <RmlUi/Core/StringUtilities.h>
+#include <algorithm>
+#include <array>
 #include <cassert>
+#include <cmath>
 #include <format>
+#include <limits>
+#include <string_view>
 #include <vector>
 
 namespace lfs::vis::gui {
+    namespace {
+        [[nodiscard]] bool isInteractiveViewportOverlayElement(const Rml::Element* const element) {
+            if (!element)
+                return false;
+            for (auto* node = element; node; node = node->GetParentNode()) {
+                if (node->GetId() == "project-drop-overlay")
+                    return false;
+            }
+            return element->GetTagName() != "body" &&
+                   element->GetTagName() != "#root" &&
+                   element->GetId() != "overlay-body" &&
+                   element->GetId() != "dm-root" &&
+                   !element->IsClassSet("viewport-split-divider") &&
+                   !element->IsClassSet("left-dock-resize-indicator");
+        }
+
+        [[nodiscard]] bool isViewportOverlayHoverRoot(const Rml::Element* const element) {
+            if (!isInteractiveViewportOverlayElement(element))
+                return false;
+
+            const auto tag = element->GetTagName();
+            return tag == "button" || tag == "input" || tag == "textarea" || tag == "select" ||
+                   element->IsClassSet("icon-btn") ||
+                   element->IsClassSet("toolbar-group-container") ||
+                   element->IsClassSet("toolbar-drag-handle") ||
+                   element->IsClassSet("viewport-transform-option") ||
+                   element->IsClassSet("viewport-transform-action") ||
+                   element->IsClassSet("vram-hud-tree-row") ||
+                   element->IsClassSet("vram-hud-expand-toggle") ||
+                   element->IsClassSet("vram-hud-tab") ||
+                   element->IsClassSet("vram-hud-filter-clear") ||
+                   element->IsClassSet("vram-hud-resize");
+        }
+
+        [[nodiscard]] const Rml::Element* viewportOverlayHoverRoot(
+            const Rml::Element* const element) {
+            // Walk parents with an explicit null stop (matches isElementOrDescendantOf).
+            for (auto* node = element; node; node = node->GetParentNode()) {
+                if (!isInteractiveViewportOverlayElement(node))
+                    break;
+                if (isViewportOverlayHoverRoot(node))
+                    return node;
+            }
+            return isInteractiveViewportOverlayElement(element) ? element : nullptr;
+        }
+
+        [[nodiscard]] bool isElementOrDescendantOf(const Rml::Element* element,
+                                                   const Rml::Element* ancestor) {
+            for (auto* node = element; node; node = node->GetParentNode()) {
+                if (node == ancestor)
+                    return true;
+            }
+            return false;
+        }
+
+        // Keep guiFocusState in sync with the overlay's live RmlUi focus so
+        // InputController shortcut dispatch sees text editing on the next key.
+        bool publishOverlayTextFocus(Rml::Element* focused) {
+            if (!rml_input::wantsTextInput(focused))
+                return false;
+            auto& focus = guiFocusState();
+            focus.want_capture_keyboard = true;
+            focus.want_text_input = true;
+            return true;
+        }
+
+    } // namespace
+
+    RmlViewportOverlay::RmlViewportOverlay()
+        : vram_hud_(std::make_unique<VramHudOverlay>()) {
+        toolbar_drag_listener_.owner = this;
+    }
+
+    RmlViewportOverlay::~RmlViewportOverlay() = default;
+
+    void RmlViewportOverlay::markRenderNeeded(const RenderReason reason) {
+        render_needed_ = true;
+        render_reason_bits_ |= static_cast<std::uint32_t>(reason);
+    }
+
+    std::string RmlViewportOverlay::renderReasonSources() const {
+        if (render_reason_bits_ == 0)
+            return "none";
+
+        std::string sources;
+        const auto append = [&](const RenderReason reason, const char* name) {
+            if ((render_reason_bits_ & static_cast<std::uint32_t>(reason)) == 0)
+                return;
+            if (!sources.empty())
+                sources.push_back('|');
+            sources.append(name);
+        };
+        append(RenderReason::Initial, "initial");
+        append(RenderReason::Reload, "reload");
+        append(RenderReason::DocumentSync, "document_sync");
+        append(RenderReason::DocumentHook, "document_hook");
+        append(RenderReason::ViewportResize, "viewport_resize");
+        append(RenderReason::ToolbarLayout, "toolbar_layout");
+        append(RenderReason::SplitDivider, "split_divider");
+        append(RenderReason::GTMetrics, "gt_metrics");
+        append(RenderReason::VramHud, "vram_hud");
+        append(RenderReason::DataModelBinding, "data_model_binding");
+        append(RenderReason::PointerHover, "pointer_hover");
+        append(RenderReason::PointerButton, "pointer_button");
+        append(RenderReason::PointerWheel, "pointer_wheel");
+        append(RenderReason::PointerDrag, "pointer_drag");
+        append(RenderReason::Keyboard, "keyboard");
+        append(RenderReason::LodStats, "lod_stats");
+        append(RenderReason::LeftDockResize, "left_dock_resize");
+        append(RenderReason::ProjectDrag, "project_drag");
+        append(RenderReason::ThemePresentation, "theme_presentation");
+        return sources.empty() ? "unknown" : sources;
+    }
 
     void RmlViewportOverlay::init(RmlUIManager* mgr) {
         assert(mgr);
@@ -44,47 +166,80 @@ namespace lfs::vis::gui {
             }
             cacheBodyTemplate();
             document_->Show();
-            applyGTMetricsOverlay();
+            bindReactiveStore();
+            refreshGTMetricsOverlayFromStore();
+            applyLodStatsOverlay();
+            applyProjectDragOverlay();
+            attachToolbarDragListeners();
+            if (vram_hud_)
+                vram_hud_->onDocumentLoaded(document_);
         } catch (const std::exception& e) {
             LOG_ERROR("RmlViewportOverlay: resource not found: {}", e.what());
             return;
         }
 
-        render_needed_ = true;
+        markRenderNeeded(RenderReason::Initial);
         updateTheme();
     }
 
     void RmlViewportOverlay::shutdown() {
+        lfs::python::notify_viewport_overlay_document_unloaded();
         if (doc_registered_)
             lfs::python::unregister_rml_document("viewport_overlay");
         doc_registered_ = false;
+        gt_metrics_config_subscription_.reset();
+        camera_metrics_subscription_.reset();
+        vram_hud_subscription_.reset();
+        document_sync_subscriptions_.clear();
+        resetToolbarDragListeners();
 
+        if (vram_hud_)
+            vram_hud_->onDocumentDestroyed();
+        if (rml_manager_)
+            rml_manager_->releaseCachedVulkanContext(direct_cache_);
         if (rml_context_ && rml_manager_)
             rml_manager_->destroyContext("viewport_overlay");
         rml_context_ = nullptr;
         document_ = nullptr;
+        body_el_ = nullptr;
         body_template_rml_.clear();
+        hovered_interactive_ = false;
+        last_hover_element_ = nullptr;
+        mouse_pos_valid_ = false;
     }
 
     void RmlViewportOverlay::reloadResources() {
         if (!rml_context_)
             return;
 
+        lfs::python::notify_viewport_overlay_document_unloaded();
         if (doc_registered_)
             lfs::python::unregister_rml_document("viewport_overlay");
         doc_registered_ = false;
 
+        if (rml_manager_)
+            rml_manager_->releaseCachedVulkanContext(direct_cache_);
+
         if (document_) {
+            resetToolbarDragListeners();
             rml_context_->UnloadDocument(document_);
             rml_context_->Update();
         }
 
+        if (vram_hud_)
+            vram_hud_->onDocumentDestroyed();
         document_ = nullptr;
+        body_el_ = nullptr;
         base_rcss_.clear();
         has_theme_signature_ = false;
         wants_input_ = false;
-        render_needed_ = true;
+        markRenderNeeded(RenderReason::Reload);
+        document_sync_dirty_ = true;
+        data_model_binding_dirty_ = true;
+        toolbar_roots_dirty_ = true;
         animation_active_ = true;
+        hovered_interactive_ = false;
+        last_hover_element_ = nullptr;
         mouse_pos_valid_ = false;
         last_render_w_ = 0;
         last_render_h_ = 0;
@@ -100,6 +255,13 @@ namespace lfs::vis::gui {
             cacheBodyTemplate();
             document_->Show();
             applyGTMetricsOverlay();
+            applySplitDividerOverlay();
+            applyLeftDockResizeIndicator();
+            applyLodStatsOverlay();
+            applyProjectDragOverlay();
+            attachToolbarDragListeners();
+            if (vram_hud_)
+                vram_hud_->onDocumentLoaded(document_);
             updateToolbarRoots();
         } catch (const std::exception& e) {
             LOG_ERROR("RmlViewportOverlay: resource not found during reload: {}", e.what());
@@ -111,11 +273,14 @@ namespace lfs::vis::gui {
 
     void RmlViewportOverlay::cacheBodyTemplate() {
         body_template_rml_.clear();
+        body_el_ = nullptr;
         if (!document_)
             return;
 
-        if (auto* const body = document_->GetElementById("overlay-body"))
+        if (auto* const body = document_->GetElementById("overlay-body")) {
+            body_el_ = body;
             body_template_rml_ = body->GetInnerRML();
+        }
     }
 
     bool RmlViewportOverlay::updateTheme() {
@@ -127,6 +292,7 @@ namespace lfs::vis::gui {
             return false;
         last_theme_signature_ = theme_signature;
         has_theme_signature_ = true;
+        viewport_chrome_style_ = loadViewportChromeStylePreference();
 
         if (base_rcss_.empty())
             base_rcss_ = rml_theme::loadBaseRCSS("rmlui/viewport_overlay.rcss");
@@ -135,8 +301,12 @@ namespace lfs::vis::gui {
         return true;
     }
 
-    bool RmlViewportOverlay::shouldRunDocumentHooks(const bool force) const {
-        if (!lfs::python::has_python_hooks("viewport_overlay", "document"))
+    // Python document hooks are allowed to mutate the Rml document, so a due
+    // hook must break the cached-render path even if all native overlay state is
+    // unchanged. Plugins that register passive hooks therefore opt into this
+    // polling cadence; hooks that dirty every poll intentionally repaint.
+    bool RmlViewportOverlay::shouldRunDocumentHooks(const bool force, const bool prepend) const {
+        if (!lfs::python::has_python_hooks("viewport_overlay", "document", prepend))
             return false;
         if (force || last_document_hook_run_ == std::chrono::steady_clock::time_point{})
             return true;
@@ -144,15 +314,56 @@ namespace lfs::vis::gui {
                kDocumentHookPollInterval;
     }
 
+    bool RmlViewportOverlay::shouldRunAnyDocumentHooks(const bool force) const {
+        return shouldRunDocumentHooks(force, true) || shouldRunDocumentHooks(force, false);
+    }
+
+    void RmlViewportOverlay::markDocumentSyncDirty() {
+        document_sync_dirty_ = true;
+    }
+
+    bool RmlViewportOverlay::syncBuiltinDocument(const bool force) {
+        if (!document_ || (!force && !document_sync_dirty_))
+            return false;
+
+        LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.builtin_document_sync", 0.25);
+        const bool dirty = lfs::python::sync_viewport_overlay_document(document_);
+        document_sync_dirty_ = false;
+        if (dirty) {
+            toolbar_rail_layout_dirty_ = true;
+            markRenderNeeded(RenderReason::DocumentSync);
+        }
+        return dirty;
+    }
+
     void RmlViewportOverlay::setViewportBounds(glm::vec2 pos, glm::vec2 size,
                                                glm::vec2 screen_origin) {
+        const bool context_size_changed =
+            static_cast<int>(vp_size_.x) != static_cast<int>(size.x) ||
+            static_cast<int>(vp_size_.y) != static_cast<int>(size.y);
         if (vp_pos_ != pos || screen_origin_ != screen_origin)
             mouse_pos_valid_ = false;
-        if (vp_size_ != size)
-            render_needed_ = true;
+        if (vp_pos_ != pos || screen_origin_ != screen_origin || vp_size_ != size)
+            last_hover_element_ = nullptr;
+        if (context_size_changed)
+            markRenderNeeded(RenderReason::ViewportResize);
+        if (context_size_changed)
+            toolbar_roots_dirty_ = true;
+        if (context_size_changed)
+            toolbar_rail_layout_dirty_ = true;
         vp_pos_ = pos;
         vp_size_ = size;
         screen_origin_ = screen_origin;
+        if (context_size_changed && project_drag_overlay_.visible)
+            applyProjectDragOverlay();
+    }
+
+    void RmlViewportOverlay::setViewportContentOffset(const float x) {
+        if (std::abs(viewport_content_offset_ - x) > 0.5f) {
+            viewport_content_offset_ = x;
+            viewport_content_offset_dirty_ = true;
+            markRenderNeeded(RenderReason::ViewportResize);
+        }
     }
 
     void RmlViewportOverlay::setToolbarPanels(const float primary_x,
@@ -175,8 +386,42 @@ namespace lfs::vis::gui {
         show_secondary_toolbar_ = show_secondary;
         secondary_toolbar_x_ = secondary_x;
         secondary_toolbar_width_ = secondary_width;
-        render_needed_ = true;
+        markRenderNeeded(RenderReason::ToolbarLayout);
+        toolbar_roots_dirty_ = true;
+        toolbar_rail_layout_dirty_ = true;
         updateToolbarRoots();
+    }
+
+    void RmlViewportOverlay::setSplitDividerOverlay(SplitDividerOverlayState state) {
+        const bool changed =
+            split_divider_overlay_.visible != state.visible ||
+            std::abs(split_divider_overlay_.x - state.x) > 0.5f ||
+            std::abs(split_divider_overlay_.y - state.y) > 0.5f ||
+            std::abs(split_divider_overlay_.width - state.width) > 0.5f ||
+            std::abs(split_divider_overlay_.height - state.height) > 0.5f;
+        if (!changed) {
+            return;
+        }
+
+        split_divider_overlay_ = state;
+        applySplitDividerOverlay();
+        markRenderNeeded(RenderReason::SplitDivider);
+    }
+
+    void RmlViewportOverlay::setLeftDockResizeIndicator(
+        const bool visible, const bool active, const float thickness) {
+        const float clamped_thickness = std::max(thickness, 0.0f);
+        if (left_dock_resize_visible_ == visible &&
+            left_dock_resize_active_ == active &&
+            std::abs(left_dock_resize_thickness_ - clamped_thickness) <= 0.5f) {
+            return;
+        }
+
+        left_dock_resize_visible_ = visible;
+        left_dock_resize_active_ = active;
+        left_dock_resize_thickness_ = clamped_thickness;
+        applyLeftDockResizeIndicator();
+        markRenderNeeded(RenderReason::LeftDockResize);
     }
 
     void RmlViewportOverlay::setGTMetricsOverlay(GTMetricsOverlayState state) {
@@ -193,13 +438,167 @@ namespace lfs::vis::gui {
 
         gt_metrics_overlay_ = std::move(state);
         applyGTMetricsOverlay();
-        render_needed_ = true;
+        markRenderNeeded(RenderReason::GTMetrics);
     }
 
-    void RmlViewportOverlay::updateToolbarRoots() {
-        if (!document_) {
+    void RmlViewportOverlay::setLodStatsOverlay(LodStatsOverlayState state) {
+        const bool changed =
+            lod_stats_overlay_.visible != state.visible ||
+            std::abs(lod_stats_overlay_.x - state.x) > 0.5f ||
+            std::abs(lod_stats_overlay_.y - state.y) > 0.5f ||
+            lod_stats_overlay_.status_text != state.status_text ||
+            lod_stats_overlay_.selected_text != state.selected_text ||
+            lod_stats_overlay_.budget_text != state.budget_text ||
+            lod_stats_overlay_.model_text != state.model_text ||
+            lod_stats_overlay_.tree_text != state.tree_text ||
+            lod_stats_overlay_.traversal_text != state.traversal_text ||
+            lod_stats_overlay_.stop_text != state.stop_text ||
+            lod_stats_overlay_.chunks_text != state.chunks_text ||
+            lod_stats_overlay_.cache_text != state.cache_text ||
+            lod_stats_overlay_.selector_text != state.selector_text ||
+            lod_stats_overlay_.pixel_text != state.pixel_text ||
+            lod_stats_overlay_.render_text != state.render_text ||
+            lod_stats_overlay_.foveation_text != state.foveation_text ||
+            lod_stats_overlay_.hash_text != state.hash_text;
+        if (!changed) {
             return;
         }
+
+        lod_stats_overlay_ = std::move(state);
+        applyLodStatsOverlay();
+        markRenderNeeded(RenderReason::LodStats);
+    }
+
+    void RmlViewportOverlay::setVramHudOverlay(VramHudOverlayState state) {
+        if (!vram_hud_)
+            return;
+        const bool was_visible = vram_hud_->isVisible();
+        vram_hud_->setState(std::move(state));
+        if (was_visible || vram_hud_->isVisible())
+            markRenderNeeded(RenderReason::VramHud);
+    }
+
+    void RmlViewportOverlay::bindReactiveStore() {
+        auto& store = lfs::vis::app_store();
+        gt_metrics_config_ = store.gt_metrics_overlay_config.get();
+        camera_metrics_ = store.camera_metrics.get();
+
+        const auto make_overlay_state = [&store]() {
+            RmlViewportOverlay::VramHudOverlayState overlay_state;
+            const auto vram_hud_state = store.vram_hud.get();
+            const auto perf_hud_state = store.perf_hud.get();
+            if (vram_hud_state.visible && vram_hud_state.snapshot) {
+                overlay_state.visible = true;
+                overlay_state.snapshot = *vram_hud_state.snapshot;
+            }
+            overlay_state.perf_hud = perf_hud_state;
+            return overlay_state;
+        };
+        const auto overlay_state = make_overlay_state();
+        setVramHudOverlay(std::move(overlay_state));
+
+        gt_metrics_config_subscription_ = store.gt_metrics_overlay_config.subscribe(
+            [this](const lfs::vis::AppStore::GTMetricsOverlayConfig& config) {
+                gt_metrics_config_ = config;
+                refreshGTMetricsOverlayFromStore();
+            });
+        camera_metrics_subscription_ = store.camera_metrics.subscribe(
+            [this](const std::optional<lfs::vis::AppStore::CameraMetrics>& metrics) {
+                camera_metrics_ = metrics;
+                refreshGTMetricsOverlayFromStore();
+            });
+        vram_hud_subscription_ = store.vram_hud.subscribe(
+            [this](const lfs::vis::AppStore::VramHud& state) {
+                RmlViewportOverlay::VramHudOverlayState overlay;
+                if (state.visible && state.snapshot) {
+                    overlay.visible = true;
+                    overlay.snapshot = *state.snapshot;
+                }
+                overlay.perf_hud = lfs::vis::app_store().perf_hud.get();
+                setVramHudOverlay(std::move(overlay));
+            });
+        perf_hud_subscription_ = store.perf_hud.subscribe(
+            [this](const lfs::vis::AppStore::PerfHud& state) {
+                auto overlay = lfs::vis::app_store().vram_hud.get();
+                VramHudOverlayState combined;
+                combined.perf_hud = state;
+                if (overlay.visible && overlay.snapshot) {
+                    combined.visible = true;
+                    combined.snapshot = *overlay.snapshot;
+                }
+                setVramHudOverlay(std::move(combined));
+            });
+
+        auto mark_document_dirty = [this](const auto&) {
+            markDocumentSyncDirty();
+        };
+        document_sync_subscriptions_.push_back(store.training_state.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.scene_generation.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.selection_generation.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.active_tool.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.active_submode.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.transform_space.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.pivot_mode.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.multi_transform_mode.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(
+            store.render_settings_generation.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(
+            store.viewport_toolbar_generation.subscribe([this](const auto&) {
+                toolbar_position_preference_dirty_ = true;
+                toolbar_roots_dirty_ = true;
+                markDocumentSyncDirty();
+                markRenderNeeded(RenderReason::ToolbarLayout);
+            }));
+        document_sync_subscriptions_.push_back(
+            store.language_generation.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(
+            store.import_overlay_state.subscribe(mark_document_dirty));
+        document_sync_subscriptions_.push_back(store.video_export_overlay_state.subscribe(mark_document_dirty));
+    }
+
+    void RmlViewportOverlay::refreshGTMetricsOverlayFromStore() {
+        GTMetricsOverlayState state;
+        state.visible = gt_metrics_config_.visible;
+        state.x = gt_metrics_config_.x;
+        state.y = gt_metrics_config_.y;
+        state.show_ssim = gt_metrics_config_.show_ssim;
+        state.psnr_text = "--";
+        state.ssim_text = "--";
+
+        if (state.visible && camera_metrics_ &&
+            camera_metrics_->camera_id == gt_metrics_config_.current_camera_id) {
+            state.psnr_text = std::format("{:.2f}", camera_metrics_->psnr);
+            if (state.show_ssim && camera_metrics_->ssim.has_value())
+                state.ssim_text = std::format("{:.4f}", *camera_metrics_->ssim);
+        }
+
+        setGTMetricsOverlay(std::move(state));
+    }
+
+    bool RmlViewportOverlay::updateToolbarRoots() {
+        if (!document_) {
+            return false;
+        }
+
+        if (toolbar_position_preference_dirty_) {
+            viewport_toolbar_position_ = loadViewportToolbarPositionPreference();
+            viewport_toolbar_free_y_ = loadViewportToolbarFreeYPreference();
+            toolbar_position_preference_dirty_ = false;
+            if (viewport_toolbar_position_ != "free") {
+                toolbar_drag_active_ = false;
+                toolbar_drag_moved_ = false;
+            }
+        }
+
+        const bool changed =
+            toolbar_roots_dirty_ ||
+            std::abs(applied_primary_toolbar_x_ - primary_toolbar_x_) > 0.5f ||
+            std::abs(applied_primary_toolbar_width_ - primary_toolbar_width_) > 0.5f ||
+            applied_show_secondary_toolbar_ != show_secondary_toolbar_ ||
+            std::abs(applied_secondary_toolbar_x_ - secondary_toolbar_x_) > 0.5f ||
+            std::abs(applied_secondary_toolbar_width_ - secondary_toolbar_width_) > 0.5f;
+        if (!changed)
+            return false;
 
         const auto apply_root = [&](const char* element_id,
                                     const float x,
@@ -217,6 +616,299 @@ namespace lfs::vis::gui {
                    secondary_toolbar_x_,
                    secondary_toolbar_width_,
                    show_secondary_toolbar_ && secondary_toolbar_width_ > 0.0f);
+        const auto apply_left_toolbar_offset = [&](const char* element_id, const float x) {
+            if (auto* const element = document_->GetElementById(element_id)) {
+                element->SetProperty("left", std::format("{:.1f}px", x));
+            }
+        };
+        apply_left_toolbar_offset("primary-utility-toolbar", -primary_toolbar_x_);
+        attachToolbarDragListeners();
+        applyToolbarPosition();
+        applied_primary_toolbar_x_ = primary_toolbar_x_;
+        applied_primary_toolbar_width_ = primary_toolbar_width_;
+        applied_show_secondary_toolbar_ = show_secondary_toolbar_;
+        applied_secondary_toolbar_x_ = secondary_toolbar_x_;
+        applied_secondary_toolbar_width_ = secondary_toolbar_width_;
+        toolbar_roots_dirty_ = false;
+        toolbar_rail_layout_dirty_ = true;
+        return true;
+    }
+
+    bool RmlViewportOverlay::updateToolbarRailLayout() {
+        if (!document_ || !rml_context_ || !toolbar_rail_layout_dirty_)
+            return false;
+
+        const float dpi = std::max(rml_context_->GetDensityIndependentPixelRatio(), 0.01f);
+        const float available_height = std::max(0.0f, vp_size_.y - 24.0f * dpi);
+        auto* const primary_toolbar = document_->GetElementById("primary-utility-toolbar");
+        auto* const secondary_toolbar = document_->GetElementById("secondary-utility-toolbar");
+        auto* const primary_tools = document_->GetElementById("primary-rail-tools");
+        auto* const primary_panels = document_->GetElementById("primary-rail-panels");
+        auto* const secondary_tools = document_->GetElementById("secondary-rail-tools");
+        auto* const secondary_panels = document_->GetElementById("secondary-rail-panels");
+
+        auto* toolbar = primary_toolbar;
+        auto* tools = primary_tools;
+        auto* panels = primary_panels;
+        if (primary_toolbar_width_ <= 0.0f && show_secondary_toolbar_ && secondary_toolbar) {
+            toolbar = secondary_toolbar;
+            tools = secondary_tools;
+            panels = secondary_panels;
+        }
+        if (!toolbar || !tools || !panels)
+            return false;
+
+        const bool tools_empty = tools->GetNumChildren() == 0;
+        const bool panels_empty = panels->GetNumChildren() == 0;
+        const bool both_groups_non_empty = !tools_empty && !panels_empty;
+        bool changed = false;
+
+        const auto set_class_on_roots = [&](const char* class_name, const bool enabled) {
+            bool class_changed = false;
+            const auto set_class = [&](Rml::Element* element) {
+                if (!element || element->IsClassSet(class_name) == enabled)
+                    return;
+                element->SetClass(class_name, enabled);
+                changed = true;
+                class_changed = true;
+            };
+            set_class(primary_toolbar);
+            set_class(secondary_toolbar);
+            return class_changed;
+        };
+
+        bool classes_changed = false;
+        classes_changed |= set_class_on_roots("rail-tools-empty", tools_empty);
+        classes_changed |= set_class_on_roots("rail-panels-empty", panels_empty);
+        classes_changed |= set_class_on_roots("rail-two-column", false);
+        classes_changed |= set_class_on_roots("rail-compact", false);
+        if (classes_changed)
+            rml_context_->Update();
+
+        const auto natural_height = [&]() {
+            return toolbar->GetBox().GetSize(Rml::BoxArea::Border).y;
+        };
+        if (natural_height() > available_height + 0.5f) {
+            if (both_groups_non_empty) {
+                if (set_class_on_roots("rail-two-column", true))
+                    rml_context_->Update();
+                if (natural_height() > available_height + 0.5f) {
+                    if (set_class_on_roots("rail-compact", true))
+                        rml_context_->Update();
+                }
+            } else {
+                if (set_class_on_roots("rail-compact", true))
+                    rml_context_->Update();
+            }
+        }
+
+        toolbar_rail_layout_dirty_ = false;
+        return changed;
+    }
+
+    float RmlViewportOverlay::toolbarFreeGap(const float toolbar_height) const {
+        const float dp_ratio = rml_context_
+                                   ? std::max(rml_context_->GetDensityIndependentPixelRatio(), 0.01f)
+                                   : 1.0f;
+        constexpr float kViewportGapDp = 12.0f;
+        return std::min(kViewportGapDp * dp_ratio,
+                        std::max(0.0f, (vp_size_.y - std::max(toolbar_height, 0.0f)) * 0.5f));
+    }
+
+    float RmlViewportOverlay::toolbarFreeTravel(const float toolbar_height) const {
+        const float gap = toolbarFreeGap(toolbar_height);
+        return std::max(0.0f, vp_size_.y - 2.0f * gap - std::max(toolbar_height, 0.0f));
+    }
+
+    float RmlViewportOverlay::toolbarFreeTop(const float toolbar_height) const {
+        return toolbarFreeGap(toolbar_height) +
+               std::clamp(viewport_toolbar_free_y_, 0.0f, 1.0f) *
+                   toolbarFreeTravel(toolbar_height);
+    }
+
+    bool RmlViewportOverlay::applyToolbarPosition() {
+        if (!document_)
+            return false;
+
+        const bool mode_changed =
+            applied_viewport_toolbar_position_ != viewport_toolbar_position_;
+        const bool drag_state_changed =
+            applied_toolbar_drag_active_ != toolbar_drag_active_;
+        bool changed = mode_changed || drag_state_changed;
+
+        if (mode_changed || drag_state_changed) {
+            const auto apply_root_classes = [&](const char* element_id) {
+                if (auto* const root = document_->GetElementById(element_id)) {
+                    root->SetClass("toolbar-position-top", viewport_toolbar_position_ == "top");
+                    root->SetClass("toolbar-position-centered", viewport_toolbar_position_ == "centered");
+                    root->SetClass("toolbar-position-free", viewport_toolbar_position_ == "free");
+                    root->SetClass("toolbar-dragging", toolbar_drag_active_);
+                }
+            };
+            apply_root_classes("primary-toolbar-root");
+            apply_root_classes("secondary-toolbar-root");
+        }
+
+        float fallback_height = 0.0f;
+        if (auto* const primary = document_->GetElementById("primary-utility-toolbar"))
+            fallback_height = primary->GetBox().GetSize(Rml::BoxArea::Border).y;
+
+        const auto apply_toolbar = [&](const char* element_id, float& applied_top) {
+            auto* const toolbar = document_->GetElementById(element_id);
+            if (!toolbar)
+                return;
+
+            if (viewport_toolbar_position_ != "free") {
+                if (mode_changed)
+                    toolbar->RemoveProperty("margin-top");
+                applied_top = std::numeric_limits<float>::quiet_NaN();
+                return;
+            }
+
+            float height = toolbar->GetBox().GetSize(Rml::BoxArea::Border).y;
+            if (height <= 0.0f)
+                height = fallback_height;
+            const float top = toolbarFreeTop(height);
+            if (!std::isfinite(applied_top) || std::abs(applied_top - top) > 0.25f) {
+                toolbar->SetProperty("margin-top", std::format("{:.1f}px", top));
+                applied_top = top;
+                changed = true;
+            }
+        };
+        apply_toolbar("primary-utility-toolbar", applied_primary_toolbar_top_);
+        apply_toolbar("secondary-utility-toolbar", applied_secondary_toolbar_top_);
+
+        applied_viewport_toolbar_position_ = viewport_toolbar_position_;
+        applied_toolbar_drag_active_ = toolbar_drag_active_;
+        return changed;
+    }
+
+    void RmlViewportOverlay::attachToolbarDragListeners() {
+        if (!document_)
+            return;
+
+        const auto attach = [&](const char* element_id, Rml::Element*& cached) {
+            auto* const handle = document_->GetElementById(element_id);
+            if (!handle || handle == cached)
+                return;
+            handle->AddEventListener(Rml::EventId::Dragstart, &toolbar_drag_listener_);
+            handle->AddEventListener(Rml::EventId::Drag, &toolbar_drag_listener_);
+            handle->AddEventListener(Rml::EventId::Dragend, &toolbar_drag_listener_);
+            cached = handle;
+        };
+        attach("primary-utility-toolbar-handle", primary_toolbar_drag_handle_);
+        attach("secondary-utility-toolbar-handle", secondary_toolbar_drag_handle_);
+    }
+
+    void RmlViewportOverlay::resetToolbarDragListeners() {
+        if (toolbar_drag_moved_ && viewport_toolbar_position_ == "free")
+            saveViewportToolbarFreeYPreference(viewport_toolbar_free_y_);
+        primary_toolbar_drag_handle_ = nullptr;
+        secondary_toolbar_drag_handle_ = nullptr;
+        toolbar_drag_active_ = false;
+        applied_toolbar_drag_active_ = false;
+        toolbar_drag_moved_ = false;
+        applied_viewport_toolbar_position_.clear();
+        applied_primary_toolbar_top_ = std::numeric_limits<float>::quiet_NaN();
+        applied_secondary_toolbar_top_ = std::numeric_limits<float>::quiet_NaN();
+    }
+
+    void RmlViewportOverlay::ToolbarDragListener::ProcessEvent(Rml::Event& event) {
+        if (owner)
+            owner->onToolbarDrag(event);
+    }
+
+    void RmlViewportOverlay::onToolbarDrag(Rml::Event& event) {
+        if (viewport_toolbar_position_ != "free")
+            return;
+
+        const auto type = event.GetId();
+        const float mouse_y = event.GetParameter("mouse_y", 0.0f);
+        if (type == Rml::EventId::Dragstart) {
+            auto* const handle = event.GetCurrentElement();
+            auto* const toolbar = handle ? handle->GetParentNode() : nullptr;
+            if (!toolbar ||
+                (toolbar->GetId() != "primary-utility-toolbar" &&
+                 toolbar->GetId() != "secondary-utility-toolbar")) {
+                return;
+            }
+            toolbar_drag_active_ = true;
+            toolbar_drag_moved_ = false;
+            toolbar_drag_start_top_ = toolbar->GetAbsoluteOffset().y;
+            toolbar_drag_start_mouse_y_ = mouse_y;
+            applyToolbarPosition();
+            markRenderNeeded(RenderReason::PointerDrag);
+            event.StopPropagation();
+        } else if (type == Rml::EventId::Drag && toolbar_drag_active_) {
+            auto* const handle = event.GetCurrentElement();
+            auto* const toolbar = handle ? handle->GetParentNode() : nullptr;
+            if (!toolbar)
+                return;
+            const float height = toolbar->GetBox().GetSize(Rml::BoxArea::Border).y;
+            const float travel = toolbarFreeTravel(height);
+            const float desired_top = toolbar_drag_start_top_ +
+                                      (mouse_y - toolbar_drag_start_mouse_y_);
+            const float next_y = travel > 0.0f
+                                     ? std::clamp(
+                                           (desired_top - toolbarFreeGap(height)) / travel,
+                                           0.0f,
+                                           1.0f)
+                                     : 0.5f;
+            if (std::abs(next_y - viewport_toolbar_free_y_) > 0.0001f) {
+                viewport_toolbar_free_y_ = next_y;
+                toolbar_drag_moved_ = true;
+                applyToolbarPosition();
+                markRenderNeeded(RenderReason::PointerDrag);
+            }
+            event.StopPropagation();
+        } else if (type == Rml::EventId::Dragend && toolbar_drag_active_) {
+            toolbar_drag_active_ = false;
+            applyToolbarPosition();
+            if (toolbar_drag_moved_)
+                saveViewportToolbarFreeYPreference(viewport_toolbar_free_y_);
+            toolbar_drag_moved_ = false;
+            markRenderNeeded(RenderReason::PointerDrag);
+            event.StopPropagation();
+        }
+    }
+
+    void RmlViewportOverlay::updateViewportContentOffset() {
+        if (!document_ || !viewport_content_offset_dirty_)
+            return;
+        if (auto* const element = document_->GetElementById("viewport-content")) {
+            element->SetProperty("left", std::format("{:.1f}px", viewport_content_offset_));
+        }
+        applyProjectDragOverlay();
+        viewport_content_offset_dirty_ = false;
+    }
+
+    void RmlViewportOverlay::applySplitDividerOverlay() {
+        if (!document_) {
+            return;
+        }
+
+        if (auto* const overlay = document_->GetElementById("split-divider-overlay")) {
+            overlay->SetClass("hidden", !split_divider_overlay_.visible);
+            overlay->SetProperty("left", std::format("{:.1f}px", split_divider_overlay_.x));
+            overlay->SetProperty("top", std::format("{:.1f}px", split_divider_overlay_.y));
+            overlay->SetProperty("width", std::format("{:.1f}px", std::max(split_divider_overlay_.width, 0.0f)));
+            overlay->SetProperty("height", std::format("{:.1f}px", std::max(split_divider_overlay_.height, 0.0f)));
+            markRenderNeeded(RenderReason::SplitDivider);
+        }
+    }
+
+    void RmlViewportOverlay::applyLeftDockResizeIndicator() {
+        if (!document_)
+            return;
+
+        if (auto* const indicator =
+                document_->GetElementById("left-dock-resize-indicator")) {
+            indicator->SetClass("hidden", !left_dock_resize_visible_);
+            indicator->SetClass("active", left_dock_resize_active_);
+            indicator->SetProperty(
+                "width",
+                std::format("{:.1f}px", left_dock_resize_thickness_));
+        }
     }
 
     void RmlViewportOverlay::applyGTMetricsOverlay() {
@@ -224,19 +916,97 @@ namespace lfs::vis::gui {
             return;
         }
 
+        const auto metric_text = [](const std::string& text) -> Rml::String {
+            return text.empty() ? Rml::String("--") : Rml::String(text);
+        };
+        bool touched = false;
         if (auto* const overlay = document_->GetElementById("gt-metrics-overlay")) {
             overlay->SetClass("hidden", !gt_metrics_overlay_.visible);
             overlay->SetProperty("left", std::format("{:.1f}px", gt_metrics_overlay_.x));
             overlay->SetProperty("top", std::format("{:.1f}px", gt_metrics_overlay_.y));
+            touched = true;
         }
         if (auto* const psnr = document_->GetElementById("gt-metrics-psnr")) {
-            psnr->SetInnerRML(Rml::String(gt_metrics_overlay_.psnr_text));
+            psnr->SetInnerRML(metric_text(gt_metrics_overlay_.psnr_text));
+            touched = true;
         }
         if (auto* const ssim_row = document_->GetElementById("gt-metrics-ssim-row")) {
             ssim_row->SetClass("hidden", !gt_metrics_overlay_.show_ssim);
+            touched = true;
         }
         if (auto* const ssim = document_->GetElementById("gt-metrics-ssim")) {
-            ssim->SetInnerRML(Rml::String(gt_metrics_overlay_.ssim_text));
+            ssim->SetInnerRML(metric_text(gt_metrics_overlay_.ssim_text));
+            touched = true;
+        }
+
+        if (touched)
+            markRenderNeeded(RenderReason::GTMetrics);
+    }
+
+    void RmlViewportOverlay::applyLodStatsOverlay() {
+        if (!document_) {
+            return;
+        }
+
+        const auto value_text = [](const std::string& text) -> Rml::String {
+            return text.empty() ? Rml::String("--") : Rml::String(text);
+        };
+        bool touched = false;
+        if (auto* const overlay = document_->GetElementById("lod-stats-overlay")) {
+            overlay->SetClass("hidden", !lod_stats_overlay_.visible);
+            overlay->SetProperty("left", std::format("{:.1f}px", lod_stats_overlay_.x));
+            overlay->SetProperty("top", std::format("{:.1f}px", lod_stats_overlay_.y));
+            touched = true;
+        }
+        const auto set_text = [&](const char* id, const std::string& text) {
+            if (auto* const element = document_->GetElementById(id)) {
+                element->SetInnerRML(value_text(text));
+                touched = true;
+            }
+        };
+        set_text("lod-stats-status", lod_stats_overlay_.status_text);
+        set_text("lod-stats-selected", lod_stats_overlay_.selected_text);
+        set_text("lod-stats-budget", lod_stats_overlay_.budget_text);
+        set_text("lod-stats-model", lod_stats_overlay_.model_text);
+        set_text("lod-stats-tree", lod_stats_overlay_.tree_text);
+        set_text("lod-stats-traversal", lod_stats_overlay_.traversal_text);
+        set_text("lod-stats-stop", lod_stats_overlay_.stop_text);
+        set_text("lod-stats-chunks", lod_stats_overlay_.chunks_text);
+        set_text("lod-stats-cache", lod_stats_overlay_.cache_text);
+        set_text("lod-stats-selector", lod_stats_overlay_.selector_text);
+        set_text("lod-stats-pixel", lod_stats_overlay_.pixel_text);
+        set_text("lod-stats-render", lod_stats_overlay_.render_text);
+        set_text("lod-stats-foveation", lod_stats_overlay_.foveation_text);
+        set_text("lod-stats-hash", lod_stats_overlay_.hash_text);
+
+        if (touched)
+            markRenderNeeded(RenderReason::LodStats);
+    }
+
+    void RmlViewportOverlay::setProjectDragOverlay(ProjectDragOverlayState state) {
+        if (project_drag_overlay_.visible == state.visible &&
+            project_drag_overlay_.label == state.label) {
+            return;
+        }
+        project_drag_overlay_ = std::move(state);
+        applyProjectDragOverlay();
+        markRenderNeeded(RenderReason::ProjectDrag);
+    }
+
+    void RmlViewportOverlay::applyProjectDragOverlay() {
+        if (!document_)
+            return;
+
+        if (auto* const overlay = document_->GetElementById("project-drop-overlay")) {
+            overlay->SetClass("hidden", !project_drag_overlay_.visible);
+            overlay->SetProperty("left", std::format("{:.1f}px", viewport_content_offset_));
+            overlay->SetProperty(
+                "width",
+                std::format("{:.1f}px", std::max(vp_size_.x - viewport_content_offset_, 0.0f)));
+        }
+        if (auto* const label = document_->GetElementById("project-drop-label")) {
+            label->SetInnerRML(
+                Rml::StringUtilities::EncodeRml(project_drag_overlay_.label));
         }
     }
 
@@ -246,66 +1016,234 @@ namespace lfs::vis::gui {
             return;
         if (vp_size_.x <= 0 || vp_size_.y <= 0)
             return;
-        updateToolbarRoots();
         if (rml_manager_) {
             rml_manager_->trackContextFrame(rml_context_,
                                             static_cast<int>(vp_pos_.x - screen_origin_.x),
                                             static_cast<int>(vp_pos_.y - screen_origin_.y));
         }
+        const bool external_mouse_capture = guiFocusState().want_capture_mouse;
 
-        if (guiFocusState().want_capture_mouse)
-            return;
         const float mx = input.mouse_x - vp_pos_.x;
         const float my = input.mouse_y - vp_pos_.y;
         const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
                                       input.key_alt, input.key_super);
         const int rml_mx = static_cast<int>(mx);
         const int rml_my = static_cast<int>(my);
+
         const bool was_inside = mouse_pos_valid_ &&
                                 last_mouse_x_ >= 0 && last_mouse_x_ < static_cast<int>(vp_size_.x) &&
                                 last_mouse_y_ >= 0 && last_mouse_y_ < static_cast<int>(vp_size_.y);
         const bool is_inside = rml_mx >= 0 && rml_mx < static_cast<int>(vp_size_.x) &&
                                rml_my >= 0 && rml_my < static_cast<int>(vp_size_.y);
-        if ((!mouse_pos_valid_ || rml_mx != last_mouse_x_ || rml_my != last_mouse_y_) &&
-            (was_inside || is_inside)) {
+        const bool mouse_moved =
+            !mouse_pos_valid_ || rml_mx != last_mouse_x_ || rml_my != last_mouse_y_;
+        const bool mouse_clicked =
+            input.mouse_clicked[0] || input.mouse_clicked[1] || input.mouse_clicked[2];
+        const bool pointer_event =
+            input.mouse_clicked[0] || input.mouse_released[0] ||
+            input.mouse_clicked[1] || input.mouse_released[1] ||
+            input.mouse_clicked[2] || input.mouse_released[2] ||
+            input.mouse_wheel != 0.0f;
+        const bool pointer_drag =
+            input.mouse_down[0] || input.mouse_down[1] || input.mouse_down[2];
+        const bool keyboard_event =
+            !input.keys_pressed.empty() || !input.keys_released.empty() ||
+            !input.keys_repeated.empty() || !input.text_codepoints.empty() ||
+            !input.text_inputs.empty() || input.has_text_editing;
+        const bool vram_drag_capture = vram_hud_ && vram_hud_->isCapturingPointer();
+        const bool toolbar_drag_capture = toolbar_drag_active_;
+        auto* const focused_before = rml_context_->GetFocusElement();
+        const bool focused_text_target = rml_input::wantsTextInput(focused_before);
+        if (mouse_pos_valid_ && !mouse_moved && !pointer_event && !pointer_drag &&
+            !keyboard_event && !vram_drag_capture && !toolbar_drag_capture) {
+            wants_input_ = hovered_interactive_ || focused_text_target;
+            auto* const hover = hovered_interactive_ ? rml_context_->GetHoverElement() : nullptr;
+            const auto* const hover_root = viewportOverlayHoverRoot(hover);
+            if (hovered_interactive_) {
+                guiFocusState().want_capture_mouse = true;
+                if (hover)
+                    tooltip_.setHover(resolveRmlTooltip(hover), hover_root ? hover_root : hover);
+            } else {
+                tooltip_.setHover({}, nullptr);
+            }
+            publishOverlayTextFocus(focused_before);
+            return;
+        }
+        auto* const point_element = is_inside
+                                        ? rml_context_->GetElementAtPoint(Rml::Vector2f(
+                                              static_cast<float>(rml_mx),
+                                              static_cast<float>(rml_my)))
+                                        : nullptr;
+        const bool point_interactive = viewportOverlayHoverRoot(point_element) != nullptr;
+        const bool has_interactive_button_event = std::any_of(
+            input.mouse_button_events.begin(), input.mouse_button_events.end(), [&](const auto& event) {
+                if (event.button >= 3)
+                    return false;
+                const float event_x = event.x - vp_pos_.x;
+                const float event_y = event.y - vp_pos_.y;
+                if (event_x < 0.0f || event_y < 0.0f ||
+                    event_x >= vp_size_.x || event_y >= vp_size_.y)
+                    return false;
+                return viewportOverlayHoverRoot(rml_context_->GetElementAtPoint(
+                           Rml::Vector2f(event_x, event_y))) != nullptr;
+            });
+        const bool hover_target_changed = point_element != last_hover_element_;
+        if (focused_text_target &&
+            mouse_clicked &&
+            is_inside &&
+            !isElementOrDescendantOf(point_element, focused_before)) {
+            focused_before->Blur();
+            markRenderNeeded(RenderReason::Keyboard);
+        }
+        if (external_mouse_capture && !point_interactive && !hovered_interactive_ &&
+            !vram_drag_capture && !toolbar_drag_capture && !has_interactive_button_event) {
+            tooltip_.setHover({}, nullptr);
+            return;
+        }
+        const bool should_process_mouse_move =
+            (mouse_moved || pointer_event) &&
+            (was_inside || is_inside || vram_drag_capture || toolbar_drag_capture) &&
+            (pointer_event || pointer_drag || hover_target_changed ||
+             hovered_interactive_ || was_inside != is_inside || vram_drag_capture ||
+             toolbar_drag_capture) &&
+            (is_inside || hovered_interactive_ || was_inside != is_inside ||
+             vram_drag_capture || toolbar_drag_capture);
+        if (should_process_mouse_move) {
             mouse_pos_valid_ = true;
             last_mouse_x_ = rml_mx;
             last_mouse_y_ = rml_my;
-            render_needed_ = true;
+            auto* const prev_hover = rml_context_->GetHoverElement();
+            const auto* const prev_hover_root = viewportOverlayHoverRoot(prev_hover);
             rml_context_->ProcessMouseMove(rml_mx, rml_my, mods);
+            auto* const next_hover = rml_context_->GetHoverElement();
+            const auto* const next_hover_root = viewportOverlayHoverRoot(next_hover);
+            if (pointer_event || pointer_drag || vram_drag_capture || toolbar_drag_capture ||
+                was_inside != is_inside || next_hover_root != prev_hover_root) {
+                if (input.mouse_wheel != 0.0f)
+                    markRenderNeeded(RenderReason::PointerWheel);
+                if (input.mouse_clicked[0] || input.mouse_released[0] ||
+                    input.mouse_clicked[1] || input.mouse_released[1] ||
+                    input.mouse_clicked[2] || input.mouse_released[2])
+                    markRenderNeeded(RenderReason::PointerButton);
+                if (pointer_drag || vram_drag_capture || toolbar_drag_capture)
+                    markRenderNeeded(RenderReason::PointerDrag);
+                if (was_inside != is_inside || next_hover_root != prev_hover_root)
+                    markRenderNeeded(RenderReason::PointerHover);
+            }
+        } else if (mouse_moved &&
+                   (was_inside || is_inside || vram_drag_capture || toolbar_drag_capture)) {
+            mouse_pos_valid_ = true;
+            last_mouse_x_ = rml_mx;
+            last_mouse_y_ = rml_my;
+        }
+        last_hover_element_ = point_element;
+
+        auto* const hover = should_process_mouse_move ? rml_context_->GetHoverElement()
+                                                      : point_element;
+        const auto* const hover_root = viewportOverlayHoverRoot(hover);
+        const bool over_interactive = is_inside && hover_root != nullptr;
+        hovered_interactive_ = over_interactive;
+
+        bool replayed_button_events = false;
+        for (const auto& event : input.mouse_button_events) {
+            if (event.button >= 3)
+                continue;
+            const float event_x = event.x - vp_pos_.x;
+            const float event_y = event.y - vp_pos_.y;
+            const bool event_inside = event_x >= 0.0f && event_x < vp_size_.x &&
+                                      event_y >= 0.0f && event_y < vp_size_.y;
+            const auto* const event_element = event_inside
+                                                  ? rml_context_->GetElementAtPoint(
+                                                        Rml::Vector2f(event_x, event_y))
+                                                  : nullptr;
+            if (!vram_drag_capture && !toolbar_drag_capture &&
+                viewportOverlayHoverRoot(event_element) == nullptr)
+                continue;
+            rml_context_->ProcessMouseMove(static_cast<int>(event_x),
+                                           static_cast<int>(event_y), mods);
+            markRenderNeeded(RenderReason::PointerButton);
+            if (event.down)
+                rml_context_->ProcessMouseButtonDown(event.button, mods);
+            else
+                rml_context_->ProcessMouseButtonUp(event.button, mods);
+            replayed_button_events = true;
         }
 
-        auto* hover = rml_context_->GetHoverElement();
-        bool over_interactive = hover && hover->GetTagName() != "body" &&
-                                hover->GetId() != "overlay-body" &&
-                                hover->GetId() != "dm-root";
-
-        if (over_interactive) {
+        if (over_interactive || vram_drag_capture || toolbar_drag_capture ||
+            replayed_button_events) {
             wants_input_ = true;
             guiFocusState().want_capture_mouse = true;
 
-            if (input.mouse_clicked[0]) {
-                render_needed_ = true;
-                rml_context_->ProcessMouseButtonDown(0, mods);
-            }
-            if (input.mouse_released[0]) {
-                render_needed_ = true;
-                rml_context_->ProcessMouseButtonUp(0, mods);
-            }
-            if (input.mouse_clicked[1]) {
-                render_needed_ = true;
-                rml_context_->ProcessMouseButtonDown(1, mods);
-            }
-            if (input.mouse_released[1]) {
-                render_needed_ = true;
-                rml_context_->ProcessMouseButtonUp(1, mods);
+            if (!replayed_button_events &&
+                (over_interactive || vram_drag_capture || toolbar_drag_capture)) {
+                if (input.mouse_clicked[0]) {
+                    markRenderNeeded(RenderReason::PointerButton);
+                    rml_context_->ProcessMouseButtonDown(0, mods);
+                }
+                if (input.mouse_released[0]) {
+                    markRenderNeeded(RenderReason::PointerButton);
+                    rml_context_->ProcessMouseButtonUp(0, mods);
+                }
+                if (input.mouse_clicked[1]) {
+                    markRenderNeeded(RenderReason::PointerButton);
+                    rml_context_->ProcessMouseButtonDown(1, mods);
+                }
+                if (input.mouse_released[1]) {
+                    markRenderNeeded(RenderReason::PointerButton);
+                    rml_context_->ProcessMouseButtonUp(1, mods);
+                }
             }
             if (input.mouse_wheel != 0.0f) {
-                render_needed_ = true;
-                rml_context_->ProcessMouseWheel(Rml::Vector2f(0.0f, -input.mouse_wheel), mods);
+                markRenderNeeded(RenderReason::PointerWheel);
+                rml_context_->ProcessMouseWheel(
+                    Rml::Vector2f(-input.mouse_wheel_x, -input.mouse_wheel), mods);
             }
 
-            tooltip_.setHover(resolveRmlTooltip(hover), hover);
+            if (hover)
+                tooltip_.setHover(resolveRmlTooltip(hover), hover_root ? hover_root : hover);
+        } else {
+            tooltip_.setHover({}, nullptr);
+        }
+
+        // Forward keyboard + text input whenever an RmlUi element on this context owns focus
+        // (e.g. the Annotations / Drill-down filter <input>). This must run regardless of
+        // over_interactive, because a text input keeps focus even when the mouse roams away.
+        if (auto* focused = rml_context_->GetFocusElement()) {
+            if (publishOverlayTextFocus(focused)) {
+                wants_input_ = true;
+                // Numpad digit and period scancodes must be suppressed from
+                // ProcessKeyDown / ProcessKeyUp when a text input is focused,
+                // otherwise RmlUi treats them as navigation keys (Home, End,
+                // arrows, etc.). The actual digit text arrives via
+                // ProcessTextInput below. This mirrors the fix in
+                // rml_panel_host.cpp for the sidebar text inputs.
+                auto isNumpadTextKey = [](int sc) {
+                    return (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) ||
+                           sc == SDL_SCANCODE_KP_PERIOD;
+                };
+                for (const int sc : input.keys_pressed) {
+                    if (isNumpadTextKey(sc))
+                        continue;
+                    const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
+                    if (rml_key != Rml::Input::KI_UNKNOWN) {
+                        markRenderNeeded(RenderReason::Keyboard);
+                        rml_context_->ProcessKeyDown(rml_key, mods);
+                    }
+                }
+                for (const int sc : input.keys_released) {
+                    if (isNumpadTextKey(sc))
+                        continue;
+                    const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
+                    if (rml_key != Rml::Input::KI_UNKNOWN) {
+                        markRenderNeeded(RenderReason::Keyboard);
+                        rml_context_->ProcessKeyUp(rml_key, mods);
+                    }
+                }
+                for (uint32_t cp : input.text_codepoints) {
+                    markRenderNeeded(RenderReason::Keyboard);
+                    rml_context_->ProcessTextInput(static_cast<Rml::Character>(cp));
+                }
+            }
         }
     }
 
@@ -321,9 +1259,7 @@ namespace lfs::vis::gui {
         }
 
         auto* const hover = rml_context_->GetElementAtPoint(Rml::Vector2f(local_x, local_y));
-        return hover && hover->GetTagName() != "body" &&
-               hover->GetId() != "overlay-body" &&
-               hover->GetId() != "dm-root";
+        return isInteractiveViewportOverlayElement(hover);
     }
 
     void RmlViewportOverlay::ensureBodyDataModelBound(Rml::Element* body) {
@@ -343,11 +1279,14 @@ namespace lfs::vis::gui {
             // Restore the original unbound body markup instead of recycling
             // the live subtree, which may already contain expanded data-for views.
             if (!body_template_rml_.empty()) {
+                resetToolbarDragListeners();
                 body->SetInnerRML(Rml::String(body_template_rml_));
+                toolbar_roots_dirty_ = true;
             } else {
                 LOG_WARN("RmlViewportOverlay: missing body template for stale data-model rebind");
                 body->RemoveChild(existing);
             }
+            markRenderNeeded(RenderReason::DataModelBinding);
         }
 
         // RmlUI does not rebind data-model when the attribute is set after
@@ -360,6 +1299,11 @@ namespace lfs::vis::gui {
         wrapper_ptr->SetProperty("width", "100%");
         wrapper_ptr->SetProperty("height", "100%");
         auto* wrapper = body->AppendChild(std::move(wrapper_ptr));
+        if (!wrapper) {
+            LOG_ERROR("RmlViewportOverlay: AppendChild failed for data-model wrapper");
+            return;
+        }
+        markRenderNeeded(RenderReason::DataModelBinding);
 
         std::vector<Rml::Element*> children_to_move;
         children_to_move.reserve(body->GetNumChildren());
@@ -372,15 +1316,181 @@ namespace lfs::vis::gui {
             wrapper->AppendChild(body->RemoveChild(child));
 
         applyGTMetricsOverlay();
+        applySplitDividerOverlay();
+        applyLeftDockResizeIndicator();
+        applyLodStatsOverlay();
+        applyProjectDragOverlay();
+        attachToolbarDragListeners();
+        if (vram_hud_)
+            vram_hud_->onDocumentLoaded(document_);
     }
 
     bool RmlViewportOverlay::applyFrameTooltip() {
         if (!document_)
             return false;
-        return tooltip_.apply(document_->GetElementById("overlay-body"),
+        if (!body_el_)
+            body_el_ = document_->GetElementById("overlay-body");
+        return tooltip_.apply(body_el_,
                               last_mouse_x_, last_mouse_y_,
                               static_cast<int>(vp_size_.x),
                               static_cast<int>(vp_size_.y));
+    }
+
+    void RmlViewportOverlay::queueCachedVulkanContext(const bool refresh_cache) {
+        if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface())
+            return;
+        const float x = vp_pos_.x - screen_origin_.x;
+        const float y = vp_pos_.y - screen_origin_.y;
+        const int w = static_cast<int>(vp_size_.x);
+        const int h = static_cast<int>(vp_size_.y);
+        rml_manager_->queueCachedVulkanContext({
+            .context = rml_context_,
+            .cache = &direct_cache_,
+            .cache_width = w,
+            .cache_height = h,
+            .offset_x = x,
+            .offset_y = y,
+            .draw_width = vp_size_.x,
+            .draw_height = vp_size_.y,
+            .refresh = refresh_cache,
+            .foreground = false,
+            .clip_enabled = true,
+            .clip = {
+                .x1 = x,
+                .y1 = y,
+                .x2 = x + vp_size_.x,
+                .y2 = y + vp_size_.y,
+            },
+        });
+    }
+
+    void RmlViewportOverlay::renderFrostedGlass() {
+        if (viewport_chrome_style_ != "frosted" || !document_ || !rml_manager_)
+            return;
+        auto* const renderer = rml_manager_->getVulkanRenderInterface();
+        if (!renderer)
+            return;
+
+        std::vector<RenderInterface_VK::FrostedGlassRegion> regions;
+        const auto is_visible = [](Rml::Element* element) {
+            for (auto* node = element; node; node = node->GetParentNode()) {
+                if (node->GetDisplay() == Rml::Style::Display::None)
+                    return false;
+            }
+            return element != nullptr;
+        };
+        const float framebuffer_x = vp_pos_.x - screen_origin_.x;
+        const float framebuffer_y = vp_pos_.y - screen_origin_.y;
+        const auto append_region = [&](Rml::Element* element, const float radius) {
+            if (!is_visible(element))
+                return;
+            const auto offset = element->GetAbsoluteOffset(Rml::BoxArea::Border);
+            const auto size = element->GetBox().GetSize(Rml::BoxArea::Border);
+            if (size.x <= 0.0f || size.y <= 0.0f)
+                return;
+            regions.push_back({
+                .x = framebuffer_x + offset.x,
+                .y = framebuffer_y + offset.y,
+                .width = size.x,
+                .height = size.y,
+                .radius = radius,
+            });
+        };
+
+        constexpr std::array<std::string_view, 8> toolbar_ids = {
+            "primary-utility-toolbar",
+            "secondary-utility-toolbar",
+            "primary-transform-toolbar",
+            "primary-mirror-toolbar",
+            "primary-crop-toolbar",
+            "secondary-transform-toolbar",
+            "secondary-mirror-toolbar",
+            "secondary-crop-toolbar",
+        };
+        for (const std::string_view id : toolbar_ids)
+            append_region(document_->GetElementById(std::string(id)), 9.0f);
+
+        Rml::ElementList gizmo_containers;
+        document_->GetElementsByClassName(gizmo_containers, "viewport-gizmo-controls");
+        for (Rml::Element* container : gizmo_containers) {
+            if (!is_visible(container))
+                continue;
+            Rml::ElementList buttons;
+            container->GetElementsByClassName(buttons, "icon-btn");
+            for (Rml::Element* button : buttons)
+                append_region(button, 5.0f);
+        }
+
+        Rml::ElementList panels;
+        document_->GetElementsByClassName(panels, "viewport-transform-panel");
+        for (Rml::Element* panel : panels)
+            append_region(panel, 8.0f);
+
+        if (regions.empty())
+            return;
+
+        const bool rendered = renderer->RenderFrostedGlass({regions.data(), regions.size()});
+        if (!rml_theme::setFrostedGlassAvailable(rendered))
+            return;
+
+        if (rendered) {
+            LOG_INFO("Frosted viewport chrome is available; restoring frosted theme tokens");
+        } else {
+            LOG_WARN("Frosted viewport chrome is unavailable; using translucent theme tokens");
+        }
+        markRenderNeeded(RenderReason::ThemePresentation);
+    }
+
+    void RmlViewportOverlay::renderCached() {
+        if (!rml_context_ || !document_)
+            return;
+        if (vp_size_.x <= 0 || vp_size_.y <= 0)
+            return;
+
+        const int w = static_cast<int>(vp_size_.x);
+        const int h = static_cast<int>(vp_size_.y);
+        const bool theme_current =
+            has_theme_signature_ && rml_theme::currentThemeSignature() == last_theme_signature_;
+        const bool document_hooks_due = shouldRunAnyDocumentHooks(false);
+        const bool builtin_document_sync_due = document_sync_dirty_;
+        bool tooltip_changed = false;
+        if (tooltip_.hasActiveState()) {
+            LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.tooltip", 0.25);
+            tooltip_changed = applyFrameTooltip();
+        }
+        if (rml_manager_) {
+            rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.needsFrame());
+            rml_manager_->setContextTooltipRevealDeadline(rml_context_, tooltip_.revealDeadline());
+        }
+        const bool can_update_tooltip_only =
+            rml_manager_ && tooltip_changed && theme_current && !document_hooks_due &&
+            !builtin_document_sync_due && !render_needed_ && !animation_active_ &&
+            !data_model_binding_dirty_ && !toolbar_roots_dirty_ &&
+            w == last_render_w_ && h == last_render_h_;
+        if (can_update_tooltip_only) {
+            rml_manager_->trackContextFrame(rml_context_,
+                                            static_cast<int>(vp_pos_.x - screen_origin_.x),
+                                            static_cast<int>(vp_pos_.y - screen_origin_.y));
+            rml_context_->SetDimensions(Rml::Vector2i(w, h));
+            rml_context_->Update();
+            queueCachedVulkanContext(true);
+            const double next_delay = rml_context_->GetNextUpdateDelay();
+            next_update_delay_ = next_delay;
+            animation_active_ = (next_delay == 0.0);
+            return;
+        }
+        const bool can_reuse = theme_current && !render_needed_ && !animation_active_ &&
+                               !document_hooks_due && !builtin_document_sync_due &&
+                               !data_model_binding_dirty_ && !toolbar_roots_dirty_ &&
+                               !tooltip_changed && w == last_render_w_ && h == last_render_h_;
+        if (!can_reuse) {
+            render();
+            return;
+        }
+
+        queueCachedVulkanContext(direct_cache_.texture == 0 ||
+                                 direct_cache_.width != w ||
+                                 direct_cache_.height != h);
     }
 
     void RmlViewportOverlay::render() {
@@ -398,56 +1508,115 @@ namespace lfs::vis::gui {
             return;
 
         const bool theme_changed = updateTheme();
+        const float toolbar_dpi = std::max(rml_context_->GetDensityIndependentPixelRatio(), 0.01f);
+        const bool dpi_changed = std::abs(last_toolbar_dpi_ - toolbar_dpi) > 0.001f;
+        if (theme_changed || dpi_changed)
+            toolbar_rail_layout_dirty_ = true;
         const int w = static_cast<int>(vp_size_.x);
         const int h = static_cast<int>(vp_size_.y);
         const bool size_changed = (w != last_render_w_ || h != last_render_h_);
-        const bool run_document_hooks = shouldRunDocumentHooks(
-            theme_changed || size_changed || render_needed_ || animation_active_);
-        if (run_document_hooks) {
-            lfs::python::invoke_python_document_hooks("viewport_overlay", "document", document_, true);
-            lfs::python::invoke_python_document_hooks("viewport_overlay", "document", document_, false);
+        const bool toolbar_changed = updateToolbarRoots();
+        updateViewportContentOffset();
+        const bool document_force = theme_changed || size_changed || toolbar_changed;
+        bool document_dirty = syncBuiltinDocument(document_force);
+        const bool run_prepend_document_hooks = shouldRunDocumentHooks(document_force, true);
+        const bool run_append_document_hooks = shouldRunDocumentHooks(document_force, false);
+        if (run_prepend_document_hooks || run_append_document_hooks) {
+            LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.document_hooks", 0.25);
+            bool hook_dirty = false;
+            if (run_prepend_document_hooks)
+                hook_dirty |= lfs::python::invoke_python_document_hooks(
+                    "viewport_overlay", "document", document_, true);
+            if (run_append_document_hooks)
+                hook_dirty |= lfs::python::invoke_python_document_hooks(
+                    "viewport_overlay", "document", document_, false);
+            if (hook_dirty)
+                markRenderNeeded(RenderReason::DocumentHook);
+            document_dirty |= hook_dirty;
             last_document_hook_run_ = std::chrono::steady_clock::now();
         }
 
-        auto* body = document_->GetElementById("overlay-body");
-        ensureBodyDataModelBound(body);
-        updateToolbarRoots();
-        const bool tooltip_changed = applyFrameTooltip();
+        if (!body_el_)
+            body_el_ = document_->GetElementById("overlay-body");
+        const bool had_data_model_binding_dirty = data_model_binding_dirty_;
+        if (had_data_model_binding_dirty) {
+            LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.bind_data_model", 0.25);
+            markRenderNeeded(RenderReason::DataModelBinding);
+            ensureBodyDataModelBound(body_el_);
+            data_model_binding_dirty_ = false;
+            document_dirty |= syncBuiltinDocument(true);
+        }
+        bool tooltip_changed = false;
+        if (tooltip_.hasActiveState()) {
+            LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.tooltip", 0.25);
+            tooltip_changed = applyFrameTooltip();
+        }
+        if (rml_manager_) {
+            rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.needsFrame());
+            rml_manager_->setContextTooltipRevealDeadline(rml_context_, tooltip_.revealDeadline());
+        }
 
-        const bool needs_render = render_needed_ || animation_active_ || run_document_hooks ||
-                                  theme_changed || size_changed || tooltip_changed;
+        const bool needs_render = render_needed_ || animation_active_ || document_dirty ||
+                                  theme_changed || size_changed || dpi_changed || toolbar_changed ||
+                                  tooltip_changed || had_data_model_binding_dirty;
         if (!needs_render) {
-            rml_manager_->queueVulkanContext(rml_context_,
-                                             vp_pos_.x - screen_origin_.x,
-                                             vp_pos_.y - screen_origin_.y,
-                                             true,
-                                             true,
-                                             vp_pos_.x - screen_origin_.x,
-                                             vp_pos_.y - screen_origin_.y,
-                                             vp_pos_.x - screen_origin_.x + vp_size_.x,
-                                             vp_pos_.y - screen_origin_.y + vp_size_.y);
+            queueCachedVulkanContext(direct_cache_.texture == 0 ||
+                                     direct_cache_.width != w ||
+                                     direct_cache_.height != h);
             return;
         }
 
-        rml_manager_->trackContextFrame(rml_context_,
-                                        static_cast<int>(vp_pos_.x - screen_origin_.x),
-                                        static_cast<int>(vp_pos_.y - screen_origin_.y));
-        rml_context_->SetDimensions(Rml::Vector2i(w, h));
-        rml_context_->Update();
+        LOG_PERF("gui_render.rml_viewport_overlay.render_reasons render_needed={} sources={} animation={} document_dirty={} theme={} size={} toolbar={} tooltip={} data_model={}",
+                 render_needed_,
+                 renderReasonSources(),
+                 animation_active_,
+                 document_dirty,
+                 theme_changed,
+                 size_changed,
+                 toolbar_changed,
+                 tooltip_changed,
+                 had_data_model_binding_dirty);
+        {
+            LOG_TIMER("gui_render.rml_viewport_overlay.render.update");
+            {
+                LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.track_context", 0.25);
+                rml_manager_->trackContextFrame(rml_context_,
+                                                static_cast<int>(vp_pos_.x - screen_origin_.x),
+                                                static_cast<int>(vp_pos_.y - screen_origin_.y));
+            }
+            {
+                LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.set_dimensions", 0.25);
+                rml_context_->SetDimensions(Rml::Vector2i(w, h));
+            }
+            {
+                LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.context_update", 0.25);
+                rml_context_->Update();
+            }
+            updateToolbarRailLayout();
+            if (viewport_toolbar_position_ == "free" && applyToolbarPosition()) {
+                LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.toolbar_position", 0.25);
+                rml_context_->Update();
+            }
+        }
 
-        rml_manager_->queueVulkanContext(rml_context_,
-                                         vp_pos_.x - screen_origin_.x,
-                                         vp_pos_.y - screen_origin_.y,
-                                         true,
-                                         true,
-                                         vp_pos_.x - screen_origin_.x,
-                                         vp_pos_.y - screen_origin_.y,
-                                         vp_pos_.x - screen_origin_.x + vp_size_.x,
-                                         vp_pos_.y - screen_origin_.y + vp_size_.y);
-        animation_active_ = (rml_context_->GetNextUpdateDelay() == 0);
+        queueCachedVulkanContext(true);
+        {
+            LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.next_delay", 0.25);
+            const double next_delay = rml_context_->GetNextUpdateDelay();
+            next_update_delay_ = next_delay;
+            animation_active_ = (next_delay == 0.0);
+        }
         render_needed_ = false;
+        render_reason_bits_ = 0;
         last_render_w_ = w;
         last_render_h_ = h;
+        last_toolbar_dpi_ = toolbar_dpi;
+    }
+
+    std::optional<double> RmlViewportOverlay::nextScheduledUpdateDelay() const {
+        if (std::isfinite(next_update_delay_) && next_update_delay_ > 0.0)
+            return next_update_delay_;
+        return std::nullopt;
     }
 
 } // namespace lfs::vis::gui

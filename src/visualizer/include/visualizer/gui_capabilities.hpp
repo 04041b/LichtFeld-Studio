@@ -4,9 +4,11 @@
 
 #pragma once
 
+#include "core/error.hpp"
 #include "core/export.hpp"
 #include "core/scene.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -77,6 +79,7 @@ namespace lfs::vis::cap {
         bool use = false;
     };
 
+    [[nodiscard]] LFS_VIS_API bool isTransformableNodeType(core::NodeType type);
     [[nodiscard]] LFS_VIS_API TransformComponents decomposeTransform(const glm::mat4& matrix);
     [[nodiscard]] LFS_VIS_API glm::mat4 composeTransform(const TransformComponents& components);
 
@@ -125,6 +128,12 @@ namespace lfs::vis::cap {
         const std::vector<std::string>& targets,
         const glm::vec3& value,
         std::string_view undo_label = "transform.scale");
+    [[nodiscard]] LFS_VIS_API std::expected<size_t, std::string> bakeNodeTransforms(
+        SceneManager& scene_manager,
+        const std::vector<std::string>& targets,
+        std::string_view undo_label = "transform.bake");
+    [[nodiscard]] LFS_VIS_API lfs::Result<void> bakeSplatTransformPreservingStorage(
+        core::SplatData& model, const glm::mat4& transform);
 
     [[nodiscard]] LFS_VIS_API std::expected<void, std::string> writeGaussianField(
         SceneManager& scene_manager,

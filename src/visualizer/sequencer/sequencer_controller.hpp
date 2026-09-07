@@ -4,16 +4,59 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/scene.hpp"
 #include "sequencer/keyframe.hpp"
 #include "sequencer/timeline.hpp"
 #include <algorithm>
+#include <expected>
+#include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace lfs::vis {
 
     inline constexpr float MIN_PLAYBACK_SPEED = 0.1f;
     inline constexpr float MAX_PLAYBACK_SPEED = 4.0f;
+    inline constexpr float DEFAULT_SEQUENCE_FPS = 24.0f;
+    inline constexpr float MIN_SEQUENCE_FPS = 1.0f;
+    inline constexpr float MAX_SEQUENCE_FPS = 240.0f;
+
+    struct PlySequenceFrame {
+        std::filesystem::path path;
+        std::string node_name;
+        core::Uuid node_uuid;
+    };
+
+    struct PlySequenceClip {
+        std::filesystem::path directory;
+        std::string node_name;
+        core::Uuid node_uuid;
+        std::vector<PlySequenceFrame> frames;
+        float fps = DEFAULT_SEQUENCE_FPS;
+
+        [[nodiscard]] float duration() const {
+            return frames.empty() ? 0.0f : static_cast<float>(frames.size()) / std::max(fps, MIN_SEQUENCE_FPS);
+        }
+    };
+
+    enum class PlySequenceResolveErrorCode : uint8_t {
+        UUID_NOT_FOUND,
+        LEGACY_NAME_NOT_FOUND,
+    };
+
+    struct PlySequenceResolveError {
+        PlySequenceResolveErrorCode code = PlySequenceResolveErrorCode::UUID_NOT_FOUND;
+        std::string message;
+    };
+
+    // UUID is authoritative once present. A UUID miss is an error and never
+    // falls back to a potentially renamed or reused display label.
+    [[nodiscard]] LFS_VIS_API std::expected<core::NodeId, PlySequenceResolveError> resolvePlySequenceNode(
+        const core::Scene& scene,
+        const core::Uuid& node_uuid,
+        std::string_view node_name);
 
     enum class PlaybackState : uint8_t {
         STOPPED,
@@ -58,7 +101,6 @@ namespace lfs::vis {
         bool setKeyframeTimeById(sequencer::KeyframeId id, float new_time);
         bool previewKeyframeTimeById(sequencer::KeyframeId id, float new_time);
         bool commitKeyframeTimeById(sequencer::KeyframeId id);
-        bool updateKeyframe(size_t index, const glm::vec3& position, const glm::quat& rotation, float focal_length_mm);
         bool updateKeyframeById(sequencer::KeyframeId id, const glm::vec3& position, const glm::quat& rotation, float focal_length_mm);
         bool updateSelectedKeyframe(const glm::vec3& position, const glm::quat& rotation, float focal_length_mm);
         bool setKeyframeFocalLength(size_t index, float focal_length_mm);
@@ -70,6 +112,23 @@ namespace lfs::vis {
         void clear();
         bool saveToJson(const std::string& path) const;
         bool loadFromJson(const std::string& path);
+        [[nodiscard]] nlohmann::json saveToJson() const;
+        bool loadFromJson(const nlohmann::json& json);
+
+        void setPlySequence(std::filesystem::path directory,
+                            std::string node_name,
+                            std::vector<std::filesystem::path> paths,
+                            std::vector<std::string> node_names,
+                            float fps = DEFAULT_SEQUENCE_FPS,
+                            core::Uuid node_uuid = {},
+                            std::vector<core::Uuid> node_uuids = {});
+        void clearPlySequence();
+        [[nodiscard]] bool hasPlySequence() const { return ply_sequence_.has_value() && !ply_sequence_->frames.empty(); }
+        [[nodiscard]] const PlySequenceClip* plySequence() const { return hasPlySequence() ? &*ply_sequence_ : nullptr; }
+        [[nodiscard]] float plySequenceFps() const { return ply_sequence_ ? ply_sequence_->fps : DEFAULT_SEQUENCE_FPS; }
+        void setPlySequenceFps(float fps);
+        [[nodiscard]] std::optional<size_t> plySequenceFrameIndex(float time) const;
+        [[nodiscard]] std::optional<size_t> currentPlySequenceFrameIndex() const { return plySequenceFrameIndex(playhead_); }
 
         bool selectKeyframe(size_t index);
         bool selectKeyframeById(sequencer::KeyframeId id);
@@ -81,6 +140,7 @@ namespace lfs::vis {
         [[nodiscard]] PlaybackState state() const { return state_; }
         [[nodiscard]] bool isPlaying() const { return state_ == PlaybackState::PLAYING; }
         [[nodiscard]] bool isStopped() const { return state_ == PlaybackState::STOPPED; }
+        [[nodiscard]] bool hasPlayableContent() const;
 
         [[nodiscard]] float clipDuration() const { return timeline_.clipDuration(); }
         void setClipDuration(float duration);
@@ -89,7 +149,6 @@ namespace lfs::vis {
         void setLoopMode(LoopMode mode);
         void toggleLoop();
         [[nodiscard]] bool isLoopKeyframe(size_t index) const;
-        [[nodiscard]] bool isEditableKeyframe(size_t index) const;
 
         [[nodiscard]] float playbackSpeed() const { return playback_speed_; }
         void setPlaybackSpeed(const float speed) { playback_speed_ = std::clamp(speed, MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED); }
@@ -99,12 +158,14 @@ namespace lfs::vis {
 
     private:
         [[nodiscard]] bool isFirstRealKeyframe(sequencer::KeyframeId id) const;
+        [[nodiscard]] float playbackStartTime() const;
         void rebuildLoopKeyframe();
         void removeLoopKeyframe();
         void markTimelineChanged();
         void markSelectionChanged();
 
         sequencer::Timeline timeline_;
+        std::optional<PlySequenceClip> ply_sequence_;
         PlaybackState state_ = PlaybackState::STOPPED;
         LoopMode loop_mode_ = LoopMode::ONCE;
 

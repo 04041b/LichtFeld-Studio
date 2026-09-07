@@ -9,8 +9,9 @@ from .types import Operator
 
 def _shortcut(action, fallback):
     try:
-        shortcut = lf.keymap.get_trigger_description(action, lf.keymap.ToolMode.GLOBAL)
-        return "" if shortcut == "Unbound" else shortcut
+        if not lf.keymap.is_bound(action, lf.keymap.ToolMode.GLOBAL):
+            return ""
+        return lf.keymap.get_trigger_description(action, lf.keymap.ToolMode.GLOBAL)
     except (AttributeError, RuntimeError, TypeError):
         return fallback
 
@@ -18,7 +19,7 @@ def _shortcut(action, fallback):
 class AddKeyframeOperator(Operator):
     """Add a keyframe at the current camera position."""
 
-    label = "Add Keyframe Here"
+    label = "sequencer.add_keyframe_here"
     shortcut = ""
 
     def execute(self, context):
@@ -29,7 +30,7 @@ class AddKeyframeOperator(Operator):
 class UpdateKeyframeOperator(Operator):
     """Update selected keyframe to current camera position."""
 
-    label = "Update to Current View"
+    label = "sequencer.update_to_current_view"
     shortcut = ""
 
     def execute(self, context):
@@ -40,6 +41,8 @@ class UpdateKeyframeOperator(Operator):
 class PlayPauseOperator(Operator):
     """Toggle sequencer playback."""
 
+    # Operator metadata is exposed to non-GUI callers verbatim. Keep this as a
+    # stable product label until the operator registry gains localized labels.
     label = "Play/Pause"
     shortcut = ""
 

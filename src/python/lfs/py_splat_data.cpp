@@ -4,15 +4,40 @@
 
 #include "py_splat_data.hpp"
 #include <nanobind/stl/optional.h>
+#include <stdexcept>
+#include <string_view>
 
 namespace {
     constexpr float SH_C0 = 0.28209479177387814f;
     constexpr float SH_DC_OFFSET = 0.5f;
+
+    [[nodiscard]] bool is_renderer_backed_kind(const std::string_view kind) {
+        return kind == "vulkan_external_buffer" || kind == "splat.exportable";
+    }
+
+    [[nodiscard]] bool splat_is_renderer_backed(const lfs::core::SplatData& data) {
+        const lfs::core::Tensor* const tensors[] = {
+            &data.means_raw(),
+            &data.sh0_raw(),
+            &data.shN_raw(),
+            &data.scaling_raw(),
+            &data.rotation_raw(),
+            &data.opacity_raw(),
+            &data.shN_value_bounds(),
+        };
+        for (const auto* tensor : tensors) {
+            if (tensor->is_valid() && is_renderer_backed_kind(tensor->external_storage_kind())) {
+                return true;
+            }
+        }
+        return false;
+    }
 } // namespace
 
 namespace lfs::python {
 
-    // Raw tensor access - return views (no copy)
+    // Raw tensor access — most accessors return a view (no copy); shN_raw is the
+    // exception (it materialises the canonical layout from swizzled storage).
     PyTensor PySplatData::means_raw() const {
         return PyTensor(data_->means_raw(), false);
     }
@@ -22,7 +47,9 @@ namespace lfs::python {
     }
 
     PyTensor PySplatData::shN_raw() const {
-        return PyTensor(data_->shN_raw(), false);
+        // shN is stored swizzled internally. Python callers expect canonical [N, K, 3];
+        // materialise that view (this allocates a fresh tensor — not a view).
+        return PyTensor(data_->shN_canonical(), true);
     }
 
     PyTensor PySplatData::scaling_raw() const {
@@ -85,12 +112,21 @@ namespace lfs::python {
     }
 
     PyTensor PySplatData::soft_delete(const PyTensor& mask) {
-        core::Tensor prev_state = data_->soft_delete(mask.tensor());
-        return PyTensor(std::move(prev_state), true);
+        core::Tensor newly_deleted = data_->soft_delete(mask.tensor());
+        return PyTensor(std::move(newly_deleted), true);
     }
 
     void PySplatData::undelete(const PyTensor& mask) {
         data_->undelete(mask.tensor());
+    }
+
+    void PySplatData::reserve_capacity(const size_t capacity) {
+        if (splat_is_renderer_backed(*data_)) {
+            throw std::runtime_error(
+                "Capacity of renderer-backed models is managed by the application "
+                "and cannot be reserved from Python");
+        }
+        data_->reserve_capacity(capacity);
     }
 
     void register_splat_data(nb::module_& m) {
@@ -101,7 +137,9 @@ namespace lfs::python {
             .def_prop_ro("sh0_raw", &PySplatData::sh0_raw,
                          "Raw SH0 tensor [N, 1, 3] (view)")
             .def_prop_ro("shN_raw", &PySplatData::shN_raw,
-                         "Raw SHN tensor [N, (degree+1)^2-1, 3] (view)")
+                         "SHN tensor in canonical [N, (degree+1)^2-1, 3] layout "
+                         "(materialised from the internal swizzled storage — this allocates, "
+                         "not a view).")
             .def_prop_ro("scaling_raw", &PySplatData::scaling_raw,
                          "Raw scaling tensor [N, 3] (log-space, view)")
             .def_prop_ro("rotation_raw", &PySplatData::rotation_raw,
@@ -163,7 +201,8 @@ namespace lfs::python {
 
             // Capacity
             .def("reserve_capacity", &PySplatData::reserve_capacity, nb::arg("capacity"),
-                 "Reserve capacity for Gaussians (for densification)");
+                 "Reserve capacity for Gaussians (for densification). "
+                 "Raises if the model is renderer-backed.");
     }
 
 } // namespace lfs::python

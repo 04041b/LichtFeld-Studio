@@ -5,6 +5,93 @@
 
 namespace lfs::core {
 
+    Tensor Tensor::from_external_owner(void* data,
+                                       TensorShape shape,
+                                       const Device device,
+                                       const DataType dtype,
+                                       std::shared_ptr<void> owner) {
+        return from_external_owner(
+            data, std::move(shape), device, dtype, std::move(owner), 0, nullptr,
+            "external.unlabeled");
+    }
+
+    Tensor Tensor::from_external_owner(void* data,
+                                       TensorShape shape,
+                                       const Device device,
+                                       const DataType dtype,
+                                       std::shared_ptr<void> owner,
+                                       const size_t capacity) {
+        return from_external_owner(
+            data, std::move(shape), device, dtype, std::move(owner), capacity, nullptr,
+            "external.unlabeled");
+    }
+
+    Tensor Tensor::from_external_owner(void* data,
+                                       TensorShape shape,
+                                       const Device device,
+                                       const DataType dtype,
+                                       std::shared_ptr<void> owner,
+                                       const size_t capacity,
+                                       const cudaStream_t stream) {
+        return from_external_owner(
+            data, std::move(shape), device, dtype, std::move(owner), capacity, stream,
+            "external.unlabeled");
+    }
+
+    Tensor Tensor::from_external_owner(void* data,
+                                       TensorShape shape,
+                                       Device device,
+                                       DataType dtype,
+                                       std::shared_ptr<void> owner,
+                                       size_t capacity,
+                                       cudaStream_t stream,
+                                       std::string external_kind) {
+        LFS_ASSERT_MSG(owner != nullptr,
+                       "from_external_owner requires a valid owner");
+        LFS_ASSERT_MSG(data != nullptr || shape.elements() == 0,
+                       "from_external_owner received null data for a non-empty tensor");
+        LFS_ASSERT_MSG(device == Device::CPU || device == Device::CUDA,
+                       "from_external_owner received an invalid device");
+        LFS_ASSERT_MSG(dtype_size(dtype) != 0,
+                       "from_external_owner received an invalid dtype");
+
+        const size_t effective_capacity = capacity == 0 && shape.rank() > 0 ? shape[0] : capacity;
+        LFS_ASSERT_MSG(shape.rank() == 0 || effective_capacity >= shape[0],
+                       "from_external_owner capacity is smaller than the logical row count");
+        const size_t allocation_bytes = storage_allocation_bytes(shape, effective_capacity, dtype);
+        auto external_owner = owner;
+        auto owner_box = std::make_shared<std::shared_ptr<void>>(std::move(owner));
+        record_storage_allocation(StorageAccountingKind::VulkanExternal, allocation_bytes);
+
+        Tensor t;
+        t.data_ = data;
+        t.data_owner_ = std::shared_ptr<void>(
+            data,
+            [owner_box = std::move(owner_box), allocation_bytes](void*) mutable {
+                owner_box->reset();
+                Tensor::record_storage_deallocation(
+                    StorageAccountingKind::VulkanExternal,
+                    allocation_bytes);
+            });
+        t.shape_ = std::move(shape);
+        t.strides_ = t.shape_.strides();
+        t.storage_offset_ = 0;
+        t.is_contiguous_ = true;
+        t.device_ = device;
+        t.dtype_ = dtype;
+        t.is_view_ = false;
+        t.ensure_state();
+        t.state_->capacity = effective_capacity;
+        t.state_->logical_size = t.shape_.rank() > 0 ? t.shape_[0] : 0;
+        t.state_->stream = stream;
+        t.id_ = next_id_++;
+        t.compute_alignment();
+        t.init_storage_meta();
+        t.storage_meta_->external_kind = std::move(external_kind);
+        t.storage_meta_->external_owner = std::move(external_owner);
+        return t;
+    }
+
     Tensor Tensor::empty(TensorShape shape, Device device, DataType dtype, bool use_pinned) {
         LoadArgs args;
         args.shape = shape;
@@ -15,14 +102,12 @@ namespace lfs::core {
         return load(LoadOp::Empty, args);
     }
 
+    Tensor Tensor::empty_pageable_host(TensorShape shape, DataType dtype) {
+        return empty(std::move(shape), Device::CPU, dtype, false);
+    }
+
     Tensor Tensor::empty_unpinned(TensorShape shape, DataType dtype) {
-        LoadArgs args;
-        args.shape = shape;
-        args.device = Device::CPU;
-        args.dtype = dtype;
-        args.use_pinned = false;
-        args.args = std::monostate{};
-        return load(LoadOp::Empty, args);
+        return empty_pageable_host(std::move(shape), dtype);
     }
 
     Tensor Tensor::zeros(TensorShape shape, Device device, DataType dtype) {

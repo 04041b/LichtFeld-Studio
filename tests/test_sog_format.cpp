@@ -9,29 +9,135 @@
  * and produce comparable results to the original PLY.
  */
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <format>
+#include <fstream>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+#include <webp/decode.h>
+#include <webp/encode.h>
 
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "io/exporter.hpp"
 #include "io/formats/ply.hpp"
 #include "io/formats/sogs.hpp"
+#include "io/loader.hpp"
+
+#include <algorithm>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+    class ScopedSogDirectory {
+    public:
+        ScopedSogDirectory() {
+            static std::atomic_uint64_t sequence = 0;
+            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+            path_ = fs::temp_directory_path() /
+                    std::format("lichtfeld_sog_validation_{}_{}", stamp, sequence++);
+            fs::create_directories(path_);
+        }
+
+        ~ScopedSogDirectory() {
+            std::error_code error;
+            fs::remove_all(path_, error);
+        }
+
+        ScopedSogDirectory(const ScopedSogDirectory&) = delete;
+        ScopedSogDirectory& operator=(const ScopedSogDirectory&) = delete;
+
+        [[nodiscard]] const fs::path& path() const { return path_; }
+
+    private:
+        fs::path path_;
+    };
+
+    nlohmann::json minimal_sog_metadata(const int count) {
+        return {
+            {"version", 2},
+            {"count", count},
+            {"means",
+             {{"mins", {0.0f, 0.0f, 0.0f}},
+              {"maxs", {1.0f, 1.0f, 1.0f}},
+              {"files", {"means_l.webp", "means_u.webp"}}}},
+            {"scales", {{"codebook", {0.0f}}, {"files", {"scales.webp"}}}},
+            {"quats", {{"files", {"quats.webp"}}}},
+            {"sh0", {{"codebook", {0.0f}}, {"files", {"sh0.webp"}}}},
+        };
+    }
+
+    bool write_json(const fs::path& path, const nlohmann::json& value) {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        const std::string encoded = value.dump();
+        stream.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+        return stream.good();
+    }
+
+    bool write_webp(const fs::path& path, const int width, const int height) {
+        std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4, 0);
+        for (size_t pixel = 0; pixel < pixels.size() / 4; ++pixel) {
+            pixels[pixel * 4 + 3] = 0xff;
+        }
+
+        uint8_t* encoded = nullptr;
+        const size_t encoded_size = WebPEncodeLosslessRGBA(
+            pixels.data(), width, height, width * 4, &encoded);
+        if (encoded_size == 0 || !encoded) {
+            return false;
+        }
+
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream.write(reinterpret_cast<const char*>(encoded),
+                     static_cast<std::streamsize>(encoded_size));
+        WebPFree(encoded);
+        return stream.good();
+    }
+
+    bool write_base_textures(const fs::path& directory, const int width, const int height) {
+        for (const std::string_view filename : {
+                 "means_l.webp",
+                 "means_u.webp",
+                 "scales.webp",
+                 "quats.webp",
+                 "sh0.webp"}) {
+            if (!write_webp(directory / filename, width, height)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+} // namespace
 
 class SogFormatTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // Test files
-        test_dir = fs::path("/home/paja/projects/gaussian-splatting-cuda/test_formats");
-        sog_bundle = test_dir / "test.sog";
-        original_ply = fs::path("/home/paja/projects/gaussian-splatting-cuda/output/splat_30000.ply");
-
-        // Create test directory if it doesn't exist
-        if (!fs::exists(test_dir)) {
-            fs::create_directories(test_dir);
+        // External fixtures are optional; tests that require unavailable fixtures skip.
+        for (const auto& candidate : {
+                 fs::path("test_formats"),
+                 fs::path("tests/data/sog"),
+             }) {
+            if (fs::exists(candidate)) {
+                test_dir = candidate;
+                break;
+            }
+        }
+        sog_bundle = test_dir.empty() ? fs::path{} : test_dir / "test.sog";
+        for (const auto& candidate : {
+                 fs::path("output/splat_30000.ply"),
+             }) {
+            if (fs::exists(candidate)) {
+                original_ply = candidate;
+                break;
+            }
         }
     }
 
@@ -181,9 +287,10 @@ TEST_F(SogFormatTest, CompareWithOriginalPly) {
 
     std::cout << "Loading original PLY..." << std::endl;
     auto ply_result = lfs::io::load_ply(original_ply);
-    ASSERT_TRUE(ply_result.has_value()) << "Failed to load PLY: " << ply_result.error();
+    ASSERT_TRUE(ply_result.has_value())
+        << "Failed to load PLY: " << lfs::format_for_developer(ply_result.error());
 
-    ASSERT_EQ(sog_result->size(), ply_result->size()) << "Splat count mismatch";
+    ASSERT_EQ(sog_result->size(), ply_result->value.size()) << "Splat count mismatch";
     const size_t N = sog_result->size();
 
     std::cout << "Comparing statistics for " << N << " splats..." << std::endl;
@@ -202,7 +309,7 @@ TEST_F(SogFormatTest, CompareWithOriginalPly) {
 
     // Compare positions
     auto sog_means = sog_result->means().cpu();
-    auto orig_means = ply_result->means().cpu();
+    auto orig_means = ply_result->value.means().cpu();
     auto [sog_pos_min, sog_pos_max, sog_pos_avg] = compute_stats(sog_means.ptr<float>(), N * 3);
     auto [orig_pos_min, orig_pos_max, orig_pos_avg] = compute_stats(orig_means.ptr<float>(), N * 3);
 
@@ -212,7 +319,7 @@ TEST_F(SogFormatTest, CompareWithOriginalPly) {
 
     // Compare SH0 colors
     auto sog_sh0 = sog_result->sh0().cpu();
-    auto orig_sh0 = ply_result->sh0().cpu();
+    auto orig_sh0 = ply_result->value.sh0().cpu();
     auto [sog_sh0_min, sog_sh0_max, sog_sh0_avg] = compute_stats(sog_sh0.ptr<float>(), N * 3);
     auto [orig_sh0_min, orig_sh0_max, orig_sh0_avg] = compute_stats(orig_sh0.ptr<float>(), N * 3);
 
@@ -230,7 +337,7 @@ TEST_F(SogFormatTest, CompareWithOriginalPly) {
 
     // Compare scales
     auto sog_scales = sog_result->get_scaling().cpu();
-    auto orig_scales = ply_result->get_scaling().cpu();
+    auto orig_scales = ply_result->value.get_scaling().cpu();
     auto [sog_scale_min, sog_scale_max, sog_scale_avg] = compute_stats(sog_scales.ptr<float>(), N * 3);
     auto [orig_scale_min, orig_scale_max, orig_scale_avg] = compute_stats(orig_scales.ptr<float>(), N * 3);
 
@@ -256,6 +363,74 @@ TEST_F(SogFormatTest, CompareWithOriginalPly) {
 TEST_F(SogFormatTest, FileNotFound) {
     auto result = lfs::io::load_sog("/nonexistent/path/file.sog");
     EXPECT_FALSE(result.has_value()) << "Should fail for nonexistent file";
+}
+
+TEST_F(SogFormatTest, RejectsTextureSmallerThanDeclaredCountBeforeCudaUpload) {
+    ScopedSogDirectory input;
+    ASSERT_TRUE(write_json(input.path() / "meta.json", minimal_sog_metadata(2)));
+    ASSERT_TRUE(write_base_textures(input.path(), 1, 1));
+
+    const auto result = lfs::io::load_sog(input.path());
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("means_l.webp"), std::string::npos)
+        << result.error();
+}
+
+TEST_F(SogFormatTest, LoadsValidatedMinimalDirectory) {
+    ScopedSogDirectory input;
+    ASSERT_TRUE(write_json(input.path() / "meta.json", minimal_sog_metadata(1)));
+    ASSERT_TRUE(write_base_textures(input.path(), 4, 4));
+
+    const auto result = lfs::io::load_sog(input.path());
+
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->size(), 1);
+}
+
+TEST_F(SogFormatTest, RejectsShortMeansBoundsBeforeReadingTextures) {
+    ScopedSogDirectory input;
+    auto metadata = minimal_sog_metadata(1);
+    metadata["means"]["mins"] = {0.0f, 0.0f};
+    ASSERT_TRUE(write_json(input.path() / "meta.json", metadata));
+
+    const auto result = lfs::io::load_sog(input.path());
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("three values"), std::string::npos)
+        << result.error();
+}
+
+TEST_F(SogFormatTest, RejectsUnsupportedShDegreeBeforeReadingTextures) {
+    ScopedSogDirectory input;
+    auto metadata = minimal_sog_metadata(1);
+    metadata["shN"] = {
+        {"count", 1},
+        {"bands", 4},
+        {"codebook", {0.0f}},
+        {"files", {"shN_centroids.webp", "shN_labels.webp"}},
+    };
+    ASSERT_TRUE(write_json(input.path() / "meta.json", metadata));
+
+    const auto result = lfs::io::load_sog(input.path());
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find("SH degree"), std::string::npos)
+        << result.error();
+}
+
+TEST_F(SogFormatTest, InvalidArchiveReturnsErrorWithoutEscaping) {
+    ScopedSogDirectory input;
+    const fs::path archive = input.path() / "invalid.sog";
+    {
+        std::ofstream stream(archive, std::ios::binary | std::ios::trunc);
+        stream << "not a zip archive";
+    }
+
+    const auto result = lfs::io::load_sog(archive);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_FALSE(result.error().empty());
 }
 
 // Test: Load meta.json directly
@@ -288,14 +463,15 @@ TEST_F(SogFormatTest, CompareWithSplatTransformDecompression) {
 
     std::cout << "Loading splat-transform decompressed PLY..." << std::endl;
     auto ref_result = lfs::io::load_ply(sog_decompressed);
-    ASSERT_TRUE(ref_result.has_value()) << "Failed to load reference: " << ref_result.error();
+    ASSERT_TRUE(ref_result.has_value())
+        << "Failed to load reference: " << lfs::format_for_developer(ref_result.error());
 
-    ASSERT_EQ(our_result->size(), ref_result->size()) << "Splat count mismatch";
+    ASSERT_EQ(our_result->size(), ref_result->value.size()) << "Splat count mismatch";
     const size_t N = our_result->size();
 
     // Compare SH0 values
     auto our_sh0 = our_result->sh0().cpu();
-    auto ref_sh0 = ref_result->sh0().cpu();
+    auto ref_sh0 = ref_result->value.sh0().cpu();
     const float* our_data = our_sh0.ptr<float>();
     const float* ref_data = ref_sh0.ptr<float>();
 
@@ -324,8 +500,9 @@ TEST_F(SogFormatTest, ExportRoundtrip) {
     // Load original PLY
     std::cout << "Loading original PLY..." << std::endl;
     auto orig_result = lfs::io::load_ply(original_ply);
-    ASSERT_TRUE(orig_result.has_value()) << "Failed to load PLY: " << orig_result.error();
-    std::cout << "Loaded " << orig_result->size() << " splats" << std::endl;
+    ASSERT_TRUE(orig_result.has_value())
+        << "Failed to load PLY: " << lfs::format_for_developer(orig_result.error());
+    std::cout << "Loaded " << orig_result->value.size() << " splats" << std::endl;
 
     // Export as SOG
     fs::path export_path = test_dir / "export_test.sog";
@@ -335,7 +512,7 @@ TEST_F(SogFormatTest, ExportRoundtrip) {
         .output_path = export_path,
         .kmeans_iterations = 10};
 
-    auto write_result = lfs::io::save_sog(*orig_result, options);
+    auto write_result = lfs::io::save_sog(orig_result->value, options);
     ASSERT_TRUE(write_result.has_value()) << "Failed to write SOG: " << write_result.error().format();
     std::cout << "SOG export complete" << std::endl;
 
@@ -344,12 +521,12 @@ TEST_F(SogFormatTest, ExportRoundtrip) {
     auto reimport_result = lfs::io::load_sog(export_path);
     ASSERT_TRUE(reimport_result.has_value()) << "Failed to reimport SOG: " << reimport_result.error();
 
-    EXPECT_EQ(reimport_result->size(), orig_result->size())
+    EXPECT_EQ(reimport_result->size(), orig_result->value.size())
         << "Reimported splat count differs from original";
 
     // Compare SH0 colors
-    size_t N = orig_result->size();
-    auto orig_sh0 = orig_result->sh0().cpu();
+    size_t N = orig_result->value.size();
+    auto orig_sh0 = orig_result->value.sh0().cpu();
     auto reimp_sh0 = reimport_result->sh0().cpu();
     const float* orig_sh0_ptr = orig_sh0.ptr<float>();
     const float* reimp_sh0_ptr = reimp_sh0.ptr<float>();
@@ -383,4 +560,122 @@ TEST_F(SogFormatTest, ExportRoundtrip) {
 
     // Clean up test file
     fs::remove_all(export_path);
+}
+
+// Synthetic SOG export/import roundtrip with SH-rest (degree 1). Exercises the
+// dequant/reformat path for resident float swizzled shN (and q16 when enabled).
+TEST_F(SogFormatTest, SyntheticExportRoundtripWithShN) {
+    constexpr size_t N = 64;
+    constexpr int sh_degree = 1; // 3 rest coeffs
+
+    std::vector<float> means(N * 3), sh0(N * 3), shN(N * 3 * 3), scales(N * 3),
+        rots(N * 4), opac(N);
+    for (size_t i = 0; i < N; ++i) {
+        means[i * 3 + 0] = static_cast<float>(i) * 0.01f;
+        means[i * 3 + 1] = static_cast<float>(i % 7) * 0.02f;
+        means[i * 3 + 2] = static_cast<float>(i % 5) * 0.03f;
+        sh0[i * 3 + 0] = 0.1f * static_cast<float>(i % 3);
+        sh0[i * 3 + 1] = 0.2f;
+        sh0[i * 3 + 2] = -0.1f;
+        for (int k = 0; k < 9; ++k)
+            shN[i * 9 + k] = 0.01f * static_cast<float>((i + k) % 11);
+        scales[i * 3 + 0] = scales[i * 3 + 1] = scales[i * 3 + 2] = -3.0f;
+        rots[i * 4] = 1.0f;
+        opac[i] = 0.5f;
+    }
+
+    auto splat = lfs::core::SplatData(
+        sh_degree,
+        lfs::core::Tensor::from_vector(means, {N, size_t{3}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(sh0, {N, size_t{1}, size_t{3}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(shN, {N, size_t{3}, size_t{3}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(scales, {N, size_t{3}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(rots, {N, size_t{4}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(opac, {N, size_t{1}}, lfs::core::Device::CUDA),
+        1.0f);
+
+    ScopedSogDirectory out_dir;
+    const fs::path export_path = out_dir.path() / "synthetic_shN.sog";
+    lfs::io::SogSaveOptions options{
+        .output_path = export_path,
+        .kmeans_iterations = 5};
+    auto write_result = lfs::io::save_sog(splat, options);
+    ASSERT_TRUE(write_result.has_value()) << "SOG export failed: " << write_result.error().format();
+
+    auto reimport = lfs::io::load_sog(export_path);
+    ASSERT_TRUE(reimport.has_value()) << "SOG reimport failed: " << reimport.error();
+    EXPECT_EQ(reimport->size(), N);
+    EXPECT_EQ(reimport->get_max_sh_degree(), sh_degree);
+    EXPECT_TRUE(reimport->means().is_valid());
+    EXPECT_TRUE(reimport->sh0().is_valid());
+    EXPECT_TRUE(reimport->shN_raw().is_valid() || reimport->shN_canonical().is_valid());
+
+    // Lossy k-means: compare SH0 average as a coarse integrity check.
+    auto orig_sh0 = splat.sh0().cpu();
+    auto re_sh0 = reimport->sh0().cpu();
+    double o = 0.0, r = 0.0;
+    for (size_t i = 0; i < N * 3; ++i) {
+        o += orig_sh0.ptr<float>()[i];
+        r += re_sh0.ptr<float>()[i];
+    }
+    EXPECT_NEAR(r / (N * 3), o / (N * 3), 0.5);
+}
+
+// Regression: a SOG loaded through the full Loader must route its tensors through the
+// supplied splat allocator (Vulkan-external storage), or the Vulkan splat renderer rejects
+// it ("refusing full input-copy fallback"). The SOG decoder ignores the allocator, so the
+// LoaderService migrates the model post-load. Before the fix the allocator was never called.
+TEST_F(SogFormatTest, LoaderRoutesSogThroughSplatAllocator) {
+    // Build a tiny SOG in-process so the allocator routing test does not depend on
+    // external fixture files under /home/paja/...
+    constexpr size_t N = 16;
+    std::vector<float> means(N * 3, 0.0f), sh0(N * 3, 0.1f), scales(N * 3, -3.0f),
+        rots(N * 4, 0.0f), opac(N, 0.5f);
+    for (size_t i = 0; i < N; ++i) {
+        means[i * 3] = static_cast<float>(i) * 0.05f;
+        rots[i * 4] = 1.0f;
+    }
+    auto source_splat = lfs::core::SplatData(
+        0,
+        lfs::core::Tensor::from_vector(means, {N, size_t{3}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(sh0, {N, size_t{1}, size_t{3}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::zeros({size_t{0}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(scales, {N, size_t{3}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(rots, {N, size_t{4}}, lfs::core::Device::CUDA),
+        lfs::core::Tensor::from_vector(opac, {N, size_t{1}}, lfs::core::Device::CUDA),
+        1.0f);
+
+    ScopedSogDirectory out_dir;
+    const fs::path sog_path = out_dir.path() / "allocator_route.sog";
+    lfs::io::SogSaveOptions save_opts{.output_path = sog_path, .kmeans_iterations = 3};
+    auto save = lfs::io::save_sog(source_splat, save_opts);
+    ASSERT_TRUE(save.has_value()) << save.error().format();
+
+    std::vector<std::string> allocated_names;
+    lfs::io::LoadOptions options;
+    options.splat_tensor_allocator = [&](lfs::core::TensorShape shape,
+                                         size_t /*capacity*/,
+                                         lfs::core::DataType dtype,
+                                         std::string_view name) {
+        allocated_names.emplace_back(name);
+        return lfs::core::Tensor::empty(std::move(shape), lfs::core::Device::CUDA, dtype);
+    };
+
+    auto loader = lfs::io::Loader::create();
+    auto result = loader->load(sog_path, options);
+    ASSERT_TRUE(result.has_value()) << "SOG load failed: " << result.error().format();
+
+    auto* splat = std::get_if<std::shared_ptr<lfs::core::SplatData>>(&result->data);
+    ASSERT_NE(splat, nullptr);
+    ASSERT_NE(*splat, nullptr);
+
+    const auto routed = [&](const std::string& n) {
+        return std::find(allocated_names.begin(), allocated_names.end(), n) != allocated_names.end();
+    };
+    EXPECT_FALSE(allocated_names.empty()) << "SOG tensors never went through the allocator";
+    EXPECT_TRUE(routed("SplatData.means"));
+    EXPECT_TRUE(routed("SplatData.sh0"));
+    EXPECT_TRUE(routed("SplatData.scaling"));
+    EXPECT_TRUE(routed("SplatData.rotation"));
+    EXPECT_TRUE(routed("SplatData.opacity"));
 }

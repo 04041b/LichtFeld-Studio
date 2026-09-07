@@ -4,12 +4,16 @@
 
 #include "core/data_loading_service.hpp"
 #include "core/checkpoint_format.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
 #include "core/parameter_manager.hpp"
 #include "core/path_utils.hpp"
 #include "core/services.hpp"
+#include "gui/gui_manager.hpp"
 #include "scene/scene_manager.hpp"
+#include "visualizer_impl.hpp"
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 namespace lfs::vis {
@@ -42,7 +46,7 @@ namespace lfs::vis {
 
         // Listen for file load commands
         cmd::LoadFile::when([this](const auto& cmd) {
-            handleLoadFileCommand(cmd.is_dataset, cmd.path);
+            handleLoadFileCommand(cmd);
         });
 
         // Listen for checkpoint load for training commands
@@ -51,32 +55,63 @@ namespace lfs::vis {
         });
     }
 
-    void DataLoadingService::handleLoadFileCommand(const bool is_dataset, const std::filesystem::path& path) {
-        if (is_dataset) {
+    void DataLoadingService::handleLoadFileCommand(
+        const lfs::core::events::cmd::LoadFile& cmd) {
+        if (viewer_ && viewer_->preflightLoadFileWipe(cmd)) {
+            return;
+        }
+        if (cmd.is_dataset) {
             return; // Handled async by GuiManager
         }
-
-        // Checkpoint files get special handling - redirect to training resume flow
-        if (isCheckpointFile(path)) {
-            handleLoadCheckpointForTrainingCommand(path, {}, {});
+        if (viewer_ && viewer_->deferLoadFileForTraining(cmd)) {
             return;
         }
 
-        if (scene_manager_->getContentType() == SceneManager::ContentType::Dataset) {
-            if (!scene_manager_->clear()) {
+        // Checkpoint files get special handling - redirect to training resume flow
+        if (isCheckpointFile(cmd.path)) {
+            handleLoadCheckpointForTrainingCommand(cmd.path, {}, {});
+            return;
+        }
+
+        const bool replace_scene =
+            viewer_ ? viewer_->loadFileWouldReplaceScene(false, cmd.replace)
+                    : (cmd.replace ||
+                       scene_manager_->getContentType() ==
+                           SceneManager::ContentType::Dataset);
+        if (replace_scene) {
+            if (!scene_manager_->canClearScene()) {
+                lfs::core::events::state::FileDropFailed{
+                    .files = {lfs::core::path_to_utf8(cmd.path)},
+                    .error = LOC("file_drop.blocked_during_training")}
+                    .emit();
+                return;
+            }
+            if (viewer_ && !viewer_->resetUntitledSessionForReplaceLoad()) {
                 return;
             }
         }
 
-        if (scene_manager_->getContentType() == SceneManager::ContentType::SplatFiles) {
-            const std::string name = lfs::core::path_to_utf8(path.stem());
-            scene_manager_->addSplatFile(path, name);
-            return;
-        }
+        try {
+            if (!cmd.replace &&
+                scene_manager_->getContentType() == SceneManager::ContentType::SplatFiles) {
+                const std::string name = lfs::core::path_to_utf8(cmd.path.stem());
+                if (!viewer_ || !viewer_->getGuiManager() ||
+                    !viewer_->getGuiManager()->asyncTasks().startSplatLoad({cmd.path}, false, {name})) {
+                    throw std::runtime_error("Import already in progress");
+                }
+                return;
+            }
 
-        // First import into an empty scene must take the full load path so SceneLoaded,
-        // application-scene binding, and UI state all refresh together.
-        scene_manager_->loadSplatFile(path);
+            // First import into an empty scene must take the full load path so SceneLoaded,
+            // application-scene binding, and UI state all refresh together.
+            if (!viewer_ || !viewer_->getGuiManager() ||
+                !viewer_->getGuiManager()->asyncTasks().startSplatLoad({cmd.path}, true)) {
+                throw std::runtime_error("Import already in progress");
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to load {}: {}", lfs::core::path_to_utf8(cmd.path), e.what());
+            lfs::core::events::state::SplatFileLoadFailed{.path = cmd.path, .error = e.what()}.emit();
+        }
     }
 
     void DataLoadingService::handleLoadCheckpointForTrainingCommand(
@@ -84,8 +119,15 @@ namespace lfs::vis {
         const std::filesystem::path& dataset_path,
         const std::filesystem::path& output_path) {
         LOG_INFO("Loading checkpoint for training: {}", lfs::core::path_to_utf8(checkpoint_path));
+        if (viewer_ && !viewer_->resetUntitledSessionForReplaceLoad()) {
+            return;
+        }
         if (auto result = loadCheckpointForTraining(checkpoint_path, dataset_path, output_path); !result) {
             LOG_ERROR("Failed to load checkpoint for training: {}", result.error());
+            lfs::core::events::state::SplatFileLoadFailed{
+                .path = checkpoint_path,
+                .error = result.error()}
+                .emit();
         }
     }
 
@@ -145,9 +187,12 @@ namespace lfs::vis {
             LOG_INFO("Loading PLY file: {}", lfs::core::path_to_utf8(path));
 
             // Load through scene manager
-            scene_manager_->loadSplatFile(path);
+            if (!viewer_ || !viewer_->getGuiManager() ||
+                !viewer_->getGuiManager()->asyncTasks().startSplatLoad({path}, true)) {
+                throw std::runtime_error("Import already in progress");
+            }
 
-            LOG_INFO("Successfully loaded PLY: {} (from: {})",
+            LOG_INFO("Queued PLY for loading: {} (from: {})",
                      lfs::core::path_to_utf8(path.filename()),
                      lfs::core::path_to_utf8(displayParentPath(path)));
 
@@ -155,7 +200,7 @@ namespace lfs::vis {
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load PLY: {}", e.what());
             LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
-            throw std::runtime_error(error_msg);
+            return std::unexpected(error_msg);
         }
     }
 
@@ -166,9 +211,12 @@ namespace lfs::vis {
             LOG_INFO("Loading SOG file: {}", lfs::core::path_to_utf8(path));
 
             // Load through scene manager
-            scene_manager_->loadSplatFile(path);
+            if (!viewer_ || !viewer_->getGuiManager() ||
+                !viewer_->getGuiManager()->asyncTasks().startSplatLoad({path}, true)) {
+                throw std::runtime_error("Import already in progress");
+            }
 
-            LOG_INFO("Successfully loaded SOG: {} (from: {})",
+            LOG_INFO("Queued SOG for loading: {} (from: {})",
                      lfs::core::path_to_utf8(path.filename()),
                      lfs::core::path_to_utf8(displayParentPath(path)));
 
@@ -176,7 +224,7 @@ namespace lfs::vis {
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load SOG: {}", e.what());
             LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
-            throw std::runtime_error(error_msg);
+            return std::unexpected(error_msg);
         }
     }
 
@@ -192,16 +240,34 @@ namespace lfs::vis {
             } else {
                 // Let the scene manager figure it out with the generic loader
                 LOG_INFO("Loading splat file: {}", lfs::core::path_to_utf8(path));
-                scene_manager_->loadSplatFile(path);
+                if (!viewer_ || !viewer_->getGuiManager() ||
+                    !viewer_->getGuiManager()->asyncTasks().startSplatLoad({path}, true)) {
+                    throw std::runtime_error("Import already in progress");
+                }
 
-                LOG_INFO("Successfully loaded splat file: {}", lfs::core::path_to_utf8(path.filename()));
+                LOG_INFO("Queued splat file for loading: {}", lfs::core::path_to_utf8(path.filename()));
                 return {};
             }
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to load splat file: {}", e.what());
             LOG_ERROR("{} (Path: {})", error_msg, lfs::core::path_to_utf8(path));
-            throw std::runtime_error(error_msg);
+            return std::unexpected(error_msg);
         }
+    }
+
+    std::expected<void, std::string>
+    DataLoadingService::loadSplatFiles(const std::vector<std::filesystem::path>& paths) {
+        if (paths.empty()) {
+            return std::unexpected("No splat files were provided");
+        }
+
+        if (!viewer_ || !viewer_->getGuiManager() ||
+            !viewer_->getGuiManager()->asyncTasks().startSplatLoad(paths, true)) {
+            return std::unexpected("Import already in progress");
+        }
+
+        LOG_INFO("Queued {} splat files for asynchronous loading", paths.size());
+        return {};
     }
 
     void DataLoadingService::addPLYToScene(const std::filesystem::path& path) {
@@ -215,9 +281,12 @@ namespace lfs::vis {
             LOG_TRACE("Extracted PLY name: {}", name);
 
             // Add through scene manager
-            scene_manager_->addSplatFile(path, name);
+            if (!viewer_ || !viewer_->getGuiManager() ||
+                !viewer_->getGuiManager()->asyncTasks().startSplatLoad({path}, false, {name})) {
+                throw std::runtime_error("Import already in progress");
+            }
 
-            LOG_INFO("Added PLY '{}' to scene", name);
+            LOG_INFO("Queued PLY '{}' for loading", name);
 
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to add PLY: {}", e.what());
@@ -236,10 +305,13 @@ namespace lfs::vis {
             std::string name = lfs::core::path_to_utf8(path.stem());
             LOG_TRACE("Extracted SOG name: {}", name);
 
-            // Add through scene manager
-            scene_manager_->addSplatFile(path, name);
+            // Add through the shared asynchronous loader.
+            if (!viewer_ || !viewer_->getGuiManager() ||
+                !viewer_->getGuiManager()->asyncTasks().startSplatLoad({path}, false, {name})) {
+                throw std::runtime_error("Import already in progress");
+            }
 
-            LOG_INFO("Added SOG '{}' to scene", name);
+            LOG_INFO("Queued SOG '{}' for loading", name);
 
         } catch (const std::exception& e) {
             std::string error_msg = std::format("Failed to add SOG: {}", e.what());
@@ -256,7 +328,10 @@ namespace lfs::vis {
         } else {
             // Generic add
             std::string name = lfs::core::path_to_utf8(path.stem());
-            scene_manager_->addSplatFile(path, name);
+            if (!viewer_ || !viewer_->getGuiManager() ||
+                !viewer_->getGuiManager()->asyncTasks().startSplatLoad({path}, false, {name})) {
+                throw std::runtime_error("Import already in progress");
+            }
         }
     }
 
@@ -303,6 +378,7 @@ namespace lfs::vis {
             if (checkpoint_params_result) {
                 params = *checkpoint_params_result;
             }
+            params.no_download = params_.no_download;
             // Override dataset/output paths if provided by user
             if (!dataset_path.empty()) {
                 params.dataset.data_path = dataset_path;

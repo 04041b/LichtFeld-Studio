@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Image preview panel using RmlUI floating window."""
 
+import os
 import time
 from math import gcd
 from pathlib import Path
@@ -9,7 +10,10 @@ from typing import Optional
 from urllib.parse import quote
 
 import lichtfeld as lf
+from . import rml_widgets as w
 from .types import Panel
+from .panels import panel_class
+from .ui import RuntimeState
 from .rml_keys import (
     KI_1, KI_ADD, KI_C, KI_DOWN, KI_END, KI_ESCAPE, KI_F, KI_HOME, KI_I,
     KI_LEFT, KI_M, KI_OEM_MINUS, KI_OEM_PLUS, KI_R, KI_RIGHT, KI_SPACE,
@@ -33,6 +37,7 @@ FILMSTRIP_WINDOW = 40
 THUMB_MAX_PX = 256
 
 _instance = None
+_pending_open = None
 _RML_PATH_SAFE_CHARS = "/:._-~"
 
 
@@ -40,17 +45,11 @@ def _encode_rml_path(path: Path | str) -> str:
     return quote(str(path), safe=_RML_PATH_SAFE_CHARS)
 
 
+@panel_class("image_preview")
 class ImagePreviewPanel(Panel):
-    id = "lfs.image_preview"
-    label = "Image Preview"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 98
-    template = "rmlui/image_preview.rml"
-    size = (900, 600)
-    update_interval_ms = 16
 
     def __init__(self):
-        global _instance
+        global _instance, _pending_open
         _instance = self
 
         self._image_paths: list[Path] = []
@@ -76,6 +75,7 @@ class ImagePreviewPanel(Panel):
         self._color_picker_active = False
 
         self._doc = None
+        self._handle = None
         self._dirty = True
         self._prev_image_index = -1
 
@@ -88,8 +88,71 @@ class ImagePreviewPanel(Panel):
         self._scroll_start_time = 0.0
 
         self._image_info_cache: dict[str, tuple[int, int, int]] = {}
+        self._path_stat_cache: dict[str, tuple[bool, int, int]] = {}
+        self._filmstrip_top_spacer = 0.0
+        self._filmstrip_bottom_spacer = 0.0
         self._last_training_params: tuple[int, int, bool] = (1, 0, False)
         self._decorator_cache: dict[str, str] = {}
+        self._reactive_unsubscribers = []
+        self._pending_view_chrome = None
+        if _pending_open is not None:
+            self.open(*_pending_open)
+            _pending_open = None
+
+    def capture_chrome(self):
+        return {
+            "camera_index": int(self._current_index),
+            "zoom": float(self._zoom),
+            "fit_to_window": bool(self._fit_to_window),
+            "pan_x": float(self._pan_x),
+            "pan_y": float(self._pan_y),
+            "rotation_quadrants": int(self._rotation_quadrants),
+            "show_filmstrip": bool(self._show_filmstrip),
+            "show_info": bool(self._show_info),
+            "show_overlay": bool(self._show_overlay),
+        }
+
+    def apply_chrome(self, payload):
+        self._current_index = 0
+        self._zoom = 1.0
+        self._fit_to_window = True
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._rotation_quadrants = 0
+        self._show_filmstrip = True
+        self._show_info = True
+        self._show_overlay = False
+        self._pending_view_chrome = payload if isinstance(payload, dict) else None
+        if self._pending_view_chrome:
+            self._apply_view_chrome(self._pending_view_chrome)
+        self._mark_dirty()
+
+    def _apply_view_chrome(self, payload):
+        index = payload.get("camera_index")
+        if isinstance(index, (int, float)):
+            index = int(index)
+            if self._image_paths:
+                self._current_index = max(0, min(index, len(self._image_paths) - 1))
+            else:
+                self._current_index = max(0, index)
+        zoom = payload.get("zoom")
+        if isinstance(zoom, (int, float)) and zoom > 0:
+            self._zoom = float(zoom)
+        if "fit_to_window" in payload:
+            self._fit_to_window = bool(payload.get("fit_to_window"))
+        if isinstance(payload.get("pan_x"), (int, float)):
+            self._pan_x = float(payload["pan_x"])
+        if isinstance(payload.get("pan_y"), (int, float)):
+            self._pan_y = float(payload["pan_y"])
+        rotation = payload.get("rotation_quadrants")
+        if isinstance(rotation, (int, float)):
+            self._rotation_quadrants = int(rotation) % 4
+        if "show_filmstrip" in payload:
+            self._show_filmstrip = bool(payload.get("show_filmstrip"))
+        if "show_info" in payload:
+            self._show_info = bool(payload.get("show_info"))
+        if "show_overlay" in payload:
+            self._show_overlay = bool(payload.get("show_overlay"))
 
     def _get_title(self) -> str:
         if self._image_paths:
@@ -104,6 +167,8 @@ class ImagePreviewPanel(Panel):
 
         model.bind_func("panel_label", lambda: self._get_title())
         model.bind_record_list("thumbs")
+        model.bind_func("filmstrip_top_spacer_height", lambda: f"{self._filmstrip_top_spacer:.1f}dp")
+        model.bind_func("filmstrip_bottom_spacer_height", lambda: f"{self._filmstrip_bottom_spacer:.1f}dp")
         self._handle = model.get_handle()
 
     def on_mount(self, doc):
@@ -160,6 +225,7 @@ class ImagePreviewPanel(Panel):
 
         self._decorator_cache = {}
         self._dirty = True
+        self._subscribe_reactive_state()
 
     def on_update(self, doc):
         if not self._fit_to_window and self._image_paths and self._hover_image:
@@ -184,27 +250,73 @@ class ImagePreviewPanel(Panel):
         if self._dirty:
             self._dirty = False
             self._refresh_ui(doc)
+            if self._crossfade_pending or self._scroll_target is not None:
+                self._request_model_update()
             return True
 
+        if needs_redraw and (self._crossfade_pending or self._scroll_target is not None):
+            self._request_model_update()
+
         return needs_redraw
+
+    def on_unmount(self, doc):
+        self._unsubscribe_reactive_state()
+        doc.remove_data_model("image_preview")
+        self._handle = None
+        self._doc = None
+
+    def _subscribe_reactive_state(self):
+        if self._reactive_unsubscribers:
+            return
+
+        self._reactive_unsubscribers = [
+            RuntimeState.scene_generation.subscribe(lambda _value: self._mark_dirty()),
+            RuntimeState.language_generation.subscribe(lambda _value: self._mark_dirty()),
+        ]
+
+    def _unsubscribe_reactive_state(self):
+        for unsubscribe in self._reactive_unsubscribers:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+        self._reactive_unsubscribers = []
+
+    def _request_model_update(self):
+        if self._handle:
+            w.request_model_update(self._handle)
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._request_model_update()
 
     def open(self, image_paths: list[Path], mask_paths: list[Optional[Path]],
              start_index: int, camera_uids: list[int] | None = None):
         if not image_paths:
             return
 
-        self._image_paths = [p.resolve() for p in image_paths]
-        self._mask_paths = [p.resolve() if p else None for p in mask_paths] if mask_paths else [None] * len(image_paths)
+        self._image_paths = [Path(p) for p in image_paths]
+        self._mask_paths = [Path(p) if p else None for p in mask_paths] if mask_paths else [None] * len(image_paths)
+        self._path_stat_cache = {}
+        for path in self._image_paths + [p for p in self._mask_paths if p is not None]:
+            try:
+                stat = os.stat(path)
+                self._path_stat_cache[str(path)] = (True, int(stat.st_mtime_ns), int(stat.st_size))
+            except OSError:
+                self._path_stat_cache[str(path)] = (False, 0, 0)
         self._camera_uids = camera_uids if camera_uids is not None else [-1] * len(image_paths)
         self._current_index = min(start_index, len(image_paths) - 1)
         self._last_training_params = self._get_training_params()
         self._rotation_quadrants = 0
         self._reset_view()
-        self._dirty = True
+        if self._pending_view_chrome:
+            self._apply_view_chrome(self._pending_view_chrome)
+            self._pending_view_chrome = None
         self._prev_image_index = -1
         self._crossfade_pending = False
         self._scroll_target = None
         self._decorator_cache = {}
+        self._mark_dirty()
 
     def _reset_pan(self):
         self._pan_x = 0.0
@@ -217,11 +329,7 @@ class ImagePreviewPanel(Panel):
         self._reset_pan()
 
     def _refresh_immediately(self):
-        if self._doc:
-            self._dirty = False
-            self._refresh_ui(self._doc)
-        else:
-            self._dirty = True
+        self._mark_dirty()
 
     def _navigate(self, delta: int):
         new_idx = self._current_index + delta
@@ -240,7 +348,7 @@ class ImagePreviewPanel(Panel):
         self._fit_to_window = not self._fit_to_window
         if self._fit_to_window:
             self._reset_view()
-        self._dirty = True
+        self._mark_dirty()
 
     def _copy_path_to_clipboard(self):
         if self._image_paths:
@@ -279,7 +387,7 @@ class ImagePreviewPanel(Panel):
         if node is None:
             return
         lf.set_camera_training_enabled(node.name, not node.training_enabled)
-        self._dirty = True
+        self._mark_dirty()
 
     def _action_show_in_file_manager(self):
         if not self._image_paths:
@@ -290,23 +398,23 @@ class ImagePreviewPanel(Panel):
         if not self._image_paths:
             return
         self._rotation_quadrants = (self._rotation_quadrants + delta_quadrants) % 4
-        self._dirty = True
+        self._mark_dirty()
 
     def _zoom_in(self):
         self._zoom = min(ZOOM_MAX, self._zoom * 1.25)
         self._fit_to_window = False
-        self._dirty = True
+        self._mark_dirty()
 
     def _zoom_out(self):
         self._zoom = max(ZOOM_MIN, self._zoom / 1.25)
         self._fit_to_window = False
-        self._dirty = True
+        self._mark_dirty()
 
     def _has_valid_overlay(self) -> bool:
         if self._current_index >= len(self._mask_paths):
             return False
         mask_path = self._mask_paths[self._current_index]
-        return mask_path is not None and mask_path.exists()
+        return mask_path is not None and self._path_stat_cache.get(str(mask_path), (False, 0, 0))[0]
 
     def _close_panel(self):
         lf.ui.set_panel_enabled("lfs.image_preview", False)
@@ -370,13 +478,13 @@ class ImagePreviewPanel(Panel):
             self._fit_to_window = cb.has_attribute("checked")
             if self._fit_to_window:
                 self._reset_view()
-            self._dirty = True
+            self._mark_dirty()
 
     def _on_mask_checkbox_change(self, _event):
         cb = self._doc.get_element_by_id("cb-mask") if self._doc else None
         if cb:
             self._show_overlay = cb.has_attribute("checked")
-            self._dirty = True
+            self._mark_dirty()
 
     def _on_precise_scroll(self, event):
         scroll_el = event.current_target()
@@ -409,7 +517,7 @@ class ImagePreviewPanel(Panel):
         else:
             self._zoom = max(ZOOM_MIN, self._zoom / 1.15)
         self._fit_to_window = False
-        self._dirty = True
+        self._mark_dirty()
 
     def _on_img_mousedown(self, event):
         button = int(event.get_parameter("button", "0"))
@@ -438,7 +546,7 @@ class ImagePreviewPanel(Panel):
         my = float(event.get_parameter("mouse_y", "0"))
         self._pan_x = self._drag_start_pan_x + (mx - self._drag_start_x)
         self._pan_y = self._drag_start_pan_y + (my - self._drag_start_y)
-        self._dirty = True
+        self._mark_dirty()
 
     def _on_img_mouseover(self, _event):
         self._hover_image = True
@@ -448,7 +556,7 @@ class ImagePreviewPanel(Panel):
         self._dragging = False
 
     def _on_layout_resize(self, _event):
-        self._dirty = True
+        self._mark_dirty()
 
     def _get_active_layer_id(self):
         return "main-image-a" if self._active_layer == "a" else "main-image-b"
@@ -668,13 +776,13 @@ class ImagePreviewPanel(Panel):
         lo = max(0, self._current_index - half)
         hi = min(n, self._current_index + half)
 
+        self._filmstrip_top_spacer = lo * 46.0
+        self._filmstrip_bottom_spacer = max(0, n - hi) * 46.0
         records = []
-        for i, path in enumerate(self._image_paths):
-            if lo <= i < hi:
-                uid = self._camera_uids[i] if i < len(self._camera_uids) else -1
-                dec = f"image({self._make_preview_url(path, uid, THUMB_MAX_PX)})"
-            else:
-                dec = "none"
+        for i in range(lo, hi):
+            path = self._image_paths[i]
+            uid = self._camera_uids[i] if i < len(self._camera_uids) else -1
+            dec = f"image({self._make_preview_url(path, uid, THUMB_MAX_PX)})"
             records.append({
                 "index": i,
                 "label": f"{i + 1:02d}",
@@ -682,14 +790,17 @@ class ImagePreviewPanel(Panel):
                 "decorator": dec,
             })
         self._handle.update_record_list("thumbs", records)
+        self._handle.dirty("filmstrip_top_spacer_height")
+        self._handle.dirty("filmstrip_bottom_spacer_height")
 
         self._scroll_filmstrip_smooth(filmstrip, self._current_index)
 
     def _scroll_filmstrip_smooth(self, filmstrip, index: int):
         children = filmstrip.children()
-        if index < 0 or index >= len(children):
+        child_index = index - max(0, self._current_index - FILMSTRIP_WINDOW // 2) + 1
+        if child_index < 1 or child_index >= len(children) - 1:
             return
-        el = children[index]
+        el = children[child_index]
         item_top = el.offset_top
         item_bot = item_top + el.offset_height
         view_h = filmstrip.client_height
@@ -982,7 +1093,7 @@ class ImagePreviewPanel(Panel):
 
         self._color_picker_active = False
         self._update_picker_cursor()
-        self._dirty = True
+        self._mark_dirty()
 
     def _update_picker_cursor(self):
         """Toggle the picker-active CSS class on the image container."""
@@ -1017,22 +1128,22 @@ class ImagePreviewPanel(Panel):
             event.stop_propagation()
         elif key == KI_I:
             self._show_info = not self._show_info
-            self._dirty = True
+            self._mark_dirty()
             event.stop_propagation()
         elif key == KI_T:
             self._show_filmstrip = not self._show_filmstrip
-            self._dirty = True
+            self._mark_dirty()
             event.stop_propagation()
         elif key == KI_M:
             if self._has_valid_overlay():
                 self._show_overlay = not self._show_overlay
-                self._dirty = True
+                self._mark_dirty()
             event.stop_propagation()
         elif key == KI_1:
             self._zoom = 1.0
             self._fit_to_window = False
             self._reset_pan()
-            self._dirty = True
+            self._mark_dirty()
             event.stop_propagation()
         elif key == KI_OEM_PLUS or key == KI_ADD:
             self._zoom_in()
@@ -1047,23 +1158,23 @@ class ImagePreviewPanel(Panel):
                 self._reset_pan()
             else:
                 self._reset_view()
-            self._dirty = True
+            self._mark_dirty()
             event.stop_propagation()
         elif key == KI_R:
             self._reset_view()
-            self._dirty = True
+            self._mark_dirty()
             event.stop_propagation()
         elif key == KI_C:
             if self._image_paths:
                 self._color_picker_active = not self._color_picker_active
                 self._update_picker_cursor()
-                self._dirty = True
+                self._mark_dirty()
             event.stop_propagation()
         elif key == KI_ESCAPE:
             if self._color_picker_active:
                 self._color_picker_active = False
                 self._update_picker_cursor()
-                self._dirty = True
+                self._mark_dirty()
             else:
                 self._close_panel()
             event.stop_propagation()
@@ -1104,17 +1215,26 @@ def _set_text(doc, element_id: str, text: str):
 
 def open_image_preview(image_paths: list[Path], mask_paths: list[Path],
                        start_index: int, camera_uids: list[int] | None = None):
-    if _instance:
-        _instance.open(image_paths, mask_paths, start_index, camera_uids)
+    global _pending_open
+    _pending_open = (image_paths, mask_paths, start_index, camera_uids)
     lf.ui.set_panel_enabled("lfs.image_preview", True)
+    panel = _instance
+    if panel is None:
+        get_panel_object = getattr(lf.ui, "get_panel_object", None)
+        if get_panel_object is not None:
+            panel = get_panel_object("lfs.image_preview")
+    if panel and _pending_open is not None:
+        panel.open(*_pending_open)
+        _pending_open = None
 
 
 def open_camera_preview_by_uid(cam_uid: int):
     scene = lf.get_scene()
     if not scene:
         return
+    nodes = scene.get_nodes()
     target = None
-    for node in scene.get_nodes():
+    for node in nodes:
         if node.type == lf.scene.NodeType.CAMERA and node.camera_uid == cam_uid:
             target = node
             break
@@ -1122,14 +1242,16 @@ def open_camera_preview_by_uid(cam_uid: int):
         return
 
     parent = scene.get_node_by_id(target.parent_id) if target.parent_id >= 0 else None
-    child_ids = parent.children if parent else [n.id for n in scene.get_nodes() if n.type == lf.scene.NodeType.CAMERA]
+    child_ids = parent.children if parent else [n.id for n in nodes if n.type == lf.scene.NodeType.CAMERA]
+
+    nodes_by_id = {node.id: node for node in nodes}
 
     image_paths = []
     mask_paths = []
     camera_uids = []
     start_index = 0
     for cid in child_ids:
-        child = scene.get_node_by_id(cid)
+        child = nodes_by_id.get(cid)
         if not child or child.type != lf.scene.NodeType.CAMERA or not child.image_path:
             continue
         if child.id == target.id:

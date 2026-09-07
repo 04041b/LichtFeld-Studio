@@ -6,6 +6,7 @@
 
 #include "core/export.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -25,23 +26,20 @@ namespace lfs::vis::gui::panels {
     public:
         static PythonScriptManagerState& getInstance();
 
-        void addScript(const std::filesystem::path& path);
         void setScripts(const std::vector<std::filesystem::path>& paths);
         void setScriptEnabled(size_t index, bool enabled);
         void setScriptError(size_t index, const std::string& error);
         void clearErrors();
         void clear();
 
-        const std::vector<ScriptInfo>& scripts() const { return scripts_; }
+        std::vector<ScriptInfo> scriptsSnapshot() const;
         std::vector<std::filesystem::path> enabledScripts() const;
-        bool needsReload() const { return needs_reload_; }
-        void setNeedsReload(bool val) { needs_reload_ = val; }
 
     private:
         PythonScriptManagerState() = default;
 
         std::vector<ScriptInfo> scripts_;
-        bool needs_reload_ = false;
+        std::uint64_t generation_ = 0;
         mutable std::mutex mutex_;
     };
 

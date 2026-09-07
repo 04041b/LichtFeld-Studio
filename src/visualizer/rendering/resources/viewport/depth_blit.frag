@@ -9,6 +9,8 @@ layout(set = 0, binding = 0) uniform sampler2D u_depth;
 
 layout(push_constant) uniform Push {
     vec4 params; // x = near, y = far, z = is_view_depth (1) vs ndc (0), w = flip_y
+    vec2 uv_scale;
+    vec2 uv_clamp_max;
 } pc;
 
 float view_depth_to_ndc(float z) {
@@ -22,10 +24,11 @@ void main() {
     if (pc.params.w > 0.5) {
         uv.y = 1.0 - uv.y;
     }
+    uv = min(uv * pc.uv_scale, pc.uv_clamp_max);
     float d = texture(u_depth, uv).r;
     float ndc;
     if (pc.params.z > 0.5) {
-        // view-space depth (CUDA rasterizer default): convert to NDC
+        // View-space depth from tensor-backed render outputs: convert to NDC.
         if (d <= 0.0 || d >= 1e9) {
             // sentinel: leave depth at far (no occlusion contribution)
             discard;

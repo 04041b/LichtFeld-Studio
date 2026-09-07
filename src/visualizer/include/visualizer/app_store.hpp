@@ -1,0 +1,250 @@
+/* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
+ * SPDX-License-Identifier: GPL-3.0-or-later */
+
+#pragma once
+
+#include "core/export.hpp"
+#include "core/reactive/observable.hpp"
+#include "core/reactive/store.hpp"
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace lfs::diagnostics {
+    struct VramProfilerSnapshot;
+} // namespace lfs::diagnostics
+
+namespace lfs::vis {
+
+    class LFS_VIS_API AppStore {
+    public:
+        struct LFS_VIS_API CameraMetrics {
+            int camera_id = -1;
+            int iteration = -1;
+            float psnr = 0.0f;
+            std::optional<float> ssim;
+            bool used_mask = false;
+
+            bool operator==(const CameraMetrics&) const = default;
+        };
+
+        struct LFS_VIS_API GTMetricsOverlayConfig {
+            bool visible = false;
+            float x = 16.0f;
+            float y = 16.0f;
+            bool show_ssim = false;
+            int current_camera_id = -1;
+
+            [[nodiscard]] bool operator==(const GTMetricsOverlayConfig& other) const noexcept {
+                return visible == other.visible &&
+                       std::abs(x - other.x) <= 0.5f &&
+                       std::abs(y - other.y) <= 0.5f &&
+                       show_ssim == other.show_ssim &&
+                       current_camera_id == other.current_camera_id;
+            }
+        };
+
+        struct LFS_VIS_API VramHud {
+            bool visible = false;
+            std::shared_ptr<const lfs::diagnostics::VramProfilerSnapshot> snapshot;
+
+            [[nodiscard]] bool operator==(const VramHud& other) const noexcept {
+                return visible == other.visible && snapshot == other.snapshot;
+            }
+        };
+
+        struct LFS_VIS_API PerfHudSnapshot {
+            std::size_t vram_process_bytes = 0;
+            std::size_t vram_used_bytes = 0;
+            std::size_t vram_total_bytes = 0;
+            std::size_t ram_process_bytes = 0;
+            std::size_t ram_used_bytes = 0;
+            std::size_t ram_total_bytes = 0;
+            float gpu_utilization_percent = -1.0f;
+            float process_cpu_percent = -1.0f;
+            std::vector<float> per_core_cpu_percent;
+            float rate = 0.0f;
+            bool gpu_utilization_valid = false;
+            bool cpu_valid = false;
+            bool ledger_valid = false; // false when profiler off → badge unknown (not GAP)
+            bool ledger_closed = false;
+            bool ledger_over = false;
+        };
+
+        struct LFS_VIS_API PerfHud {
+            bool visible = false;
+            bool expanded = true;
+            std::shared_ptr<const PerfHudSnapshot> snapshot;
+
+            [[nodiscard]] bool operator==(const PerfHud& other) const noexcept {
+                return visible == other.visible && expanded == other.expanded &&
+                       snapshot == other.snapshot;
+            }
+        };
+
+        struct LFS_VIS_API ImportOverlayState {
+            bool active = false;
+            bool show_completion = false;
+            float progress = 0.0f;
+            std::string stage;
+            std::string dataset_type;
+            std::string path;
+            bool success = false;
+            std::string error;
+            std::uint64_t num_images = 0;
+            std::uint64_t num_points = 0;
+            float seconds_since_completion = 0.0f;
+
+            bool operator==(const ImportOverlayState&) const = default;
+        };
+
+        struct LFS_VIS_API AccountState {
+            bool signed_in = false;
+            bool linking = false;
+            bool membership_required = false;
+            std::string label;
+            std::string tier;
+            std::string tooltip;
+
+            bool operator==(const AccountState&) const = default;
+        };
+
+        struct LFS_VIS_API VideoExportOverlayState {
+            bool active = false;
+            float progress = 0.0f;
+            int current_frame = 0;
+            int total_frames = 0;
+            std::string stage;
+
+            bool operator==(const VideoExportOverlayState&) const = default;
+        };
+
+        struct LFS_VIS_API ExportProgressState {
+            bool active = false;
+            float progress = 0.0f;
+            std::string stage;
+            std::string outcome{"idle"};
+            std::string format;
+            std::string error;
+            std::string path;
+
+            [[nodiscard]] bool operator==(const ExportProgressState& other) const noexcept {
+                return active == other.active &&
+                       std::abs(progress - other.progress) <= 0.0005f &&
+                       stage == other.stage &&
+                       outcome == other.outcome &&
+                       format == other.format &&
+                       error == other.error &&
+                       path == other.path;
+            }
+        };
+
+        struct LFS_VIS_API TaskProgressState {
+            bool active = false;
+            float progress = 0.0f;
+            std::string stage;
+            std::string error;
+            std::string source_name;
+            std::string output_name;
+
+            [[nodiscard]] bool operator==(const TaskProgressState& other) const noexcept {
+                return active == other.active &&
+                       std::abs(progress - other.progress) <= 0.0005f &&
+                       stage == other.stage &&
+                       error == other.error &&
+                       source_name == other.source_name &&
+                       output_name == other.output_name;
+            }
+        };
+
+        enum Field : std::uint32_t {
+            Iteration = 1,
+            TotalIterations,
+            Loss,
+            NumGaussians,
+            MaxGaussians,
+            TrainingRunning,
+            TrainingState,
+            TrainerLoaded,
+            EvalPsnr,
+            EvalSsim,
+            EvalLpips,
+            SceneGeneration,
+            SelectionGeneration,
+            Fps,
+            ModeText,
+            CameraMetricsValue,
+            GTMetricsOverlayConfigValue,
+            VramHudValue,
+            PerfHudValue,
+            ActiveTool,
+            ActiveSubmode,
+            TransformSpaceValue,
+            PivotModeValue,
+            MultiTransformModeValue,
+            ImportOverlayStateValue,
+            AccountStateValue,
+            VideoExportOverlayStateValue,
+            ExportProgressStateValue,
+            Mesh2SplatStateValue,
+            SplatSimplifyStateValue,
+            ScriptsGeneration,
+            LanguageGeneration,
+            RenderSettingsGeneration,
+            ViewportToolbarGeneration,
+        };
+
+        AppStore();
+
+        [[nodiscard]] lfs::core::reactive::Store& store() noexcept { return store_; }
+        [[nodiscard]] const lfs::core::reactive::Store& store() const noexcept { return store_; }
+
+        lfs::core::reactive::Observable<int> iteration;
+        lfs::core::reactive::Observable<int> total_iterations;
+        lfs::core::reactive::Observable<float> loss;
+        lfs::core::reactive::Observable<std::int64_t> num_gaussians;
+        lfs::core::reactive::Observable<std::int64_t> max_gaussians;
+        lfs::core::reactive::Observable<bool> training_running;
+        lfs::core::reactive::Observable<std::string> training_state;
+        lfs::core::reactive::Observable<bool> trainer_loaded;
+        lfs::core::reactive::Observable<std::optional<float>> eval_psnr;
+        lfs::core::reactive::Observable<std::optional<float>> eval_ssim;
+        lfs::core::reactive::Observable<std::optional<float>> eval_lpips;
+        lfs::core::reactive::Observable<std::uint64_t> scene_generation;
+        lfs::core::reactive::Observable<std::uint64_t> selection_generation;
+        lfs::core::reactive::Observable<float> fps;
+        lfs::core::reactive::Observable<std::string> mode_text;
+        lfs::core::reactive::Observable<std::optional<CameraMetrics>> camera_metrics;
+        lfs::core::reactive::Observable<GTMetricsOverlayConfig> gt_metrics_overlay_config;
+        lfs::core::reactive::Observable<VramHud> vram_hud;
+        lfs::core::reactive::Observable<PerfHud> perf_hud;
+        lfs::core::reactive::Observable<std::string> active_tool;
+        lfs::core::reactive::Observable<std::string> active_submode;
+        lfs::core::reactive::Observable<int> transform_space;
+        lfs::core::reactive::Observable<int> pivot_mode;
+        lfs::core::reactive::Observable<int> multi_transform_mode;
+        lfs::core::reactive::Observable<ImportOverlayState> import_overlay_state;
+        lfs::core::reactive::Observable<AccountState> account_state;
+        lfs::core::reactive::Observable<VideoExportOverlayState> video_export_overlay_state;
+        lfs::core::reactive::Observable<ExportProgressState> export_progress_state;
+        lfs::core::reactive::Observable<TaskProgressState> mesh2splat_state;
+        lfs::core::reactive::Observable<TaskProgressState> splat_simplify_state;
+        lfs::core::reactive::Observable<std::uint64_t> scripts_generation;
+        lfs::core::reactive::Observable<std::uint64_t> language_generation;
+        lfs::core::reactive::Observable<std::uint64_t> render_settings_generation;
+        lfs::core::reactive::Observable<std::uint64_t> viewport_toolbar_generation;
+
+    private:
+        lfs::core::reactive::Store store_;
+    };
+
+    LFS_VIS_API AppStore& app_store();
+    LFS_VIS_API void publish_language_generation();
+    LFS_VIS_API void publish_viewport_toolbar_generation();
+
+} // namespace lfs::vis

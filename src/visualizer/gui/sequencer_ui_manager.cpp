@@ -3,10 +3,14 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/sequencer_ui_manager.hpp"
+#include "core/environment.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/sh_value_quant.hpp"
+#include "core/splat_data.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/panel_input_utils.hpp"
 #include "gui/rml_sequencer_overlay.hpp"
@@ -14,11 +18,13 @@
 #include "gui/string_keys.hpp"
 #include "gui/translation_gizmo.hpp"
 #include "gui/utils/native_file_dialog.hpp"
+#include "io/loader.hpp"
 #include "io/video/video_export_options.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
+#include "scene/viewer_splat_quantize.hpp"
 #include "sequencer/interpolation.hpp"
 #include "sequencer/keyframe.hpp"
 #include "sequencer/timeline_view_math.hpp"
@@ -26,9 +32,19 @@
 #include "visualizer_impl.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cuda_runtime.h>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <string_view>
+#include <system_error>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace lfs::vis::gui {
@@ -37,6 +53,222 @@ namespace lfs::vis::gui {
         constexpr size_t MIN_PATH_RENDER_SAMPLES = 128;
         constexpr size_t MAX_PATH_RENDER_SAMPLES = 4096;
         constexpr float PATH_SAMPLES_PER_VIEWPORT_PIXEL = 2.0f;
+        constexpr uint32_t PLY_SEQUENCE_CACHE_MAGIC = 0x4C465351; // "LFSQ"
+        constexpr uint32_t PLY_SEQUENCE_CACHE_VERSION = 1;
+        constexpr int PIP_PREVIEW_LONG_SIDE = 320;
+
+        struct PipPreviewSize {
+            int width = PIP_PREVIEW_LONG_SIDE;
+            int height = 180;
+        };
+
+        [[nodiscard]] PipPreviewSize pipPreviewSize(int out_w, int out_h) {
+            out_w = std::max(out_w, 1);
+            out_h = std::max(out_h, 1);
+            int width;
+            int height;
+            if (out_w >= out_h) {
+                width = PIP_PREVIEW_LONG_SIDE;
+                height = static_cast<int>(std::lround(
+                    static_cast<double>(PIP_PREVIEW_LONG_SIDE) * static_cast<double>(out_h) /
+                    static_cast<double>(out_w)));
+            } else {
+                height = PIP_PREVIEW_LONG_SIDE;
+                width = static_cast<int>(std::lround(
+                    static_cast<double>(PIP_PREVIEW_LONG_SIDE) * static_cast<double>(out_w) /
+                    static_cast<double>(out_h)));
+            }
+            const auto even = [](const int value) { return std::max(2, value & ~1); };
+            return {even(width), even(height)};
+        }
+
+        struct PlySequenceCacheHeader {
+            uint32_t magic = PLY_SEQUENCE_CACHE_MAGIC;
+            uint32_t version = PLY_SEQUENCE_CACHE_VERSION;
+            uint64_t source_size = 0;
+            int64_t source_mtime_ns = 0;
+            uint64_t source_key = 0;
+        };
+
+        [[nodiscard]] uint64_t fnv1a64(std::string_view text) {
+            uint64_t hash = 14695981039346656037ull;
+            for (const unsigned char c : text) {
+                hash ^= static_cast<uint64_t>(c);
+                hash *= 1099511628211ull;
+            }
+            return hash;
+        }
+
+        [[nodiscard]] int64_t fileTimeNs(const std::filesystem::path& path) {
+            std::error_code ec;
+            const auto write_time = std::filesystem::last_write_time(path, ec);
+            if (ec)
+                return 0;
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       write_time.time_since_epoch())
+                .count();
+        }
+
+        [[nodiscard]] std::filesystem::path stableAbsolutePath(const std::filesystem::path& path) {
+            std::error_code ec;
+            auto absolute = std::filesystem::weakly_canonical(path, ec);
+            if (!ec && !absolute.empty())
+                return absolute;
+            absolute = std::filesystem::absolute(path, ec);
+            return ec ? path : absolute;
+        }
+
+        [[nodiscard]] std::filesystem::path plySequenceCacheRoot() {
+#ifdef _WIN32
+            if (const auto local_app_data = lfs::core::environment::value("LOCALAPPDATA")) {
+                return lfs::core::utf8_to_path(*local_app_data) / "LichtFeld" / "ply_sequence_cache";
+            }
+            if (const auto temp = lfs::core::environment::value("TEMP")) {
+                return lfs::core::utf8_to_path(*temp) / "LichtFeld" / "ply_sequence_cache";
+            }
+            return std::filesystem::path("C:/Temp/LichtFeld/ply_sequence_cache");
+#else
+            if (const auto xdg_cache = lfs::core::environment::value("XDG_CACHE_HOME")) {
+                return lfs::core::utf8_to_path(*xdg_cache) / "lichtfeld" / "ply_sequence_cache";
+            }
+            if (const auto home = lfs::core::environment::value("HOME")) {
+                return lfs::core::utf8_to_path(*home) / ".cache" / "lichtfeld" / "ply_sequence_cache";
+            }
+            return std::filesystem::temp_directory_path() / "lichtfeld" / "ply_sequence_cache";
+#endif
+        }
+
+        [[nodiscard]] std::optional<PlySequenceCacheHeader> makePlySequenceCacheHeader(
+            const std::filesystem::path& source_path) {
+            std::error_code ec;
+            const uint64_t source_size = std::filesystem::file_size(source_path, ec);
+            if (ec)
+                return std::nullopt;
+
+            const auto absolute = stableAbsolutePath(source_path);
+            const int64_t source_mtime_ns = fileTimeNs(source_path);
+            const std::string key_text = std::format("{}|{}|{}",
+                                                     lfs::core::path_to_utf8(absolute),
+                                                     source_size,
+                                                     source_mtime_ns);
+            return PlySequenceCacheHeader{
+                .magic = PLY_SEQUENCE_CACHE_MAGIC,
+                .version = PLY_SEQUENCE_CACHE_VERSION,
+                .source_size = source_size,
+                .source_mtime_ns = source_mtime_ns,
+                .source_key = fnv1a64(key_text)};
+        }
+
+        [[nodiscard]] std::filesystem::path plySequenceCachePath(
+            const PlySequenceCacheHeader& header) {
+            return plySequenceCacheRoot() / std::format("{:016x}.lfs_splat", header.source_key);
+        }
+
+        [[nodiscard]] bool cacheHeaderMatches(const PlySequenceCacheHeader& actual,
+                                              const PlySequenceCacheHeader& expected) {
+            return actual.magic == PLY_SEQUENCE_CACHE_MAGIC &&
+                   actual.version == PLY_SEQUENCE_CACHE_VERSION &&
+                   actual.source_size == expected.source_size &&
+                   actual.source_mtime_ns == expected.source_mtime_ns &&
+                   actual.source_key == expected.source_key;
+        }
+
+        [[nodiscard]] std::unique_ptr<lfs::core::SplatData> loadPlySequenceCache(
+            const std::filesystem::path& source_path,
+            const lfs::io::SplatTensorAllocator& allocator,
+            std::string& error) {
+            const auto expected_header = makePlySequenceCacheHeader(source_path);
+            if (!expected_header) {
+                error = "source metadata unavailable";
+                return nullptr;
+            }
+
+            const auto cache_path = plySequenceCachePath(*expected_header);
+            std::ifstream file;
+            if (!lfs::core::open_file_for_read(cache_path, std::ios::binary, file)) {
+                error = "cache miss";
+                return nullptr;
+            }
+
+            PlySequenceCacheHeader actual_header{};
+            file.read(reinterpret_cast<char*>(&actual_header), sizeof(actual_header));
+            if (!file || !cacheHeaderMatches(actual_header, *expected_header)) {
+                error = "stale cache";
+                std::error_code ec;
+                std::filesystem::remove(cache_path, ec);
+                return nullptr;
+            }
+
+            try {
+                auto model = std::make_unique<lfs::core::SplatData>();
+                model->deserialize(file, allocator);
+                if (!file) {
+                    error = "truncated cache";
+                    std::error_code ec;
+                    std::filesystem::remove(cache_path, ec);
+                    return nullptr;
+                }
+                return model;
+            } catch (const std::exception& e) {
+                error = e.what();
+                std::error_code ec;
+                std::filesystem::remove(cache_path, ec);
+                return nullptr;
+            }
+        }
+
+        [[nodiscard]] bool writePlySequenceCache(const std::filesystem::path& source_path,
+                                                 const lfs::core::SplatData& model,
+                                                 std::string& error) {
+            const auto header = makePlySequenceCacheHeader(source_path);
+            if (!header) {
+                error = "source metadata unavailable";
+                return false;
+            }
+
+            const auto cache_path = plySequenceCachePath(*header);
+            std::error_code ec;
+            std::filesystem::create_directories(cache_path.parent_path(), ec);
+            if (ec) {
+                error = ec.message();
+                return false;
+            }
+
+            auto tmp_path = cache_path;
+            tmp_path += ".tmp";
+            std::ofstream file;
+            if (!lfs::core::open_file_for_write(tmp_path,
+                                                std::ios::binary | std::ios::trunc,
+                                                file)) {
+                error = "open failed";
+                return false;
+            }
+
+            try {
+                file.write(reinterpret_cast<const char*>(&*header), sizeof(*header));
+                model.serialize(file);
+            } catch (const std::exception& e) {
+                error = e.what();
+                std::filesystem::remove(tmp_path, ec);
+                return false;
+            }
+            file.close();
+            if (!file) {
+                error = "write failed";
+                std::filesystem::remove(tmp_path, ec);
+                return false;
+            }
+
+            std::filesystem::remove(cache_path, ec);
+            ec.clear();
+            std::filesystem::rename(tmp_path, cache_path, ec);
+            if (ec) {
+                error = ec.message();
+                std::filesystem::remove(tmp_path, ec);
+                return false;
+            }
+            return true;
+        }
 
     } // namespace
 
@@ -48,15 +280,35 @@ namespace lfs::vis::gui {
           overlay_(std::make_unique<RmlSequencerOverlay>(controller_, rml_manager)),
           scene_sync_(std::make_unique<KeyframeSceneSync>(controller_, viewer)) {}
 
-    SequencerUIManager::~SequencerUIManager() = default;
+    SequencerUIManager::~SequencerUIManager() {
+        stopPlySequenceStreaming();
+    }
+
+    float SequencerUIManager::timelineZoom() const {
+        return panel_ ? panel_->zoomLevel() : 1.0f;
+    }
+
+    float SequencerUIManager::timelinePan() const {
+        return panel_ ? panel_->panOffset() : 0.0f;
+    }
+
+    void SequencerUIManager::setTimelineView(const float zoom, const float pan) {
+        if (panel_)
+            panel_->setTimelineView(zoom, pan);
+    }
 
     void SequencerUIManager::destroyGraphicsResources() {
+        stopPlySequenceStreaming();
+        last_ply_sequence_frame_ = std::nullopt;
+        loaded_ply_sequence_frames_.clear();
         if (panel_)
             panel_->destroyGraphicsResources();
         if (overlay_)
             overlay_->destroyGraphicsResources();
         pip_texture_.reset();
         pip_initialized_ = false;
+        pip_last_key_.reset();
+        pip_needs_update_ = true;
         line_renderer_.destroyResources();
         film_strip_.destroyGraphicsResources();
     }
@@ -81,7 +333,7 @@ namespace lfs::vis::gui {
 
         viewport_edit_mode_ = SequencerViewportEditMode::None;
         keyframe_gizmo_active_ = false;
-        pip_last_keyframe_ = std::nullopt;
+        pip_last_key_.reset();
         pip_needs_update_ = true;
         last_panel_frame_time_ = std::chrono::steady_clock::now();
         endViewportKeyframeEdit();
@@ -119,12 +371,11 @@ namespace lfs::vis::gui {
 
     void SequencerUIManager::restoreViewportCameraState(const sequencer::CameraState& state) const {
         auto& vp = viewer_->getViewport();
-        vp.camera.R = glm::mat3_cast(state.rotation);
-        vp.camera.t = state.position;
+        vp.setViewMatrix(glm::mat3_cast(state.rotation), state.position);
 
         if (auto* const rm = viewer_->getRenderingManager()) {
             rm->setFocalLength(state.focal_length_mm);
-            rm->markDirty(DirtyFlag::CAMERA);
+            rm->markCameraPoseChanged();
         }
     }
 
@@ -136,9 +387,9 @@ namespace lfs::vis::gui {
                 ui_state_.equirectangular = *event.equirectangular;
         });
 
-        cmd::SequencerAddKeyframe::when([this](const auto&) {
+        cmd::SequencerAddKeyframe::when([this](const auto& event) {
             const auto& cam = viewer_->getViewport().camera;
-            const float time = controller_.playhead();
+            const float time = std::max(event.time.value_or(controller_.playhead()), 0.0f);
             const glm::vec3 position = cam.t;
             const glm::quat rotation = glm::quat_cast(cam.R);
 
@@ -155,6 +406,7 @@ namespace lfs::vis::gui {
                                                           std::abs(kf.time - time) < REPLACE_EPSILON_S;
                                                });
             if (existing != keyframes.end()) {
+                LOG_INFO("Replaced keyframe {} at t={:.3f}s instead of adding a new one", existing->id, time);
                 controller_.updateKeyframeById(existing->id, position, rotation, focal_mm);
             } else {
                 lfs::sequencer::Keyframe kf;
@@ -199,6 +451,12 @@ namespace lfs::vis::gui {
             controller_.togglePlayPause();
         });
 
+        cmd::SequencerLoadPlySequence::when([this](const auto& event) {
+            if (event.fps > 0.0f)
+                ui_state_.sequence_fps = std::clamp(event.fps, MIN_SEQUENCE_FPS, MAX_SEQUENCE_FPS);
+            loadPlySequenceFromDirectory(lfs::core::utf8_to_path(event.directory));
+        });
+
         state::KeyframeListChanged::when([this](const auto&) {
             film_strip_.invalidateAll();
         });
@@ -207,9 +465,13 @@ namespace lfs::vis::gui {
         // and film-strip thumbs by wiping the timeline; the keyframes belong to the old scene.
         state::SceneCleared::when([this](const auto&) {
             if (controller_.timeline().realKeyframeCount() == 0 &&
-                !controller_.timeline().hasAnimationClip())
+                !controller_.timeline().hasAnimationClip() &&
+                !controller_.hasPlySequence())
                 return;
+            stopPlySequenceStreaming();
             controller_.clear();
+            last_ply_sequence_frame_ = std::nullopt;
+            loaded_ply_sequence_frames_.clear();
             film_strip_.invalidateAll();
             state::KeyframeListChanged{.count = 0}.emit();
         });
@@ -232,8 +494,12 @@ namespace lfs::vis::gui {
 
     float SequencerUIManager::preferredFloatingHeight() const {
         const float dp = std::max(1.0f, getThemeDpiScale());
-        const float strip_h = ui_state_.show_film_strip ? FilmStripRenderer::STRIP_HEIGHT : 0.0f;
-        return (panel_config::HEIGHT + panel_config::EASING_STRIPE_HEIGHT) * dp + strip_h;
+        // #floating-header min-height + margin-bottom + #panel.is-floating padding-top
+        const float header_h = (28.0f + 6.0f + 10.0f) * dp;
+        const float strip_h =
+            ui_state_.show_film_strip ? FilmStripRenderer::STRIP_HEIGHT * dp : 0.0f;
+        return (panel_config::HEIGHT + panel_config::EASING_STRIPE_HEIGHT) * dp + header_h +
+               strip_h;
     }
 
     void SequencerUIManager::render(const UIContext& ctx, const ViewportLayout& viewport,
@@ -249,7 +515,6 @@ namespace lfs::vis::gui {
 
         if (ui_state_.equirectangular != last_equirectangular_) {
             last_equirectangular_ = ui_state_.equirectangular;
-            pip_needs_update_ = true;
             film_strip_.invalidateAll();
         }
 
@@ -304,13 +569,6 @@ namespace lfs::vis::gui {
         overlay_->render(sdl_buf.window_w, sdl_buf.window_h);
     }
 
-    void SequencerUIManager::compositeOverlays(const int screen_w, const int screen_h) {
-        if (panel_)
-            panel_->compositeToScreen(screen_w, screen_h);
-        if (overlay_)
-            overlay_->compositeToScreen(screen_w, screen_h);
-    }
-
     bool SequencerUIManager::blocksPointer(const double x, const double y) const {
         return overlay_ &&
                (overlay_->wantsInput() || overlay_->isMouseOverEditOverlay(static_cast<float>(x),
@@ -321,11 +579,538 @@ namespace lfs::vis::gui {
         return overlay_ && (overlay_->isContextMenuOpen() || overlay_->isPopupOpen());
     }
 
-    void SequencerUIManager::renderSequencerPanel(const UIContext& /*ctx*/, const ViewportLayout& viewport,
-                                                  const float panel_x, const float panel_y,
-                                                  const float panel_width, const float panel_height,
-                                                  const PanelInputState& panel_input) {
-        (void)viewport;
+    bool SequencerUIManager::needsAnimationFrame() const {
+        return (panel_ && panel_->needsLocalizationFrame()) ||
+               controller_.isPlaying() ||
+               controller_.state() == PlaybackState::SCRUBBING ||
+               plySequenceStreamHasWork() ||
+               keyframe_gizmo_active_ ||
+               viewport_keyframe_edit_snapshot_.has_value() ||
+               (ui_state_.show_pip_preview &&
+                (pip_needs_update_ || !pip_last_key_ || currentPipPreviewKey() != *pip_last_key_)) ||
+               (overlay_ && (overlay_->wantsInput() ||
+                             overlay_->isContextMenuOpen() ||
+                             overlay_->isPopupOpen()));
+    }
+
+    bool SequencerUIManager::plySequenceStreamHasWork() const {
+        std::lock_guard lock(ply_stream_mutex_);
+        return ply_stream_inflight_ ||
+               !ply_stream_requests_.empty() ||
+               !ply_stream_completed_.empty();
+    }
+
+    size_t SequencerUIManager::plySequenceFrameDistance(const size_t lhs,
+                                                        const size_t rhs,
+                                                        const size_t frame_count) const {
+        if (frame_count == 0)
+            return 0;
+
+        const size_t direct = lhs > rhs ? lhs - rhs : rhs - lhs;
+        if (controller_.loopMode() != LoopMode::LOOP)
+            return direct;
+        return std::min(direct, frame_count - direct);
+    }
+
+    bool SequencerUIManager::isPlySequenceFrameInWindow(const size_t frame_index,
+                                                        const size_t center_frame,
+                                                        const size_t frame_count) const {
+        return isPlySequenceFrameInWindow(frame_index,
+                                          center_frame,
+                                          frame_count,
+                                          controller_.loopMode() == LoopMode::LOOP);
+    }
+
+    bool SequencerUIManager::isPlySequenceFrameInWindow(const size_t frame_index,
+                                                        const size_t center_frame,
+                                                        const size_t frame_count,
+                                                        const bool loop) const {
+        if (frame_count == 0 || frame_index >= frame_count || center_frame >= frame_count)
+            return false;
+        if (frame_count <= MAX_STREAM_RESIDENT_FRAMES)
+            return true;
+        if (frame_index == center_frame)
+            return true;
+
+        if (loop) {
+            const size_t forward = (frame_index + frame_count - center_frame) % frame_count;
+            const size_t backward = (center_frame + frame_count - frame_index) % frame_count;
+            return forward <= STREAM_PREFETCH_AHEAD || backward <= STREAM_PREFETCH_BEHIND;
+        }
+
+        if (frame_index > center_frame)
+            return frame_index - center_frame <= STREAM_PREFETCH_AHEAD;
+        return center_frame - frame_index <= STREAM_PREFETCH_BEHIND;
+    }
+
+    std::optional<size_t> SequencerUIManager::selectPlySequenceDisplayFrame(const size_t requested_frame) const {
+        const auto* const sequence = controller_.plySequence();
+        if (!sequence || requested_frame >= sequence->frames.size())
+            return std::nullopt;
+
+        std::lock_guard lock(ply_stream_mutex_);
+        if (requested_frame < ply_stream_states_.size() &&
+            ply_stream_states_[requested_frame] == PlyStreamFrameState::Resident) {
+            return requested_frame;
+        }
+
+        const size_t frame_count = sequence->frames.size();
+        const bool playing = controller_.isPlaying();
+        std::optional<size_t> best_frame;
+        size_t best_score = 0;
+        for (size_t frame = 0; frame < ply_stream_states_.size() && frame < frame_count; ++frame) {
+            if (ply_stream_states_[frame] != PlyStreamFrameState::Resident)
+                continue;
+
+            size_t score = 0;
+            if (!playing) {
+                score = plySequenceFrameDistance(frame, requested_frame, frame_count);
+            } else if (controller_.loopMode() == LoopMode::LOOP) {
+                score = (frame + frame_count - requested_frame) % frame_count;
+            } else if (frame >= requested_frame) {
+                score = frame - requested_frame;
+            } else {
+                score = STREAM_PREFETCH_AHEAD + 1 + requested_frame - frame;
+            }
+
+            if (!best_frame.has_value() || score < best_score) {
+                best_frame = frame;
+                best_score = score;
+            }
+        }
+
+        return best_frame;
+    }
+
+    void SequencerUIManager::requestPlySequenceFrame(const size_t frame_index, const bool priority) {
+        std::lock_guard lock(ply_stream_mutex_);
+        if (frame_index >= ply_stream_states_.size())
+            return;
+
+        auto& state = ply_stream_states_[frame_index];
+        if (state == PlyStreamFrameState::Resident || state == PlyStreamFrameState::Loading)
+            return;
+
+        if (state == PlyStreamFrameState::Queued) {
+            if (priority) {
+                std::erase(ply_stream_requests_, frame_index);
+                ply_stream_requests_.push_front(frame_index);
+            }
+            return;
+        }
+
+        state = PlyStreamFrameState::Queued;
+        if (priority)
+            ply_stream_requests_.push_front(frame_index);
+        else
+            ply_stream_requests_.push_back(frame_index);
+        ply_stream_cv_.notify_one();
+    }
+
+    void SequencerUIManager::prunePlySequenceRequests(const size_t frame_index) {
+        const auto* const sequence = controller_.plySequence();
+        if (!sequence || sequence->frames.size() <= MAX_STREAM_RESIDENT_FRAMES)
+            return;
+
+        const size_t count = sequence->frames.size();
+        std::lock_guard lock(ply_stream_mutex_);
+        for (auto it = ply_stream_requests_.begin(); it != ply_stream_requests_.end();) {
+            const size_t queued_frame = *it;
+            if (isPlySequenceFrameInWindow(queued_frame, frame_index, count)) {
+                ++it;
+                continue;
+            }
+            if (queued_frame < ply_stream_states_.size() &&
+                ply_stream_states_[queued_frame] == PlyStreamFrameState::Queued) {
+                ply_stream_states_[queued_frame] = PlyStreamFrameState::Empty;
+            }
+            it = ply_stream_requests_.erase(it);
+            ++ply_stream_stale_request_drop_count_;
+        }
+    }
+
+    void SequencerUIManager::requestPlySequenceWindow(const size_t frame_index) {
+        const auto* const sequence = controller_.plySequence();
+        if (!sequence || sequence->frames.empty())
+            return;
+
+        const size_t count = sequence->frames.size();
+        ply_stream_target_frame_.store(frame_index, std::memory_order_release);
+        ply_stream_target_loop_.store(controller_.loopMode() == LoopMode::LOOP, std::memory_order_release);
+        prunePlySequenceRequests(frame_index);
+        requestPlySequenceFrame(frame_index, true);
+
+        if (count <= MAX_STREAM_RESIDENT_FRAMES) {
+            for (size_t frame = 0; frame < count; ++frame)
+                requestPlySequenceFrame(frame, frame == frame_index);
+            return;
+        }
+
+        for (size_t offset = 1; offset <= STREAM_PREFETCH_AHEAD && offset < count; ++offset) {
+            const size_t next = controller_.loopMode() == LoopMode::LOOP
+                                    ? (frame_index + offset) % count
+                                    : frame_index + offset;
+            if (next >= count)
+                break;
+            requestPlySequenceFrame(next, false);
+        }
+
+        for (size_t offset = 1; offset <= STREAM_PREFETCH_BEHIND && offset < count; ++offset) {
+            if (controller_.loopMode() == LoopMode::LOOP) {
+                requestPlySequenceFrame((frame_index + count - offset) % count, false);
+            } else if (offset <= frame_index) {
+                requestPlySequenceFrame(frame_index - offset, false);
+            } else {
+                break;
+            }
+        }
+    }
+
+    void SequencerUIManager::plySequenceStreamWorker(const uint64_t generation) {
+        auto loader = lfs::io::Loader::create();
+
+        while (!ply_stream_stop_.load(std::memory_order_acquire) &&
+               ply_stream_generation_.load(std::memory_order_acquire) == generation) {
+            size_t frame_index = 0;
+            std::filesystem::path path;
+            lfs::io::SplatTensorAllocator allocator;
+
+            {
+                std::unique_lock lock(ply_stream_mutex_);
+                ply_stream_cv_.wait(lock, [this, generation] {
+                    return ply_stream_stop_.load(std::memory_order_acquire) ||
+                           ply_stream_generation_.load(std::memory_order_acquire) != generation ||
+                           !ply_stream_requests_.empty();
+                });
+
+                if (ply_stream_stop_.load(std::memory_order_acquire) ||
+                    ply_stream_generation_.load(std::memory_order_acquire) != generation)
+                    return;
+
+                frame_index = ply_stream_requests_.front();
+                ply_stream_requests_.pop_front();
+                if (frame_index >= ply_stream_states_.size() ||
+                    frame_index >= ply_stream_paths_.size() ||
+                    ply_stream_states_[frame_index] != PlyStreamFrameState::Queued) {
+                    continue;
+                }
+
+                ply_stream_states_[frame_index] = PlyStreamFrameState::Loading;
+                ply_stream_inflight_ = true;
+                ply_stream_inflight_frame_ = frame_index;
+                path = ply_stream_paths_[frame_index];
+                allocator = ply_stream_allocator_;
+            }
+
+            const auto start = std::chrono::steady_clock::now();
+            PlyStreamResult completed{};
+            completed.generation = generation;
+            completed.frame_index = frame_index;
+
+            try {
+                std::string cache_error;
+                completed.model = loadPlySequenceCache(path, allocator, cache_error);
+                completed.cache_hit = completed.model != nullptr;
+                completed.cache_miss = !completed.cache_hit;
+
+                if (!completed.model) {
+                    const lfs::io::LoadOptions load_options{
+                        .resize_factor = -1,
+                        .max_width = 0,
+                        .images_folder = "images",
+                        .validate_only = false,
+                        .cancel_requested = [this, generation, frame_index, frame_count = ply_stream_paths_.size()] {
+                            if (ply_stream_stop_.load(std::memory_order_acquire) ||
+                                ply_stream_generation_.load(std::memory_order_acquire) != generation) {
+                                return true;
+                            }
+                            if (frame_count <= MAX_STREAM_RESIDENT_FRAMES)
+                                return false;
+
+                            const size_t target = ply_stream_target_frame_.load(std::memory_order_acquire);
+                            if (target >= frame_count)
+                                return false;
+                            const bool loop = ply_stream_target_loop_.load(std::memory_order_acquire);
+                            return !isPlySequenceFrameInWindow(frame_index, target, frame_count, loop);
+                        },
+                        .splat_tensor_allocator = allocator,
+                        .shN_q16 = lfs::core::sh_value_quant::enabled()};
+
+                    auto load_result = loader->load(path, load_options);
+                    if (!load_result)
+                        throw std::runtime_error(load_result.error().format());
+
+                    auto* splat_data = std::get_if<std::shared_ptr<lfs::core::SplatData>>(&load_result->data);
+                    if (!splat_data || !*splat_data)
+                        throw std::runtime_error("sequence frame is not a gaussian splat PLY");
+
+                    completed.model = std::make_unique<lfs::core::SplatData>(std::move(**splat_data));
+                    std::string write_error;
+                    if (writePlySequenceCache(path, *completed.model, write_error)) {
+                        completed.cache_written = true;
+                    } else {
+                        completed.cache_write_failed = true;
+                        LOG_DEBUG("Failed to write PLY sequence cache for '{}': {}",
+                                  lfs::core::path_to_utf8(path),
+                                  write_error);
+                    }
+                }
+                // Cache deserialize always materializes fp32 swizzled shN; quantize
+                // after both hit and miss so resident frames (up to 64) stay q16.
+                quantizeViewerLoadedPlyShN(path, *completed.model);
+            } catch (const lfs::io::LoadCancelledError& e) {
+                completed.cancelled = true;
+                completed.error = e.what();
+            } catch (const std::exception& e) {
+                // Quantize can throw after the model is assigned. Drain installs
+                // any non-null model, so drop it rather than bind a broken q16 pair.
+                completed.model.reset();
+                completed.error = e.what();
+            }
+
+            completed.load_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+            {
+                std::lock_guard lock(ply_stream_mutex_);
+                if (ply_stream_generation_.load(std::memory_order_acquire) == generation) {
+                    ply_stream_completed_.push_back(std::move(completed));
+                }
+                ply_stream_inflight_ = false;
+                ply_stream_cv_.notify_one();
+            }
+        }
+    }
+
+    void SequencerUIManager::startPlySequenceStreaming(std::vector<std::filesystem::path> paths,
+                                                       lfs::io::SplatTensorAllocator allocator) {
+        stopPlySequenceStreaming();
+
+        const uint64_t generation = ply_stream_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        {
+            std::lock_guard lock(ply_stream_mutex_);
+            ply_stream_paths_ = std::move(paths);
+            ply_stream_allocator_ = std::move(allocator);
+            ply_stream_states_.assign(ply_stream_paths_.size(), PlyStreamFrameState::Empty);
+            ply_stream_requests_.clear();
+            ply_stream_completed_.clear();
+            ply_stream_inflight_ = false;
+            ply_stream_inflight_frame_ = 0;
+            ply_stream_last_load_ms_ = 0.0;
+            ply_stream_failed_count_ = 0;
+            ply_stream_miss_count_ = 0;
+            ply_stream_fallback_count_ = 0;
+            ply_stream_eviction_count_ = 0;
+            ply_stream_stale_request_drop_count_ = 0;
+            ply_stream_cache_hit_count_ = 0;
+            ply_stream_cache_miss_count_ = 0;
+            ply_stream_cache_write_count_ = 0;
+            ply_stream_cache_write_fail_count_ = 0;
+        }
+        ply_stream_target_frame_.store(0, std::memory_order_release);
+        ply_stream_target_loop_.store(controller_.loopMode() == LoopMode::LOOP, std::memory_order_release);
+
+        ply_stream_stop_.store(false, std::memory_order_release);
+        ply_stream_thread_ = std::thread([this, generation] {
+            plySequenceStreamWorker(generation);
+        });
+
+        requestPlySequenceWindow(0);
+    }
+
+    void SequencerUIManager::stopPlySequenceStreaming() {
+        ply_stream_stop_.store(true, std::memory_order_release);
+        ply_stream_generation_.fetch_add(1, std::memory_order_acq_rel);
+        ply_stream_cv_.notify_all();
+        if (ply_stream_thread_.joinable())
+            ply_stream_thread_.join();
+
+        std::lock_guard lock(ply_stream_mutex_);
+        ply_stream_paths_.clear();
+        ply_stream_allocator_ = {};
+        ply_stream_states_.clear();
+        ply_stream_requests_.clear();
+        ply_stream_completed_.clear();
+        ply_stream_inflight_ = false;
+        ply_stream_inflight_frame_ = 0;
+        ply_stream_last_load_ms_ = 0.0;
+        ply_stream_failed_count_ = 0;
+        ply_stream_miss_count_ = 0;
+        ply_stream_fallback_count_ = 0;
+        ply_stream_eviction_count_ = 0;
+        ply_stream_stale_request_drop_count_ = 0;
+        ply_stream_cache_hit_count_ = 0;
+        ply_stream_cache_miss_count_ = 0;
+        ply_stream_cache_write_count_ = 0;
+        ply_stream_cache_write_fail_count_ = 0;
+        ply_stream_target_frame_.store(0, std::memory_order_release);
+        ply_stream_target_loop_.store(false, std::memory_order_release);
+    }
+
+    void SequencerUIManager::drainPlySequenceStream() {
+        auto* const scene_manager = viewer_->getSceneManager();
+        const auto* const sequence = controller_.plySequence();
+        if (!scene_manager || !sequence)
+            return;
+
+        std::deque<PlyStreamResult> completed;
+        {
+            std::lock_guard lock(ply_stream_mutex_);
+            completed.swap(ply_stream_completed_);
+        }
+
+        if (completed.empty())
+            return;
+
+        auto& scene = scene_manager->getScene();
+        const uint64_t active_generation = ply_stream_generation_.load(std::memory_order_acquire);
+        bool current_frame_loaded = false;
+        const auto current_frame = controller_.currentPlySequenceFrameIndex();
+
+        while (!completed.empty()) {
+            auto result = std::move(completed.front());
+            completed.pop_front();
+            if (result.generation != active_generation ||
+                result.frame_index >= sequence->frames.size()) {
+                continue;
+            }
+
+            const auto& frame = sequence->frames[result.frame_index];
+            const auto resolved_node = resolvePlySequenceNode(scene, frame.node_uuid, frame.node_name);
+            if (!resolved_node) {
+                LOG_ERROR("Cannot stream PLY sequence frame {}: {}",
+                          result.frame_index,
+                          resolved_node.error().message);
+                std::lock_guard lock(ply_stream_mutex_);
+                if (result.frame_index < ply_stream_states_.size())
+                    ply_stream_states_[result.frame_index] = PlyStreamFrameState::Failed;
+                ++ply_stream_failed_count_;
+                continue;
+            }
+            const auto* frame_node = scene.getNodeById(*resolved_node);
+            assert(frame_node);
+            const std::string node_name = frame_node->name;
+            if (!result.model) {
+                if (result.cancelled) {
+                    std::lock_guard lock(ply_stream_mutex_);
+                    if (result.frame_index < ply_stream_states_.size())
+                        ply_stream_states_[result.frame_index] = PlyStreamFrameState::Empty;
+                    ply_stream_last_load_ms_ = result.load_ms;
+                    continue;
+                }
+
+                LOG_ERROR("Failed to stream PLY sequence frame {}: {}",
+                          result.frame_index,
+                          result.error.empty() ? "unknown error" : result.error);
+                std::lock_guard lock(ply_stream_mutex_);
+                if (result.frame_index < ply_stream_states_.size())
+                    ply_stream_states_[result.frame_index] = PlyStreamFrameState::Failed;
+                ++ply_stream_failed_count_;
+                ply_stream_last_load_ms_ = result.load_ms;
+                continue;
+            }
+
+            const size_t gaussian_count = result.model->size();
+            auto old_model = scene.swapNodeModel(node_name, std::move(result.model));
+            old_model.reset();
+            scene.setNodeVisibility(*resolved_node, false);
+            scene_manager->setPlyPath(frame_node->uuid, frame.path);
+
+            {
+                std::lock_guard lock(ply_stream_mutex_);
+                if (result.frame_index < ply_stream_states_.size())
+                    ply_stream_states_[result.frame_index] = PlyStreamFrameState::Resident;
+                std::erase(loaded_ply_sequence_frames_, result.frame_index);
+                loaded_ply_sequence_frames_.push_back(result.frame_index);
+                ply_stream_last_load_ms_ = result.load_ms;
+                if (result.cache_hit)
+                    ++ply_stream_cache_hit_count_;
+                if (result.cache_miss)
+                    ++ply_stream_cache_miss_count_;
+                if (result.cache_written)
+                    ++ply_stream_cache_write_count_;
+                if (result.cache_write_failed)
+                    ++ply_stream_cache_write_fail_count_;
+            }
+
+            LOG_INFO("Streamed PLY sequence frame {} '{}' ({} gaussians, {:.1f}ms, cache={})",
+                     result.frame_index,
+                     node_name,
+                     gaussian_count,
+                     result.load_ms,
+                     result.cache_hit ? "hit" : "miss");
+            current_frame_loaded = current_frame.has_value() && *current_frame == result.frame_index;
+        }
+
+        if (current_frame_loaded)
+            last_ply_sequence_frame_ = std::nullopt;
+        if (auto* const rm = viewer_->getRenderingManager())
+            rm->markDirty(DirtyFlag::SPLATS);
+        if (current_frame.has_value())
+            evictPlySequenceFrames(*current_frame);
+    }
+
+    void SequencerUIManager::evictPlySequenceFrames(const size_t keep_frame_index) {
+        const auto* const sequence = controller_.plySequence();
+        auto* const scene_manager = viewer_->getSceneManager();
+        if (!sequence || !scene_manager)
+            return;
+
+        auto& scene = scene_manager->getScene();
+        const size_t frame_count = sequence->frames.size();
+        const size_t budget = std::min(MAX_STREAM_RESIDENT_FRAMES, frame_count);
+        while (loaded_ply_sequence_frames_.size() > budget) {
+            auto victim_it = loaded_ply_sequence_frames_.end();
+            bool victim_outside_window = false;
+            size_t victim_distance = 0;
+
+            for (auto it = loaded_ply_sequence_frames_.begin(); it != loaded_ply_sequence_frames_.end(); ++it) {
+                const size_t candidate = *it;
+                if (candidate == keep_frame_index ||
+                    (last_ply_sequence_frame_.has_value() && candidate == *last_ply_sequence_frame_) ||
+                    candidate >= frame_count) {
+                    continue;
+                }
+
+                const bool outside_window = !isPlySequenceFrameInWindow(candidate, keep_frame_index, frame_count);
+                const size_t distance = plySequenceFrameDistance(candidate, keep_frame_index, frame_count);
+                if (victim_it == loaded_ply_sequence_frames_.end() ||
+                    (outside_window && !victim_outside_window) ||
+                    (outside_window == victim_outside_window && distance > victim_distance)) {
+                    victim_it = it;
+                    victim_outside_window = outside_window;
+                    victim_distance = distance;
+                }
+            }
+
+            if (victim_it == loaded_ply_sequence_frames_.end())
+                return;
+
+            const size_t victim = *victim_it;
+            loaded_ply_sequence_frames_.erase(victim_it);
+            if (victim >= frame_count)
+                continue;
+
+            const auto& victim_frame = sequence->frames[victim];
+            const auto resolved_node = resolvePlySequenceNode(
+                scene, victim_frame.node_uuid, victim_frame.node_name);
+            if (!resolved_node) {
+                LOG_ERROR("Cannot evict PLY sequence frame {}: {}", victim, resolved_node.error().message);
+                continue;
+            }
+            const auto* victim_node = scene.getNodeById(*resolved_node);
+            assert(victim_node);
+            auto old_model = scene.swapNodeModel(victim_node->name, nullptr);
+            old_model.reset();
+            scene.setNodeVisibility(*resolved_node, false);
+            std::lock_guard lock(ply_stream_mutex_);
+            if (victim < ply_stream_states_.size())
+                ply_stream_states_[victim] = PlyStreamFrameState::Empty;
+            ++ply_stream_eviction_count_;
+        }
+    }
+
+    float SequencerUIManager::advancePanelClock() {
         const auto now = std::chrono::steady_clock::now();
         float delta_time = std::chrono::duration<float>(now - last_panel_frame_time_).count();
         last_panel_frame_time_ = now;
@@ -333,24 +1118,159 @@ namespace lfs::vis::gui {
             delta_time = 0.0f;
         delta_time = std::min(delta_time, 0.1f);
         panel_elapsed_time_ += delta_time;
+        last_panel_delta_time_ = delta_time;
+        return delta_time;
+    }
 
-        controller_.update(delta_time);
+    float SequencerUIManager::advancePlaybackClock() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!last_playback_tick_time_.has_value()) {
+            last_playback_tick_time_ = now;
+            return 0.0f;
+        }
+
+        float delta_time = std::chrono::duration<float>(now - *last_playback_tick_time_).count();
+        last_playback_tick_time_ = now;
+        if (!std::isfinite(delta_time) || delta_time < 0.0f)
+            delta_time = 0.0f;
+        if (!controller_.hasPlySequence())
+            delta_time = std::min(delta_time, 0.1f);
+        return delta_time;
+    }
+
+    float SequencerUIManager::playbackDelta(const float delta_time) const {
+        return delta_time;
+    }
+
+    void SequencerUIManager::applyPlaybackCameraFollow() {
+        auto* const rm = viewer_->getRenderingManager();
+        if (!rm)
+            return;
 
         const bool is_playing = controller_.isPlaying() && controller_.timeline().realKeyframeCount() > 0;
+        rm->setOverlayAnimationActive(is_playing);
+        if (ui_state_.follow_playback && controller_.timeline().realKeyframeCount() > 0) {
+            const auto state = controller_.currentCameraState();
+            auto& vp = viewer_->getViewport();
+            vp.setViewMatrix(glm::mat3_cast(state.rotation), state.position);
+            rm->setFocalLength(state.focal_length_mm);
+            rm->markCameraPoseChanged();
+        }
+    }
 
-        if (auto* const rm = viewer_->getRenderingManager()) {
-            rm->setOverlayAnimationActive(is_playing);
-            // Follow whenever the toggle is on — playing, scrubbing, or paused.
-            // The user wants the main viewport to track the playhead at all times,
-            // not only during automatic playback.
-            if (ui_state_.follow_playback && controller_.timeline().realKeyframeCount() > 0) {
-                rm->markDirty(DirtyFlag::CAMERA);
-                const auto state = controller_.currentCameraState();
-                auto& vp = viewer_->getViewport();
-                vp.camera.R = glm::mat3_cast(state.rotation);
-                vp.camera.t = state.position;
-                rm->setFocalLength(state.focal_length_mm);
+    void SequencerUIManager::advancePlayback(const float delta_time) {
+        controller_.update(playbackDelta(delta_time));
+        applyPlaybackCameraFollow();
+        applyPlySequenceFrame();
+    }
+
+    void SequencerUIManager::tickPlaybackBeforeSceneRender() {
+        if (!controller_.isPlaying()) {
+            last_playback_tick_time_ = std::nullopt;
+            drainPlySequenceStream();
+            applyPlySequenceFrame();
+            return;
+        }
+
+        advancePanelClock();
+        advancePlayback(advancePlaybackClock());
+        playback_ticked_before_scene_ = true;
+    }
+
+    std::string SequencerUIManager::plyPlayerStatusJson() const {
+        const auto* const sequence = controller_.plySequence();
+        if (!sequence)
+            return {};
+        const auto current_frame = controller_.currentPlySequenceFrameIndex();
+
+        size_t resident = 0;
+        size_t queued = 0;
+        size_t failed = 0;
+        bool inflight = false;
+        double last_load_ms = 0.0;
+        size_t misses = 0;
+        size_t fallbacks = 0;
+        size_t evictions = 0;
+        size_t stale_drops = 0;
+        size_t cache_hits = 0;
+        size_t cache_misses = 0;
+        size_t cache_writes = 0;
+        size_t cache_write_failures = 0;
+        {
+            std::lock_guard lock(ply_stream_mutex_);
+            for (const auto state : ply_stream_states_) {
+                switch (state) {
+                case PlyStreamFrameState::Resident: ++resident; break;
+                case PlyStreamFrameState::Queued: ++queued; break;
+                case PlyStreamFrameState::Loading: break;
+                case PlyStreamFrameState::Failed: ++failed; break;
+                case PlyStreamFrameState::Empty: break;
+                }
             }
+            queued = std::max(queued, ply_stream_requests_.size());
+            inflight = ply_stream_inflight_;
+            failed = std::max(failed, ply_stream_failed_count_);
+            last_load_ms = ply_stream_last_load_ms_;
+            misses = ply_stream_miss_count_;
+            fallbacks = ply_stream_fallback_count_;
+            evictions = ply_stream_eviction_count_;
+            stale_drops = ply_stream_stale_request_drop_count_;
+            cache_hits = ply_stream_cache_hit_count_;
+            cache_misses = ply_stream_cache_miss_count_;
+            cache_writes = ply_stream_cache_write_count_;
+            cache_write_failures = ply_stream_cache_write_fail_count_;
+        }
+
+        return std::format(
+            "{{\"frame_count\":{},\"displayed_frame\":{},\"requested_frame\":{},\"on_target\":{},"
+            "\"resident\":{},\"slots\":{},\"max_slots\":{},\"decode_queue\":{},"
+            "\"inflight\":{},\"failed\":{},\"last_swap_ms\":{:.3f},"
+            "\"last_load_ms\":{:.3f},\"misses\":{},\"fallbacks\":{},"
+            "\"evictions\":{},\"stale_queue_drops\":{},\"cache_hits\":{},"
+            "\"cache_misses\":{},\"cache_writes\":{},\"cache_write_failures\":{},"
+            "\"streaming\":true}}",
+            sequence->frames.size(),
+            last_ply_sequence_frame_.has_value() ? static_cast<long long>(*last_ply_sequence_frame_) : -1ll,
+            current_frame.has_value() ? static_cast<long long>(*current_frame) : -1ll,
+            last_ply_sequence_frame_.has_value() && current_frame.has_value() &&
+                    *last_ply_sequence_frame_ == *current_frame
+                ? "true"
+                : "false",
+            resident,
+            resident,
+            std::min(MAX_STREAM_RESIDENT_FRAMES, sequence->frames.size()),
+            queued,
+            inflight ? 1 : 0,
+            failed,
+            0.0,
+            last_load_ms,
+            misses,
+            fallbacks,
+            evictions,
+            stale_drops,
+            cache_hits,
+            cache_misses,
+            cache_writes,
+            cache_write_failures);
+    }
+
+    void SequencerUIManager::renderSequencerPanel(const UIContext& /*ctx*/, const ViewportLayout& viewport,
+                                                  const float panel_x, const float panel_y,
+                                                  const float panel_width, const float panel_height,
+                                                  const PanelInputState& panel_input) {
+        (void)viewport;
+        const bool already_ticked = playback_ticked_before_scene_;
+        const float delta_time = already_ticked ? last_panel_delta_time_ : advancePanelClock();
+        playback_ticked_before_scene_ = false;
+        if (!already_ticked) {
+            if (controller_.isPlaying()) {
+                advancePlayback(advancePlaybackClock());
+            } else {
+                last_playback_tick_time_ = std::nullopt;
+                advancePlayback(delta_time);
+            }
+        } else if (!controller_.isPlaying()) {
+            last_playback_tick_time_ = std::nullopt;
         }
 
         panel_->setFilmStripAttached(ui_state_.show_film_strip);
@@ -402,11 +1322,16 @@ namespace lfs::vis::gui {
                     lfs::core::events::state::KeyframeListChanged{
                         .count = controller_.timeline().realKeyframeCount()}
                         .emit();
-                    pip_needs_update_ = true;
                 } else {
                     LOG_ERROR("Failed to load camera path from {}", path_utf8);
                 }
             }
+        }
+
+        if (panel_->consumeLoadSequenceRequest()) {
+            const auto path = gui::PickFolderDialog();
+            if (!path.empty())
+                loadPlySequenceFromDirectory(path);
         }
 
         if (panel_->consumeDockToggleRequest()) {
@@ -424,26 +1349,23 @@ namespace lfs::vis::gui {
         }
 
         if (panel_->consumeExportRequest() && controller_.timeline().realKeyframeCount() > 0) {
-            const auto info = lfs::io::video::getPresetInfo(ui_state_.preset);
-            const int w = ui_state_.preset == lfs::io::video::VideoPreset::CUSTOM
-                              ? ui_state_.custom_width
-                              : info.width;
-            const int h = ui_state_.preset == lfs::io::video::VideoPreset::CUSTOM
-                              ? ui_state_.custom_height
-                              : info.height;
             lfs::core::events::cmd::SequencerExportVideo{
-                .width = w,
-                .height = h,
+                .width = ui_state_.outputWidth(),
+                .height = ui_state_.outputHeight(),
                 .framerate = ui_state_.framerate,
                 .crf = ui_state_.quality}
                 .emit();
         }
 
         if (panel_->consumeClearRequest() &&
-            (controller_.timeline().realKeyframeCount() > 0 || controller_.timeline().hasAnimationClip())) {
+            (controller_.timeline().realKeyframeCount() > 0 || controller_.timeline().hasAnimationClip() ||
+             controller_.hasPlySequence())) {
+            stopPlySequenceStreaming();
             controller_.clear();
+            last_ply_sequence_frame_ = std::nullopt;
+            loaded_ply_sequence_frames_.clear();
             lfs::core::events::state::KeyframeListChanged{.count = 0}.emit();
-            LOG_INFO("All keyframes cleared");
+            LOG_INFO("Sequencer cleared");
         }
 
         auto ctx_req = panel_->consumeTransportContextMenu();
@@ -517,19 +1439,33 @@ namespace lfs::vis::gui {
                                    if (action.starts_with("preset_")) {
                                        using lfs::io::video::VideoPreset;
                                        const int idx = std::stoi(std::string(action.substr(7)));
-                                       ui_state_.preset = static_cast<VideoPreset>(idx);
-                                       const auto info = lfs::io::video::getPresetInfo(ui_state_.preset);
-                                       ui_state_.custom_width = info.width;
-                                       ui_state_.custom_height = info.height;
-                                       ui_state_.framerate = info.framerate;
+                                       const auto next = static_cast<VideoPreset>(idx);
+                                       if (next == VideoPreset::CUSTOM) {
+                                           ui_state_.custom_width = ui_state_.outputWidth();
+                                           ui_state_.custom_height = ui_state_.outputHeight();
+                                           if (ui_state_.preset != VideoPreset::CUSTOM)
+                                               ui_state_.framerate =
+                                                   lfs::io::video::getPresetInfo(ui_state_.preset).framerate;
+                                           ui_state_.preset = next;
+                                       } else {
+                                           ui_state_.preset = next;
+                                           const auto info = lfs::io::video::getPresetInfo(next);
+                                           ui_state_.custom_width = info.width;
+                                           ui_state_.custom_height = info.height;
+                                           ui_state_.framerate = info.framerate;
+                                       }
                                    }
                                    break;
                                case Target::CLEAR:
                                    if (action == "clear_confirm" &&
-                                       (controller_.timeline().realKeyframeCount() > 0 || controller_.timeline().hasAnimationClip())) {
+                                       (controller_.timeline().realKeyframeCount() > 0 || controller_.timeline().hasAnimationClip() ||
+                                        controller_.hasPlySequence())) {
+                                       stopPlySequenceStreaming();
                                        controller_.clear();
+                                       last_ply_sequence_frame_ = std::nullopt;
+                                       loaded_ply_sequence_frames_.clear();
                                        lfs::core::events::state::KeyframeListChanged{.count = 0}.emit();
-                                       LOG_INFO("All keyframes cleared");
+                                       LOG_INFO("Sequencer cleared");
                                    }
                                    break;
                                case Target::NONE:
@@ -538,6 +1474,8 @@ namespace lfs::vis::gui {
                            });
             }
         }
+
+        applyPlySequenceFrame();
     }
 
     void SequencerUIManager::renderCameraPath(const ViewportLayout& viewport) {
@@ -709,7 +1647,7 @@ namespace lfs::vis::gui {
                    projected->y <= static_cast<float>(panel.render_size.y) + margin_y;
         };
 
-        const auto toColor = [](const ImVec4& c, const float alpha) -> glm::vec4 {
+        const auto toColor = [](const ThemeColor& c, const float alpha) -> glm::vec4 {
             return {c.x, c.y, c.z, alpha};
         };
 
@@ -1080,7 +2018,6 @@ namespace lfs::vis::gui {
                     new_pos,
                     new_rot,
                     kf->focal_length_mm)) {
-                pip_needs_update_ = true;
                 rendering_manager->markDirty(DirtyFlag::OVERLAY);
             }
         }
@@ -1093,6 +2030,197 @@ namespace lfs::vis::gui {
         }
 
         draw_list.PopClipRect();
+    }
+
+    void SequencerUIManager::loadPlySequenceFromDirectory(const std::filesystem::path& directory) {
+        auto* const scene_manager = viewer_->getSceneManager();
+        if (!scene_manager)
+            return;
+
+        std::error_code ec;
+        if (!std::filesystem::is_directory(directory, ec)) {
+            LOG_ERROR("PLY sequence path is not a directory: {}", lfs::core::path_to_utf8(directory));
+            return;
+        }
+        last_ply_sequence_frame_ = std::nullopt;
+        loaded_ply_sequence_frames_.clear();
+
+        std::vector<std::filesystem::path> paths;
+        const std::filesystem::directory_iterator entries(directory, ec);
+        if (ec) {
+            LOG_ERROR("Failed to read PLY sequence directory {}: {}",
+                      lfs::core::path_to_utf8(directory),
+                      ec.message());
+            return;
+        }
+        for (const auto& entry : entries) {
+            if (ec) {
+                LOG_ERROR("Failed to read PLY sequence directory {}: {}",
+                          lfs::core::path_to_utf8(directory),
+                          ec.message());
+                return;
+            }
+            if (!entry.is_regular_file(ec))
+                continue;
+            auto ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext == ".ply")
+                paths.push_back(entry.path());
+        }
+
+        std::sort(paths.begin(), paths.end());
+        if (paths.empty()) {
+            LOG_WARN("No PLY files found in sequence directory: {}", lfs::core::path_to_utf8(directory));
+            return;
+        }
+
+        // A PLY sequence replaces the scene. Each file gets a real scene-graph
+        // child immediately; the heavy SplatData is streamed into those nodes.
+        if (scene_manager->getContentType() != SceneManager::ContentType::Empty) {
+            if (!scene_manager->clear())
+                return;
+        }
+
+        const std::string sequence_prefix = lfs::core::path_to_utf8(directory.filename().empty()
+                                                                        ? directory.parent_path().filename()
+                                                                        : directory.filename());
+        const std::string sequence_name = sequence_prefix.empty() ? "PLY Sequence" : sequence_prefix;
+        const std::string sequence_node = scene_manager->addPlySequenceNode(sequence_name, "", paths.size());
+        if (sequence_node.empty()) {
+            LOG_ERROR("Failed to create PLY sequence node for {}",
+                      lfs::core::path_to_utf8(directory));
+            return;
+        }
+
+        std::vector<std::filesystem::path> loaded_paths;
+        std::vector<std::string> node_names;
+        std::vector<core::Uuid> node_uuids;
+        loaded_paths.reserve(paths.size());
+        node_names.reserve(paths.size());
+        node_uuids.reserve(paths.size());
+        auto splat_allocator = scene_manager->makeExternalSplatAllocator();
+        auto& scene = scene_manager->getScene();
+        scene.setCombinedModelAllocator(splat_allocator);
+        const auto* sequence_scene_node = scene.getNode(sequence_node);
+        if (!sequence_scene_node) {
+            LOG_ERROR("Failed to resolve PLY sequence node '{}'", sequence_node);
+            return;
+        }
+        const core::NodeId sequence_id = sequence_scene_node->id;
+        const core::Uuid sequence_uuid = sequence_scene_node->uuid;
+
+        for (size_t i = 0; i < paths.size(); ++i) {
+            const std::string stem = lfs::core::path_to_utf8(paths[i].stem());
+            const std::string base_name = std::format("{}_{:04}_{}", sequence_node, i, stem);
+            std::string node_name = base_name;
+            for (int suffix = 1; scene.getNode(node_name); ++suffix)
+                node_name = std::format("{}_{}", base_name, suffix);
+
+            const core::NodeId frame_id = scene.addSplatPlaceholder(node_name, sequence_id);
+            if (frame_id == core::NULL_NODE) {
+                LOG_ERROR("Failed to create PLY sequence frame placeholder '{}'", node_name);
+                if (!scene_manager->clear())
+                    LOG_WARN("Failed to clear partial PLY sequence after placeholder failure");
+                return;
+            }
+            const auto* frame_node = scene.getNodeById(frame_id);
+            assert(frame_node);
+            scene.setNodeVisibility(frame_id, false);
+            scene_manager->setPlyPath(frame_node->uuid, paths[i]);
+            loaded_paths.push_back(paths[i]);
+            node_names.push_back(node_name);
+            node_uuids.push_back(frame_node->uuid);
+            LOG_DEBUG("Added PLY sequence placeholder '{}'", node_name);
+        }
+
+        ui_state_.sequence_fps = std::clamp(ui_state_.sequence_fps, MIN_SEQUENCE_FPS, MAX_SEQUENCE_FPS);
+        controller_.setPlySequence(directory,
+                                   sequence_node,
+                                   std::move(loaded_paths),
+                                   std::move(node_names),
+                                   ui_state_.sequence_fps,
+                                   sequence_uuid,
+                                   std::move(node_uuids));
+        ui_state_.sequence_fps = controller_.plySequenceFps();
+        last_ply_sequence_frame_ = std::nullopt;
+        startPlySequenceStreaming(paths, std::move(splat_allocator));
+        applyPlySequenceFrame();
+
+        if (const auto* sequence = controller_.plySequence()) {
+            const auto resolved_node = resolvePlySequenceNode(scene, sequence->node_uuid, sequence->node_name);
+            if (!resolved_node) {
+                LOG_ERROR("Cannot select PLY sequence container: {}", resolved_node.error().message);
+                return;
+            }
+            scene_manager->selectNode(*resolved_node);
+            LOG_INFO("Registered PLY sequence '{}' with {} frames at {} fps",
+                     lfs::core::path_to_utf8(directory),
+                     sequence->frames.size(),
+                     sequence->fps);
+        }
+
+        lfs::core::events::state::KeyframeListChanged{
+            .count = controller_.timeline().realKeyframeCount()}
+            .emit();
+    }
+
+    void SequencerUIManager::applyPlySequenceFrame() {
+        drainPlySequenceStream();
+        auto* const scene_manager = viewer_->getSceneManager();
+        const auto* const sequence = controller_.plySequence();
+        const auto frame_index = controller_.currentPlySequenceFrameIndex();
+        if (!scene_manager || !sequence || !frame_index.has_value()) {
+            last_ply_sequence_frame_ = std::nullopt;
+            return;
+        }
+        if (*frame_index >= sequence->frames.size())
+            return;
+
+        const size_t requested_frame = *frame_index;
+        requestPlySequenceWindow(requested_frame);
+        const auto display_frame = selectPlySequenceDisplayFrame(requested_frame);
+        if (!display_frame.has_value()) {
+            std::lock_guard lock(ply_stream_mutex_);
+            ++ply_stream_miss_count_;
+            return;
+        }
+        if (*display_frame != requested_frame) {
+            std::lock_guard lock(ply_stream_mutex_);
+            ++ply_stream_miss_count_;
+            ++ply_stream_fallback_count_;
+        }
+        if (last_ply_sequence_frame_ == display_frame)
+            return;
+
+        auto& scene = scene_manager->getScene();
+        const auto set_frame_visibility = [&](const size_t index, const bool visible) {
+            const auto& frame = sequence->frames[index];
+            const auto resolved_node = resolvePlySequenceNode(scene, frame.node_uuid, frame.node_name);
+            if (!resolved_node) {
+                LOG_ERROR("Cannot resolve PLY sequence frame {}: {}", index, resolved_node.error().message);
+                return false;
+            }
+            scene.setNodeVisibility(*resolved_node, visible);
+            return true;
+        };
+        if (last_ply_sequence_frame_.has_value() &&
+            *last_ply_sequence_frame_ < sequence->frames.size()) {
+            (void)set_frame_visibility(*last_ply_sequence_frame_, false);
+        } else {
+            for (const size_t loaded_frame : loaded_ply_sequence_frames_) {
+                if (loaded_frame == *display_frame || loaded_frame >= sequence->frames.size())
+                    continue;
+                (void)set_frame_visibility(loaded_frame, false);
+            }
+        }
+
+        if (!set_frame_visibility(*display_frame, true)) {
+            return;
+        }
+        last_ply_sequence_frame_ = display_frame;
+        if (auto* const rm = viewer_->getRenderingManager())
+            rm->markDirty(DirtyFlag::SPLATS);
     }
 
     void SequencerUIManager::handleOverlayActions() {
@@ -1114,7 +2242,6 @@ namespace lfs::vis::gui {
                 controller_.addKeyframeAtTime(kf, time);
                 controller_.seek(time);
                 state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
-                pip_needs_update_ = true;
             } break;
             case Action::UPDATE_KEYFRAME:
                 viewport_edit_mode_ = SequencerViewportEditMode::None;
@@ -1184,7 +2311,6 @@ namespace lfs::vis::gui {
                             view_state.rotation,
                             view_state.focal_length_mm)) {
                         state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
-                        pip_needs_update_ = true;
                     }
                     if (const auto* const keyframe =
                             controller_.timeline().getKeyframeById(
@@ -1207,16 +2333,44 @@ namespace lfs::vis::gui {
         if (auto time_result = overlay_->consumeTimeEdit()) {
             if (controller_.setKeyframeTime(time_result->index, time_result->value)) {
                 state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
-                pip_needs_update_ = true;
             }
         }
 
         if (auto focal_result = overlay_->consumeFocalEdit()) {
             if (controller_.setKeyframeFocalLength(focal_result->index, focal_result->value)) {
                 state::KeyframeListChanged{.count = controller_.timeline().realKeyframeCount()}.emit();
-                pip_needs_update_ = true;
             }
         }
+    }
+
+    SequencerUIManager::PipPreviewKey SequencerUIManager::currentPipPreviewKey() const {
+        const auto preview = pipPreviewSize(ui_state_.outputWidth(), ui_state_.outputHeight());
+        const auto selected = controller_.selectedKeyframe();
+        const bool follow_playhead = !controller_.isStopped() || !selected.has_value();
+
+        PipPreviewKey key;
+        key.equirectangular = ui_state_.equirectangular;
+        key.width = preview.width;
+        key.height = preview.height;
+
+        if (follow_playhead) {
+            const auto state = controller_.currentCameraState();
+            key.timeline_revision = controller_.timelineRevision();
+            key.playhead = controller_.playhead();
+            key.position = state.position;
+            key.rotation = state.rotation;
+            key.focal_length_mm = state.focal_length_mm;
+            return key;
+        }
+
+        const auto* const kf = controller_.timeline().getKeyframe(*selected);
+        if (kf) {
+            key.selected_id = kf->id;
+            key.position = kf->position;
+            key.rotation = kf->rotation;
+            key.focal_length_mm = kf->focal_length_mm;
+        }
+        return key;
     }
 
     void SequencerUIManager::initPipPreview() {
@@ -1227,74 +2381,36 @@ namespace lfs::vis::gui {
         if (!ui_state_.show_pip_preview)
             return;
 
-        const bool is_playing = !controller_.isStopped();
-        const auto selected = controller_.selectedKeyframe();
-
-        const auto now = std::chrono::steady_clock::now();
-        if (is_playing) {
-            const float elapsed = std::chrono::duration<float>(now - pip_last_render_time_).count();
-            if (elapsed < 1.0f / PREVIEW_TARGET_FPS)
-                return;
-        }
-
         auto* const rm = ctx.viewer->getRenderingManager();
         auto* const sm = ctx.viewer->getSceneManager();
         if (!rm || !sm)
             return;
 
+        const auto key = currentPipPreviewKey();
+        if (!pip_needs_update_ && pip_last_key_ == key)
+            return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!key.selected_id.has_value() && !pip_needs_update_) {
+            const float elapsed = std::chrono::duration<float>(now - pip_last_render_time_).count();
+            if (elapsed < 1.0f / PREVIEW_TARGET_FPS)
+                return;
+        }
+
         if (!pip_initialized_)
             initPipPreview();
 
-        glm::mat3 cam_rot;
-        glm::vec3 cam_pos;
-        float cam_focal_length_mm;
-        auto& vp = ctx.viewer->getViewport();
-
-        if (is_playing) {
-            const auto state = controller_.currentCameraState();
-            cam_rot = glm::mat3_cast(state.rotation);
-            cam_pos = state.position;
-            cam_focal_length_mm = state.focal_length_mm;
-        } else {
-            if (selected.has_value()) {
-                if (pip_last_keyframe_ == selected && !pip_needs_update_)
-                    return;
-
-                const auto& timeline = controller_.timeline();
-                if (*selected >= timeline.size())
-                    return;
-
-                const auto* const kf = timeline.getKeyframe(*selected);
-                if (!kf)
-                    return;
-
-                cam_rot = glm::mat3_cast(kf->rotation);
-                cam_pos = kf->position;
-                cam_focal_length_mm = kf->focal_length_mm;
-            } else {
-                if (pip_last_keyframe_.has_value()) {
-                    pip_needs_update_ = true;
-                    pip_last_keyframe_ = std::nullopt;
-                }
-                if (!pip_needs_update_)
-                    return;
-
-                cam_rot = vp.camera.R;
-                cam_pos = vp.camera.t;
-                cam_focal_length_mm = rm ? rm->getFocalLengthMm()
-                                         : lfs::rendering::DEFAULT_FOCAL_LENGTH_MM;
-            }
-        }
-
-        const auto image = rm->renderPreviewImage(sm, cam_rot, cam_pos, cam_focal_length_mm,
-                                                  PREVIEW_WIDTH, PREVIEW_HEIGHT);
-        // Rasterizer output uses OpenGL (bottom-left) origin; RmlUi samples top-left, so flip on upload.
-        if (image && pip_texture_.upload(*image, PREVIEW_WIDTH, PREVIEW_HEIGHT, /*flip_y=*/true)) {
+        const glm::mat3 cam_rot = glm::mat3_cast(key.rotation);
+        const auto image = rm->renderPreviewImage(sm, cam_rot, key.position, key.focal_length_mm,
+                                                  key.width, key.height);
+        // Vulkan preview readback is already in the orientation RmlUi samples.
+        // upload() recreates the VkImage when width/height change.
+        if (image && pip_texture_.upload(*image, key.width, key.height, /*flip_y=*/false)) {
+            pip_render_width_ = key.width;
+            pip_render_height_ = key.height;
             pip_last_render_time_ = now;
-            if (!is_playing) {
-                pip_last_keyframe_ = selected;
-                pip_needs_update_ = false;
-            }
+            pip_last_key_ = key;
+            pip_needs_update_ = false;
         }
     }
 
@@ -1331,12 +2447,19 @@ namespace lfs::vis::gui {
         const float scale = ui_state_.pip_preview_scale;
         constexpr float MARGIN = 16.0f;
         constexpr float TITLE_HEIGHT = 18.0f;
-        const float scaled_width = static_cast<float>(PREVIEW_WIDTH) * scale;
-        const float scaled_height = static_cast<float>(PREVIEW_HEIGHT) * scale;
+        const auto preview = pipPreviewSize(ui_state_.outputWidth(), ui_state_.outputHeight());
+        const float scaled_width = static_cast<float>(preview.width) * scale;
+        const float scaled_height = static_cast<float>(preview.height) * scale;
         const float total_height = scaled_height + TITLE_HEIGHT + 8.0f;
 
-        const float left = viewport.pos.x + MARGIN;
-        const float top = panel_->cachedPanelY() - total_height - MARGIN;
+        float left = viewport.pos.x + MARGIN;
+        float top = panel_->cachedPanelY() - total_height - MARGIN;
+        const float min_top = viewport.pos.y + MARGIN;
+        if (top < min_top)
+            top = min_top;
+        const float max_left = viewport.pos.x + viewport.size.x - scaled_width - 8.0f - MARGIN;
+        if (left > max_left)
+            left = std::max(viewport.pos.x + MARGIN, max_left);
 
         const float playhead = controller_.playhead();
         const std::string title = (is_playing || !selected.has_value())
@@ -1350,7 +2473,7 @@ namespace lfs::vis::gui {
 
         overlay_->showPreviewWindow(left, top, scaled_width, scaled_height,
                                     title, is_playing,
-                                    pip_texture_.rmlSrcUrl(PREVIEW_WIDTH, PREVIEW_HEIGHT));
+                                    pip_texture_.rmlSrcUrl(pip_render_width_, pip_render_height_));
     }
 
     void SequencerUIManager::renderKeyframeEditOverlay(const ViewportLayout& viewport) {

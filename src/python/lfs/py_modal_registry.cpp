@@ -29,6 +29,7 @@ namespace lfs::python {
         modal.is_open = true;
         modal.needs_open = true;
         modals_.push_back(std::move(modal));
+        request_redraw();
     }
 
     void PyModalRegistry::show_confirm(const std::string& title, const std::string& message,
@@ -45,6 +46,7 @@ namespace lfs::python {
         modal.is_open = true;
         modal.needs_open = true;
         modals_.push_back(std::move(modal));
+        request_redraw();
     }
 
     void PyModalRegistry::show_input(const std::string& title, const std::string& message,
@@ -61,6 +63,23 @@ namespace lfs::python {
         modal.is_open = true;
         modal.needs_open = true;
         modals_.push_back(std::move(modal));
+        request_redraw();
+    }
+
+    void PyModalRegistry::show_message(const std::string& title, const std::string& message,
+                                       MessageStyle style) {
+        std::lock_guard lock(mutex_);
+        PyModalDialog modal;
+        modal.id = "modal_" + std::to_string(next_id_++);
+        modal.title = title;
+        modal.message = message;
+        modal.buttons = {"OK"};
+        modal.type = ModalDialogType::Message;
+        modal.style = style;
+        modal.is_open = true;
+        modal.needs_open = true;
+        modals_.push_back(std::move(modal));
+        request_redraw();
     }
 
     void PyModalRegistry::show_message(const std::string& title, const std::string& message,
@@ -77,6 +96,7 @@ namespace lfs::python {
         modal.is_open = true;
         modal.needs_open = true;
         modals_.push_back(std::move(modal));
+        request_redraw();
     }
 
     bool PyModalRegistry::has_open_modals() const {

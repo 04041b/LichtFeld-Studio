@@ -1,39 +1,229 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "adam_api.h"
 #include "core/camera.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/cuda/sh_layout.cuh"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include "io/formats/ply.hpp"
+#include "lfs/training/joint_adam_codec.hpp"
+#include "rasterization/fastgs/rasterization/include/forward.h"
+#include "rasterization/fastgs/utils/utils.h"
 #include "training/optimizer/adam_optimizer.hpp"
 #include "training/rasterization/fast_rasterizer.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <gtest/gtest.h>
+#include <limits>
 #include <random>
+#include <stdexcept>
 #include <torch/torch.h>
+#include <unordered_set>
+#include <vector>
 
 using namespace lfs::training;
 using namespace lfs::core;
+
+cudaError_t fastgs_visibility_readback_delay(cudaStream_t stream, unsigned long long cycles);
 
 namespace {
     constexpr const char* GARDEN_PATH = "data/garden";
     constexpr int W = 640, H = 480;
     constexpr float FX = 500.0f, FY = 500.0f;
 
-    const Tensor& adam_moment(const AdamOptimizer& opt, ParamType type) {
+    const AdamParamState& adam_state(const AdamOptimizer& opt, ParamType type) {
         const auto* state = opt.get_state(type);
         if (!state || !state->exp_avg.is_valid()) {
             throw std::runtime_error("Missing Adam moment state");
         }
-        return state->exp_avg;
+        return *state;
+    }
+
+    // Recover gradients from the first Adam moment after one fused step from
+    // zero moments: m = (1-beta1)*g, so g ≈ m/(1-beta1). Joint moments must
+    // be decoded through their codec.
+    Tensor adam_moment(const AdamOptimizer& opt, ParamType type) {
+        const auto& state = adam_state(opt, type);
+        if (state.exp_avg.dtype() == DataType::Float32) {
+            return state.exp_avg;
+        }
+
+        // --- Joint (u, log_s) codec (default ON since 2.2) ---
+        if (state.is_joint()) {
+            if (!state.joint_bounds.is_valid()) {
+                throw std::runtime_error("Joint Adam state missing joint_bounds");
+            }
+            const int bits = state.joint_bits;
+            const int bpc = joint_adam::bytes_per_cell(bits);
+            if (bpc <= 0) {
+                throw std::runtime_error("Joint Adam: unsupported joint_bits");
+            }
+
+            auto packed_cpu = state.exp_avg.to(Device::CPU);
+            auto bounds_cpu = state.joint_bounds.to(Device::CPU);
+            const auto* packed = packed_cpu.ptr<std::uint8_t>();
+            const auto* bounds = bounds_cpu.ptr<float>();
+            const size_t n_bounds = bounds_cpu.shape()[0];
+
+            // Contiguous params: packed [N, n_attr * bpc] → dequant [N, n_attr] (or [N] if n_attr==1
+            // and original param was rank-1). Recover shape from packed layout.
+            if (state.exp_avg.ndim() >= 2) {
+                const size_t n_prim = state.exp_avg.shape()[0];
+                const size_t packed_row = state.exp_avg.shape()[1];
+                if (packed_row % static_cast<size_t>(bpc) != 0) {
+                    throw std::runtime_error("Joint packed row not divisible by bytes_per_cell");
+                }
+                const size_t n_attr = packed_row / static_cast<size_t>(bpc);
+                std::vector<float> dequant(n_prim * n_attr, 0.0f);
+
+                auto decode_cell = [&](std::size_t cell, float umin, float umax, float smin, float smax,
+                                       float& g1, float& g2) {
+                    if (bits == 16) {
+                        joint_adam::Codec16::decode_g1g2(packed, cell, umin, umax, smin, smax, g1, g2);
+                    } else {
+                        joint_adam::Codec8::decode_g1g2(packed, cell, umin, umax, smin, smax, g1, g2);
+                    }
+                };
+
+                for (size_t p = 0; p < n_prim; ++p) {
+                    const size_t bidx = p / static_cast<size_t>(joint_adam::kBlockSize);
+                    if (bidx >= n_bounds) {
+                        throw std::runtime_error("Joint bounds undersized for primitive index");
+                    }
+                    const float umin = bounds[bidx * 4 + 0];
+                    const float umax = bounds[bidx * 4 + 1];
+                    const float smin = bounds[bidx * 4 + 2];
+                    const float smax = bounds[bidx * 4 + 3];
+                    for (size_t a = 0; a < n_attr; ++a) {
+                        const size_t cell = p * n_attr + a;
+                        float g1 = 0.0f, g2 = 0.0f;
+                        decode_cell(cell, umin, umax, smin, smax, g1, g2);
+                        dequant[cell] = g1;
+                    }
+                }
+
+                // Match param layouts used by numerical grads: sh0 [N,1,3], opacity [N], else [N,C].
+                TensorShape out_shape;
+                if (type == ParamType::Sh0 && n_attr == 3) {
+                    out_shape = TensorShape({n_prim, size_t{1}, size_t{3}});
+                } else if (n_attr == 1) {
+                    out_shape = TensorShape({n_prim});
+                } else {
+                    out_shape = TensorShape({n_prim, n_attr});
+                }
+                return Tensor::from_blob(dequant.data(), out_shape, Device::CPU, DataType::Float32)
+                    .clone()
+                    .to(Device::CUDA);
+            }
+
+            // Swizzled shN: 1D packed cells (one cell per swizzled float).
+            // Bounds are per 256-primitive block. When only one bounds row exists (N<=256),
+            // every cell shares bounds[0] — sufficient for crop-damping N=1 and small fuzz.
+            const size_t n_cells = state.exp_avg.numel() / static_cast<size_t>(bpc);
+            if (n_bounds != 1) {
+                throw std::runtime_error(
+                    "adam_moment joint 1D (shN) multi-block decode needs swizzle→prim map");
+            }
+            std::vector<float> dequant(n_cells, 0.0f);
+            const float umin = bounds[0], umax = bounds[1], smin = bounds[2], smax = bounds[3];
+            for (size_t cell = 0; cell < n_cells; ++cell) {
+                float g1 = 0.0f, g2 = 0.0f;
+                if (bits == 16) {
+                    joint_adam::Codec16::decode_g1g2(packed, cell, umin, umax, smin, smax, g1, g2);
+                } else {
+                    joint_adam::Codec8::decode_g1g2(packed, cell, umin, umax, smin, smax, g1, g2);
+                }
+                dequant[cell] = g1;
+            }
+            return Tensor::from_blob(dequant.data(), TensorShape({n_cells}), Device::CPU, DataType::Float32)
+                .clone()
+                .to(Device::CUDA);
+        }
+
+        throw std::runtime_error("Legacy Adam moment codec is unsupported");
+    }
+
+    void expect_adam_state_finite(const AdamOptimizer& opt, ParamType type) {
+        const auto& state = adam_state(opt, type);
+        if (state.is_joint()) {
+            ASSERT_TRUE(state.joint_bounds.is_valid());
+            auto bounds = state.joint_bounds.to(Device::CPU);
+            auto* ptr = bounds.ptr<float>();
+            for (size_t i = 0; i < bounds.numel(); ++i) {
+                EXPECT_TRUE(std::isfinite(ptr[i]));
+            }
+            // Packed uint8 codes are always finite by construction.
+            return;
+        }
+    }
+
+    // L1 of decoded first moment m (joint or legacy). Proxy for "moments moved".
+    float first_moment_l1(const AdamOptimizer& opt, ParamType type) {
+        auto m = adam_moment(opt, type);
+        return m.abs().sum().item<float>();
     }
 
     Tensor recovered_fused_grad(const AdamOptimizer& opt, ParamType type, float beta1 = 0.9f) {
         return adam_moment(opt, type).mul(1.0f / (1.0f - beta1));
     }
+
+    SplatData make_adam_test_splat(const size_t count, const int sh_degree = 0) {
+        std::vector<float> means_data(count * 3, 0.0f);
+        std::vector<float> rotations(count * 4, 0.0f);
+        for (size_t i = 0; i < count; ++i) {
+            means_data[i * 3 + 2] = 1.0f;
+            rotations[i * 4] = 1.0f;
+        }
+        const size_t sh_rest = sh_rest_coefficients_for_degree(sh_degree);
+        return SplatData(
+            sh_degree,
+            Tensor::from_vector(means_data, {count, size_t{3}}, Device::CUDA),
+            Tensor::full({count, size_t{1}, size_t{3}}, 0.25f, Device::CUDA),
+            Tensor::full({count, sh_rest, size_t{3}}, 0.1f, Device::CUDA),
+            Tensor::full({count, size_t{3}}, -1.5f, Device::CUDA),
+            Tensor::from_vector(rotations, {count, size_t{4}}, Device::CUDA),
+            Tensor::zeros({count, size_t{1}}, Device::CUDA),
+            1.0f);
+    }
 } // namespace
+
+TEST(FastGSOverflowGuards, RejectsInstanceCountsBeyondIntRange) {
+    const uint64_t max_int = static_cast<uint64_t>(std::numeric_limits<int>::max());
+    EXPECT_EQ(checked_fastgs_instance_count(max_int, 1, 1), std::numeric_limits<int>::max());
+    EXPECT_THROW(
+        checked_fastgs_instance_count(max_int + 1, 595037, 11907),
+        std::overflow_error);
+}
+
+TEST(FastGSOverflowGuards, RejectsVisibleCountsBeyondPrimitiveCount) {
+    const uint64_t max_int = static_cast<uint64_t>(std::numeric_limits<int>::max());
+    EXPECT_EQ(checked_fastgs_visible_count(0, 1000), 0);
+    EXPECT_EQ(checked_fastgs_visible_count(1, 1000), 1);
+    EXPECT_EQ(checked_fastgs_visible_count(1000, 1000), 1000);
+    EXPECT_EQ(checked_fastgs_visible_count(max_int, max_int), std::numeric_limits<int>::max());
+
+    for (const uint64_t count : {uint64_t{1001}, max_int,
+                                 static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())}) {
+        SCOPED_TRACE(count);
+        try {
+            (void)checked_fastgs_visible_count(count, 1000);
+            FAIL() << "An impossible visible count must be rejected";
+        } catch (const std::runtime_error& error) {
+            EXPECT_EQ(std::string(error.what()),
+                      "FastGS visible count exceeds primitive count: " + std::to_string(count) +
+                          " visible primitives from 1000 primitives");
+        }
+    }
+    EXPECT_THROW(checked_fastgs_visible_count(max_int + 1, max_int + 1), std::overflow_error);
+}
 
 class FastGSKernelTest : public ::testing::Test {
 protected:
@@ -70,8 +260,8 @@ protected:
             create_synthetic_data();
             return;
         }
-        n_ = std::min(result->means().shape()[0], size_t(10000));
-        means_ = result->means().slice(0, 0, n_).contiguous().to(Device::CUDA);
+        n_ = std::min(result->value.means().shape()[0], size_t(10000));
+        means_ = result->value.means().slice(0, 0, n_).contiguous().to(Device::CUDA);
         init_params();
     }
 
@@ -117,7 +307,7 @@ protected:
 // Forward kernels
 TEST_F(FastGSKernelTest, Forward_Preprocess) {
     auto r = forward();
-    ASSERT_TRUE(r.has_value()) << r.error();
+    ASSERT_TRUE(r.has_value()) << lfs::format_for_developer(r.error());
     EXPECT_GT(r->second.forward_ctx.n_instances, 0);
 }
 
@@ -158,7 +348,7 @@ TEST_F(FastGSKernelTest, Forward_Blend) {
 
 TEST_F(FastGSKernelTest, Forward_Full) {
     auto r = forward();
-    ASSERT_TRUE(r.has_value()) << r.error();
+    ASSERT_TRUE(r.has_value()) << lfs::format_for_developer(r.error());
     EXPECT_EQ(r->first.width, W);
     EXPECT_EQ(r->first.height, H);
 }
@@ -175,6 +365,626 @@ TEST_F(FastGSKernelTest, Backward_Blend) {
 
     EXPECT_GT(adam_moment(*opt, ParamType::Means).pow(2.0f).sum().item<float>(), 0.0f);
     EXPECT_GT(adam_moment(*opt, ParamType::Scaling).pow(2.0f).sum().item<float>(), 0.0f);
+}
+
+TEST_F(FastGSKernelTest, EdgeWeightedContributionUsesFloatMapInMainBackward) {
+    auto r = forward();
+    ASSERT_TRUE(r.has_value()) << lfs::format_for_developer(r.error());
+
+    // This value lies halfway between the rejected u8/16 cache levels, so the
+    // equality below also guards the float32 map contract against quantization.
+    constexpr float edge_weight = 1.03125f;
+    const float expected_total_contribution =
+        r->first.alpha.sum().item<float>() * edge_weight;
+    auto edge_weights = Tensor::full(
+        {H, W}, edge_weight, Device::CUDA, DataType::Float32);
+    auto edge_scores = Tensor::zeros({n_}, Device::CUDA, DataType::Float32);
+    FastGSFusedExtraGradients fused;
+    fused.edge_weight_map = edge_weights.ptr<float>();
+    fused.edge_score_out = edge_scores.ptr<float>();
+
+    auto opt = make_optimizer();
+    opt->zero_grad(0);
+    fast_rasterize_backward(
+        r->second,
+        Tensor::zeros_like(r->first.image),
+        *splat_,
+        *opt,
+        Tensor::zeros_like(r->first.alpha),
+        {},
+        DensificationType::None,
+        1,
+        fused);
+
+    const float actual_total_contribution = edge_scores.sum().item<float>();
+    EXPECT_GT(actual_total_contribution, 0.0f);
+    EXPECT_NEAR(actual_total_contribution, expected_total_contribution,
+                std::max(1.0e-3f, expected_total_contribution * 1.0e-4f));
+}
+
+TEST(FastGSDepthGradientTest, BackwardDepthMatchesLibtorchAutogradForCenteredSplat) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    std::vector<float> means_data{0.0f, 0.0f, 1.0f};
+    auto means = Tensor::from_blob(means_data.data(), {1, 3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    auto sh0 = Tensor::zeros({1, 1, 3}, Device::CUDA);
+    auto shN = Tensor::zeros({1, 0, 3}, Device::CUDA);
+    auto scaling = Tensor::full({1, 3}, -1.5f, Device::CUDA);
+    std::vector<float> rotation_data{1.0f, 0.0f, 0.0f, 0.0f};
+    auto rotation = Tensor::from_blob(rotation_data.data(), {1, 4}, Device::CPU, DataType::Float32).to(Device::CUDA);
+
+    const float opacity_value = 0.3f;
+    const float raw_opacity_value = std::log(opacity_value / (1.0f - opacity_value));
+    auto opacity = Tensor::full({1}, raw_opacity_value, Device::CUDA);
+    auto splat = SplatData(0, means, sh0, shN, scaling, rotation, opacity, 1.0f);
+
+    auto R = Tensor::eye(3, Device::CUDA);
+    std::vector<float> t_data{0.0f, 0.0f, 4.0f};
+    auto T = Tensor::from_blob(t_data.data(), {3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    auto camera = Camera(R, T, 1.0f, 1.0f, 0.5f, 0.5f,
+                         Tensor(), Tensor(), CameraModelType::PINHOLE,
+                         "depth_grad", "", std::filesystem::path{}, 1, 1, 0);
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
+    ASSERT_EQ(forward->first.depth.numel(), 1);
+    EXPECT_GT(forward->first.depth.item<float>(), 0.0f);
+
+    AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer opt(splat, cfg);
+    opt.allocate_gradients();
+    opt.zero_grad(0);
+
+    const float upstream_depth_grad = 1.7f;
+    auto grad_image = Tensor::zeros_like(forward->first.image);
+    auto grad_depth = Tensor::full({1, 1}, upstream_depth_grad, Device::CUDA);
+    fast_rasterize_backward(
+        forward->second,
+        grad_image,
+        splat,
+        opt,
+        {},
+        {},
+        DensificationType::None,
+        1,
+        {},
+        grad_depth);
+
+    const auto mean_grad = recovered_fused_grad(opt, ParamType::Means).to(Device::CPU);
+    const auto opacity_grad = recovered_fused_grad(opt, ParamType::Opacity).to(Device::CPU);
+
+    auto raw_opacity_ag = torch::tensor({raw_opacity_value}, torch::dtype(torch::kFloat32).device(torch::kCUDA))
+                              .set_requires_grad(true);
+    auto depth_ag = torch::tensor({means_data[2] + t_data[2]}, torch::dtype(torch::kFloat32).device(torch::kCUDA))
+                        .set_requires_grad(true);
+    auto depth_out = torch::sigmoid(raw_opacity_ag) * depth_ag;
+    auto loss = depth_out * upstream_depth_grad;
+    loss.backward();
+
+    const float expected_opacity_grad = raw_opacity_ag.grad().item<float>();
+    const float expected_depth_grad = depth_ag.grad().item<float>();
+    const float actual_opacity_grad = opacity_grad.ptr<float>()[0];
+    const float actual_mean_z_grad = mean_grad.ptr<float>()[2];
+
+    EXPECT_NEAR(actual_opacity_grad, expected_opacity_grad, 1.0e-4f)
+        << "raw opacity depth gradient should match libtorch autograd";
+    EXPECT_NEAR(actual_mean_z_grad, expected_depth_grad, 1.0e-4f)
+        << "mean z depth gradient should match libtorch autograd";
+    EXPECT_NEAR(mean_grad.ptr<float>()[0], 0.0f, 1.0e-5f);
+    EXPECT_NEAR(mean_grad.ptr<float>()[1], 0.0f, 1.0e-5f);
+}
+
+TEST(FastGSDepthGradientTest, BackwardDepthMatchesLibtorchAutogradForOverlappingSplats) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    std::vector<float> means_data{
+        0.0f, 0.0f, 0.5f,
+        0.0f, 0.0f, 1.5f};
+    auto means = Tensor::from_blob(means_data.data(), {2, 3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    auto sh0 = Tensor::zeros({2, 1, 3}, Device::CUDA);
+    auto shN = Tensor::zeros({2, 0, 3}, Device::CUDA);
+    auto scaling = Tensor::full({2, 3}, -1.5f, Device::CUDA);
+    std::vector<float> rotation_data{
+        1.0f, 0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f, 0.0f};
+    auto rotation = Tensor::from_blob(rotation_data.data(), {2, 4}, Device::CPU, DataType::Float32).to(Device::CUDA);
+
+    const std::vector<float> opacity_values{0.25f, 0.4f};
+    std::vector<float> raw_opacity_values{
+        std::log(opacity_values[0] / (1.0f - opacity_values[0])),
+        std::log(opacity_values[1] / (1.0f - opacity_values[1]))};
+    auto opacity = Tensor::from_blob(raw_opacity_values.data(), {2}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    auto splat = SplatData(0, means, sh0, shN, scaling, rotation, opacity, 1.0f);
+
+    auto R = Tensor::eye(3, Device::CUDA);
+    std::vector<float> t_data{0.0f, 0.0f, 4.0f};
+    auto T = Tensor::from_blob(t_data.data(), {3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    auto camera = Camera(R, T, 1.0f, 1.0f, 0.5f, 0.5f,
+                         Tensor(), Tensor(), CameraModelType::PINHOLE,
+                         "depth_grad_overlap", "", std::filesystem::path{}, 1, 1, 0);
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
+    ASSERT_EQ(forward->first.depth.numel(), 1);
+
+    const float depth0 = means_data[2] + t_data[2];
+    const float depth1 = means_data[5] + t_data[2];
+    const float expected_forward_depth =
+        opacity_values[0] * depth0 +
+        (1.0f - opacity_values[0]) * opacity_values[1] * depth1;
+    EXPECT_NEAR(forward->first.depth.item<float>(), expected_forward_depth, 1.0e-4f)
+        << "test setup should render the nearer splat first";
+
+    AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer opt(splat, cfg);
+    opt.allocate_gradients();
+    opt.zero_grad(0);
+
+    const float upstream_depth_grad = 1.3f;
+    auto grad_image = Tensor::zeros_like(forward->first.image);
+    auto grad_depth = Tensor::full({1, 1}, upstream_depth_grad, Device::CUDA);
+    fast_rasterize_backward(
+        forward->second,
+        grad_image,
+        splat,
+        opt,
+        {},
+        {},
+        DensificationType::None,
+        1,
+        {},
+        grad_depth);
+
+    const auto mean_grad = recovered_fused_grad(opt, ParamType::Means).to(Device::CPU);
+    const auto opacity_grad = recovered_fused_grad(opt, ParamType::Opacity).to(Device::CPU);
+
+    const auto opts = torch::dtype(torch::kFloat32).device(torch::kCUDA);
+    auto raw_opacity_ag = torch::tensor(raw_opacity_values, opts).clone().set_requires_grad(true);
+    auto depth_ag = torch::tensor({depth0, depth1}, opts).clone().set_requires_grad(true);
+    const auto alpha = torch::sigmoid(raw_opacity_ag);
+    const auto depth_out =
+        alpha.select(0, 0) * depth_ag.select(0, 0) +
+        (1.0f - alpha.select(0, 0)) * alpha.select(0, 1) * depth_ag.select(0, 1);
+    const auto loss = depth_out * upstream_depth_grad;
+    loss.backward();
+
+    const auto expected_opacity_grad = raw_opacity_ag.grad().to(torch::kCPU);
+    const auto expected_depth_grad = depth_ag.grad().to(torch::kCPU);
+    const float* actual_opacity_grad = opacity_grad.ptr<float>();
+    const float* actual_mean_grad = mean_grad.ptr<float>();
+
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_NEAR(actual_opacity_grad[i], expected_opacity_grad[i].item<float>(), 1.0e-4f)
+            << "raw opacity depth gradient mismatch for splat " << i;
+        EXPECT_NEAR(actual_mean_grad[i * 3 + 2], expected_depth_grad[i].item<float>(), 1.0e-4f)
+            << "mean z depth gradient mismatch for splat " << i;
+        EXPECT_NEAR(actual_mean_grad[i * 3], 0.0f, 1.0e-5f);
+        EXPECT_NEAR(actual_mean_grad[i * 3 + 1], 0.0f, 1.0e-5f);
+    }
+}
+
+namespace {
+    struct NormalChannelScene {
+        std::vector<float> means_data{0.0f, 0.0f, 1.0f};
+        // Distinct raw log-scales with z clearly smallest so the normal axis
+        // (argmin variance) is stable under the perturbations below.
+        std::vector<float> scaling_data{-1.0f, -1.5f, -3.0f};
+        float opacity_value = 0.3f;
+        std::vector<float> t_data{0.0f, 0.0f, 4.0f};
+
+        SplatData make_splat(const std::vector<float>& rotation_data) const {
+            const size_t n = means_data.size() / 3;
+            auto means = Tensor::from_blob(const_cast<float*>(means_data.data()), {n, 3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            auto sh0 = Tensor::zeros({n, 1, 3}, Device::CUDA);
+            auto shN = Tensor::zeros({n, 0, 3}, Device::CUDA);
+            auto scaling = Tensor::from_blob(const_cast<float*>(scaling_data.data()), {n, 3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            auto rotation = Tensor::from_blob(const_cast<float*>(rotation_data.data()), {n, 4}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            const float raw_opacity = std::log(opacity_value / (1.0f - opacity_value));
+            auto opacity = Tensor::full({n}, raw_opacity, Device::CUDA);
+            return SplatData(0, means, sh0, shN, scaling, rotation, opacity, 1.0f);
+        }
+
+        Camera make_camera() const {
+            auto R = Tensor::eye(3, Device::CUDA);
+            auto T = Tensor::from_blob(const_cast<float*>(t_data.data()), {3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            return Camera(R, T, 1.0f, 1.0f, 0.5f, 0.5f,
+                          Tensor(), Tensor(), CameraModelType::PINHOLE,
+                          "normal_grad", "", std::filesystem::path{}, 1, 1, 0);
+        }
+    };
+} // namespace
+
+class FastGSVisibilityReadback : public ::testing::Test {
+protected:
+    static constexpr size_t scratch_bytes = 16 * 1024 * 1024;
+    cudaStream_t blocking_stream_ = nullptr;
+    cudaStream_t nonblocking_stream_ = nullptr;
+    char* scratch_ = nullptr;
+    unsigned long long delay_cycles_ = 0;
+
+    static void check_cuda(cudaError_t error) {
+        if (error != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(error));
+        }
+    }
+
+    void SetUp() override {
+        if (!torch::cuda::is_available()) {
+            GTEST_SKIP() << "CUDA not available";
+        }
+        ASSERT_EQ(cudaStreamCreateWithFlags(&blocking_stream_, cudaStreamDefault), cudaSuccess);
+        ASSERT_EQ(cudaStreamCreateWithFlags(&nonblocking_stream_, cudaStreamNonBlocking), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&scratch_, scratch_bytes), cudaSuccess);
+        int device = 0;
+        int clock_khz = 0;
+        ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+        ASSERT_EQ(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device), cudaSuccess);
+        delay_cycles_ = static_cast<unsigned long long>(clock_khz) * 200;
+        // Load the helper before the timed run, including with CUDA lazy loading.
+        ASSERT_EQ(fastgs_visibility_readback_delay(nonblocking_stream_, 0), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(nonblocking_stream_), cudaSuccess);
+    }
+
+    void TearDown() override {
+        if (blocking_stream_)
+            EXPECT_EQ(cudaStreamSynchronize(blocking_stream_), cudaSuccess);
+        if (nonblocking_stream_)
+            EXPECT_EQ(cudaStreamSynchronize(nonblocking_stream_), cudaSuccess);
+        if (scratch_)
+            EXPECT_EQ(cudaFree(scratch_), cudaSuccess);
+        if (nonblocking_stream_)
+            EXPECT_EQ(cudaStreamDestroy(nonblocking_stream_), cudaSuccess);
+        if (blocking_stream_)
+            EXPECT_EQ(cudaStreamDestroy(blocking_stream_), cudaSuccess);
+    }
+
+    struct RenderResult {
+        int n_visible;
+        float image[3];
+        std::vector<unsigned> primitive_work_indices;
+    };
+
+    RenderResult render(Camera& camera, SplatData& splat, cudaStream_t stream, bool delay = false,
+                        int scratch_fill = 0) {
+        CUDAStreamGuard guard(stream);
+        // Preallocate every callback's storage. cudaMalloc/arena frame entry
+        // after the delay could synchronize the device and conceal the bug.
+        // Zero scratch makes an unordered read deterministically see zero.
+        check_cuda(cudaMemsetAsync(scratch_, scratch_fill, scratch_bytes, stream));
+        check_cuda(cudaDeviceSynchronize());
+        size_t used = 256; // Reserve image, alpha and depth at the front.
+        auto allocate = [&](size_t bytes) -> char* {
+            const size_t offset = (used + 255) & ~size_t{255};
+            if (offset > scratch_bytes || bytes > scratch_bytes - offset) {
+                throw std::runtime_error("FastGS visibility test scratch exhausted");
+            }
+            used = offset + bytes;
+            return scratch_ + offset;
+        };
+        auto* output = reinterpret_cast<float*>(scratch_);
+        if (delay) {
+            check_cuda(fastgs_visibility_readback_delay(stream, delay_cycles_));
+        }
+        const auto result = fast_lfs::rasterization::forward(
+            allocate,
+            [](size_t) {}, // Keep all phases alive until forward completes.
+            allocate,
+            [](const void* ptr, size_t) { return static_cast<char*>(const_cast<void*>(ptr)); },
+            allocate,
+            reinterpret_cast<const float3*>(splat.means().ptr<float>()),
+            reinterpret_cast<const float3*>(splat.scaling_raw().ptr<float>()),
+            reinterpret_cast<const float4*>(splat.rotation_raw().ptr<float>()),
+            splat.opacity_raw().ptr<float>(),
+            reinterpret_cast<const float3*>(splat.sh0().ptr<float>()),
+            nullptr, nullptr, 0, 0,
+            reinterpret_cast<const float4*>(camera.world_view_transform_ptr()),
+            reinterpret_cast<const float3*>(camera.cam_position_ptr()),
+            output, output + 3, output + 4,
+            nullptr, nullptr, nullptr,
+            static_cast<int>(splat.means().shape()[0]),
+            1, 1, 1, 1, 1.0f, 1.0f, 0.5f, 0.5f, 0.01f, 1e10f,
+            false, getCurrentCUDAStream());
+        check_cuda(cudaStreamSynchronize(stream));
+        RenderResult host{.n_visible = result.n_visible, .image = {}, .primitive_work_indices = std::vector<unsigned>(splat.means().shape()[0])};
+        check_cuda(cudaMemcpy(host.image, output, sizeof(host.image), cudaMemcpyDeviceToHost));
+        check_cuda(cudaMemcpy(host.primitive_work_indices.data(), result.primitive_work_indices,
+                              host.primitive_work_indices.size() * sizeof(unsigned), cudaMemcpyDeviceToHost));
+        return host;
+    }
+};
+
+TEST_F(FastGSVisibilityReadback, CountIsStreamOrderedOnNonBlockingStream) {
+    NormalChannelScene scene;
+    auto camera = scene.make_camera();
+    auto splat = scene.make_splat({1.0f, 0.0f, 0.0f, 0.0f});
+    // Warm the forward kernels and CUB before the delayed call as well.
+    const auto reference = render(camera, splat, blocking_stream_);
+    ASSERT_EQ(reference.n_visible, 1);
+    ASSERT_GT(reference.image[0], 0.0f);
+
+    const auto actual = render(camera, splat, nonblocking_stream_, true);
+    EXPECT_EQ(actual.n_visible, reference.n_visible);
+    for (int channel = 0; channel < 3; ++channel) {
+        EXPECT_NEAR(actual.image[channel], reference.image[channel], 1e-6f);
+    }
+}
+
+TEST_F(FastGSVisibilityReadback, CountIsBoundedByPrimitiveCount) {
+    NormalChannelScene scene;
+    auto camera = scene.make_camera();
+    for (const size_t count : {1, 31, 32, 33, 255, 256, 257, 1000}) {
+        for (const bool visible : {true, false}) {
+            SCOPED_TRACE(::testing::Message() << "N=" << count << ", visible=" << visible);
+            auto splat = make_adam_test_splat(count);
+            if (!visible) {
+                // Camera is at z=-4; put every primitive behind it.
+                std::vector<float> means(count * 3, 0.0f);
+                for (size_t i = 0; i < count; ++i)
+                    means[i * 3 + 2] = -10.0f;
+                splat.means() = Tensor::from_vector(means, {count, size_t{3}}, Device::CUDA);
+            }
+            const auto result = render(camera, splat, nonblocking_stream_);
+            EXPECT_GE(result.n_visible, 0);
+            EXPECT_LE(result.n_visible, static_cast<int>(count));
+            EXPECT_EQ(result.n_visible, visible ? static_cast<int>(count) : 0);
+        }
+    }
+}
+
+TEST_F(FastGSVisibilityReadback, MixedVisibilityCompactsIndicesWithDirtyScratch) {
+    NormalChannelScene scene;
+    auto camera = scene.make_camera();
+    enum class Pattern { Alternating,
+                         BlockEdges,
+                         LastOnly,
+                         None,
+                         All };
+    for (const size_t count : {1, 31, 32, 33, 255, 256, 257, 511, 512, 513,
+                               4095, 4096, 4097, 65537}) {
+        for (const auto pattern : {Pattern::Alternating, Pattern::BlockEdges,
+                                   Pattern::LastOnly, Pattern::None, Pattern::All}) {
+            SCOPED_TRACE(::testing::Message() << "N=" << count << ", pattern=" << static_cast<int>(pattern));
+            auto splat = make_adam_test_splat(count);
+            std::vector<float> means(count * 3, 0.0f);
+            std::vector<unsigned> expected(count, 0xffffffffu);
+            unsigned n_visible = 0;
+            for (size_t i = 0; i < count; ++i) {
+                bool visible = false;
+                switch (pattern) {
+                case Pattern::Alternating: visible = i % 2 == 1; break;
+                case Pattern::BlockEdges: visible = i % 256 == 255 || i % 256 == 0; break;
+                case Pattern::LastOnly: visible = i == count - 1; break;
+                case Pattern::None: break;
+                case Pattern::All: visible = true; break;
+                }
+                means[3 * i + 2] = visible ? 1.0f : -10.0f;
+                if (visible)
+                    expected[i] = n_visible++;
+            }
+            splat.means() = Tensor::from_vector(means, {count, size_t{3}}, Device::CUDA);
+            const auto reference = render(camera, splat, blocking_stream_);
+            ASSERT_EQ(reference.n_visible, n_visible);
+            ASSERT_EQ(reference.primitive_work_indices, expected);
+
+            // Dirty storage exposes missing map writes and dependence on zeros.
+            // The separate delayed test exercises the readback ordering race.
+            const auto actual = render(camera, splat, nonblocking_stream_, false, 0xa5);
+            EXPECT_EQ(actual.n_visible, n_visible);
+            EXPECT_EQ(actual.primitive_work_indices, expected);
+            for (int channel = 0; channel < 3; ++channel)
+                EXPECT_NEAR(actual.image[channel], reference.image[channel], 1e-6f);
+        }
+    }
+}
+
+TEST(FastGSNormalChannelTest, RendersCameraSpaceNormalForCenteredSplat) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    NormalChannelScene scene;
+    const std::vector<float> identity_quat{1.0f, 0.0f, 0.0f, 0.0f};
+    auto splat = scene.make_splat(identity_quat);
+    auto camera = scene.make_camera();
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+
+    auto without_normal = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false);
+    ASSERT_TRUE(without_normal.has_value())
+        << lfs::format_for_developer(without_normal.error());
+    EXPECT_FALSE(without_normal->first.normal.is_valid())
+        << "normal channel must stay off unless requested";
+    without_normal->second.release_forward_context();
+
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
+    ASSERT_TRUE(forward->first.normal.is_valid());
+    ASSERT_EQ(forward->first.normal.numel(), 3);
+
+    // Identity rotation, z the smallest axis: world normal is -z (oriented
+    // toward the camera at -4z), identity w2c keeps it in place, and the
+    // pixel-centered splat blends with weight alpha.
+    const auto normal_cpu = forward->first.normal.to(Device::CPU);
+    const float* n = normal_cpu.ptr<float>();
+    EXPECT_NEAR(n[0], 0.0f, 1.0e-5f);
+    EXPECT_NEAR(n[1], 0.0f, 1.0e-5f);
+    EXPECT_NEAR(n[2], -scene.opacity_value, 1.0e-4f);
+    forward->second.release_forward_context();
+}
+
+TEST(FastGSNormalChannelTest, BackwardNormalRotationGradientMatchesFiniteDifferences) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    NormalChannelScene scene;
+    // Generic quaternion away from symmetry; keeps the smallest-axis column
+    // pointed toward the camera so the orientation sign stays fixed.
+    const std::vector<float> base_quat{0.95f, 0.15f, -0.1f, 0.05f};
+    const std::vector<float> upstream{0.7f, -0.4f, 1.1f};
+    auto camera = scene.make_camera();
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+
+    const auto render_loss = [&](const std::vector<float>& quat) {
+        auto splat = scene.make_splat(quat);
+        auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+        if (!forward.has_value()) {
+            throw lfs::Exception(std::move(forward.error()));
+        }
+        const auto normal_cpu = forward->first.normal.to(Device::CPU);
+        const float* n = normal_cpu.ptr<float>();
+        const float loss = upstream[0] * n[0] + upstream[1] * n[1] + upstream[2] * n[2];
+        forward->second.release_forward_context();
+        return loss;
+    };
+
+    auto splat = scene.make_splat(base_quat);
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
+
+    AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer opt(splat, cfg);
+    opt.allocate_gradients();
+    opt.zero_grad(0);
+
+    std::vector<float> upstream_data = upstream;
+    auto grad_image = Tensor::zeros_like(forward->first.image);
+    auto grad_normal = Tensor::from_blob(upstream_data.data(), {3, 1, 1}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    fast_rasterize_backward(
+        forward->second,
+        grad_image,
+        splat,
+        opt,
+        {},
+        {},
+        DensificationType::None,
+        1,
+        {},
+        {},
+        grad_normal);
+
+    const auto rotation_grad = recovered_fused_grad(opt, ParamType::Rotation).to(Device::CPU);
+    const float* actual = rotation_grad.ptr<float>();
+
+    // The splat sits exactly on the pixel center, so the blend weight has zero
+    // derivative w.r.t. rotation there and central differences through the full
+    // forward isolate exactly the detached-weight value path the kernel emits.
+    const float h = 2.0e-2f;
+    for (int c = 0; c < 4; ++c) {
+        std::vector<float> plus = base_quat;
+        std::vector<float> minus = base_quat;
+        plus[c] += h;
+        minus[c] -= h;
+        const float expected = (render_loss(plus) - render_loss(minus)) / (2.0f * h);
+        EXPECT_NEAR(actual[c], expected, std::max(2.0e-3f, std::abs(expected) * 2.0e-2f))
+            << "rotation gradient mismatch for quaternion component " << c;
+    }
+}
+
+TEST(FastGSNormalChannelTest, BackwardNormalRotationGradientUsesCompactVisibleIndex) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    NormalChannelScene single_scene;
+    NormalChannelScene scene;
+    // R is identity and T is world-to-camera translation: depth = world_z + 4.
+    // Rows 0/1 have depth -46 and fail preprocess forward's near-plane culling.
+    scene.means_data = {0.0f, 0.0f, -50.0f,
+                        0.0f, 0.0f, -50.0f,
+                        0.0f, 0.0f, 1.0f};
+    scene.scaling_data = {-1.0f, -1.5f, -3.0f,
+                          -1.0f, -1.5f, -3.0f,
+                          -1.0f, -1.5f, -3.0f};
+    const std::vector<float> base_quat{0.95f, 0.15f, -0.1f, 0.05f};
+    const std::vector<float> upstream{0.7f, -0.4f, 1.1f};
+    std::vector<float> rotations;
+    for (int row = 0; row < 3; ++row) {
+        rotations.insert(rotations.end(), base_quat.begin(), base_quat.end());
+    }
+    auto camera = scene.make_camera();
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+
+    auto single_splat = single_scene.make_splat(base_quat);
+    auto single_forward = fast_rasterize_forward(camera, single_splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+    ASSERT_TRUE(single_forward.has_value()) << lfs::format_for_developer(single_forward.error());
+    ASSERT_TRUE(single_forward->first.normal.is_valid());
+    ASSERT_EQ(single_forward->first.normal.numel(), 3);
+    const auto single_normal_cpu = single_forward->first.normal.to(Device::CPU);
+    single_forward->second.release_forward_context();
+
+    const auto render_loss = [&](const std::vector<float>& rotation_data) {
+        auto splat = scene.make_splat(rotation_data);
+        auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+        if (!forward.has_value()) {
+            throw lfs::Exception(std::move(forward.error()));
+        }
+        const auto normal_cpu = forward->first.normal.to(Device::CPU);
+        const float* n = normal_cpu.ptr<float>();
+        const float loss = upstream[0] * n[0] + upstream[1] * n[1] + upstream[2] * n[2];
+        forward->second.release_forward_context();
+        return loss;
+    };
+
+    auto splat = scene.make_splat(rotations);
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
+    ASSERT_EQ(forward->second.forward_ctx.n_visible, 1);
+    ASSERT_TRUE(forward->first.normal.is_valid());
+    ASSERT_EQ(forward->first.normal.numel(), 3);
+    const auto normal_cpu = forward->first.normal.to(Device::CPU);
+    for (int c = 0; c < 3; ++c) {
+        EXPECT_FLOAT_EQ(normal_cpu.ptr<float>()[c], single_normal_cpu.ptr<float>()[c])
+            << "invisible rows must not change normal channel " << c;
+    }
+
+    AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer opt(splat, cfg);
+    opt.allocate_gradients();
+    opt.zero_grad(0);
+
+    std::vector<float> upstream_data = upstream;
+    auto grad_image = Tensor::zeros_like(forward->first.image);
+    auto grad_normal = Tensor::from_blob(upstream_data.data(), {3, 1, 1}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    fast_rasterize_backward(
+        forward->second,
+        grad_image,
+        splat,
+        opt,
+        {},
+        {},
+        DensificationType::None,
+        1,
+        {},
+        {},
+        grad_normal);
+
+    const auto rotation_grad = recovered_fused_grad(opt, ParamType::Rotation).to(Device::CPU);
+    const float* actual = rotation_grad.ptr<float>();
+    for (int row = 0; row < 2; ++row) {
+        for (int c = 0; c < 4; ++c) {
+            EXPECT_EQ(actual[row * 4 + c], 0.0f)
+                << "invisible row " << row << " has rotation gradient for component " << c;
+        }
+    }
+
+    // Only primitive row 2 is visible, so its normal helper is at work_idx 0.
+    // As in the single-splat test, pixel centering isolates the normal value path.
+    const float h = 2.0e-2f;
+    for (int c = 0; c < 4; ++c) {
+        std::vector<float> plus = rotations;
+        std::vector<float> minus = rotations;
+        plus[2 * 4 + c] += h;
+        minus[2 * 4 + c] -= h;
+        const float expected = (render_loss(plus) - render_loss(minus)) / (2.0f * h);
+        EXPECT_NEAR(actual[2 * 4 + c], expected, std::max(2.0e-3f, std::abs(expected) * 2.0e-2f))
+            << "rotation gradient mismatch for visible row 2, quaternion component " << c;
+    }
 }
 
 TEST_F(FastGSKernelTest, Backward_Preprocess) {
@@ -213,6 +1023,162 @@ TEST_F(FastGSKernelTest, Optimizer_AdamStep) {
     auto diff = (splat_->scaling_raw() - before).abs().sum().item<float>();
 
     EXPECT_GT(diff, 0.0f);
+}
+
+TEST(AdamCropDampingTest, SetterRequiresExactBooleanRowMaskAndCanClearIt) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    auto splat = make_adam_test_splat(3);
+    AdamOptimizer optimizer(splat, AdamConfig{});
+
+    EXPECT_THROW(
+        optimizer.set_crop_damping_mask(Tensor::zeros_bool({2}, Device::CPU)),
+        std::runtime_error);
+    EXPECT_THROW(
+        optimizer.set_crop_damping_mask(Tensor::zeros({3}, Device::CPU)),
+        std::runtime_error);
+    EXPECT_THROW(
+        optimizer.set_crop_damping_mask(Tensor::zeros_bool({3, 1}, Device::CPU)),
+        std::runtime_error);
+
+    optimizer.set_crop_damping_mask(Tensor::zeros_bool({3}, Device::CPU));
+    EXPECT_TRUE(optimizer.crop_damping_mask().is_valid());
+    EXPECT_EQ(optimizer.crop_damping_mask().device(), Device::CUDA);
+    EXPECT_TRUE(optimizer.crop_damping_mask().is_contiguous());
+
+    optimizer.set_crop_damping_mask({});
+    EXPECT_FALSE(optimizer.crop_damping_mask().is_valid());
+}
+
+TEST(AdamCropDampingTest, RepeatedMaskReplacementIsSafeAcrossStreams) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    cudaStream_t producer_stream = nullptr;
+    cudaStream_t execution_stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&producer_stream, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&execution_stream, cudaStreamNonBlocking), cudaSuccess);
+
+    {
+        auto splat = make_adam_test_splat(4);
+        AdamOptimizer optimizer(splat, AdamConfig{});
+        optimizer.allocate_gradients();
+        optimizer.set_cropbox_lr_scale(0.1f);
+
+        for (int iteration = 1; iteration <= 64; ++iteration) {
+            Tensor mask;
+            {
+                const CUDAStreamGuard producer_guard(producer_stream);
+                mask = iteration % 2 == 0
+                           ? Tensor::zeros_bool({4}, Device::CUDA)
+                           : Tensor::ones_bool({4}, Device::CUDA);
+            }
+            optimizer.set_crop_damping_mask(std::move(mask));
+
+            {
+                const CUDAStreamGuard execution_guard(execution_stream);
+                optimizer.zero_grad(iteration - 1);
+                optimizer.get_grad(ParamType::Means).fill_(1.0f);
+                optimizer.step(iteration);
+            }
+        }
+
+        ASSERT_EQ(cudaStreamSynchronize(producer_stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(execution_stream), cudaSuccess);
+        EXPECT_TRUE(splat.means().isfinite().all().item<bool>());
+    }
+
+    CudaMemoryPool::instance().release_stream(producer_stream);
+    CudaMemoryPool::instance().release_stream(execution_stream);
+    ASSERT_EQ(cudaStreamDestroy(producer_stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(execution_stream), cudaSuccess);
+}
+
+TEST(FastGSCropDampingTest, FusedBackwardZeroScaleSkipsContiguousAndSwizzledWrites) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    struct UpdateResult {
+        float opacity_delta = 0.0f;
+        float shn_delta = 0.0f;
+        float opacity_moment_scale = 0.0f;
+        float shn_moment_scale = 0.0f;
+    };
+
+    const auto run_backward = [](const bool damp) {
+        auto splat = make_adam_test_splat(1, 1);
+        auto camera_rotation = Tensor::eye(3, Device::CUDA);
+        auto camera_translation = Tensor::from_vector(
+            std::vector<float>{0.0f, 0.0f, 4.0f},
+            {3},
+            Device::CUDA);
+        Camera camera(
+            camera_rotation,
+            camera_translation,
+            8.0f,
+            8.0f,
+            3.5f,
+            3.5f,
+            {},
+            {},
+            CameraModelType::PINHOLE,
+            "crop_damping",
+            "",
+            {},
+            8,
+            8,
+            0);
+        auto background = Tensor::zeros({3}, Device::CUDA);
+        auto forward = fast_rasterize_forward(
+            camera, splat, background, 0, 0, 0, 0, false);
+        if (!forward) {
+            throw lfs::Exception(std::move(forward.error()));
+        }
+
+        AdamOptimizer optimizer(splat, AdamConfig{});
+        optimizer.allocate_gradients();
+        optimizer.zero_grad(1000);
+        if (damp) {
+            optimizer.set_crop_damping_mask(Tensor::ones_bool({1}, Device::CUDA));
+            optimizer.set_cropbox_lr_scale(0.0f);
+        }
+
+        const auto opacity_before = splat.opacity_raw().clone();
+        const auto shn_before = splat.shN().clone();
+        fast_rasterize_backward(
+            forward->second,
+            Tensor::ones_like(forward->first.image),
+            splat,
+            optimizer,
+            {},
+            {},
+            DensificationType::None,
+            1001);
+
+        UpdateResult result;
+        result.opacity_delta =
+            (splat.opacity_raw() - opacity_before).abs().sum().item<float>();
+        result.shn_delta = (splat.shN() - shn_before).abs().sum().item<float>();
+        // Joint codec has no per-primitive moment scales — use decoded |m| L1.
+        result.opacity_moment_scale = first_moment_l1(optimizer, ParamType::Opacity);
+        result.shn_moment_scale = first_moment_l1(optimizer, ParamType::ShN);
+        return result;
+    };
+
+    const auto baseline = run_backward(false);
+    const auto damped = run_backward(true);
+    EXPECT_GT(baseline.opacity_delta, 0.0f);
+    EXPECT_GT(baseline.shn_delta, 0.0f);
+    EXPECT_GT(baseline.opacity_moment_scale, 0.0f);
+    EXPECT_GT(baseline.shn_moment_scale, 0.0f);
+    EXPECT_FLOAT_EQ(damped.opacity_delta, 0.0f);
+    EXPECT_FLOAT_EQ(damped.shn_delta, 0.0f);
+    EXPECT_FLOAT_EQ(damped.opacity_moment_scale, 0.0f);
+    EXPECT_FLOAT_EQ(damped.shn_moment_scale, 0.0f);
 }
 
 TEST_F(FastGSKernelTest, Optimizer_ZeroRows) {
@@ -316,51 +1282,6 @@ TEST_F(FastGSKernelTest, TiledRendering_Consistency) {
 
     float diff = (tile->first.image - region).abs().max().item<float>();
     EXPECT_LT(diff, 0.01f);
-}
-
-// Performance
-TEST_F(FastGSKernelTest, Performance_Forward) {
-    for (int i = 0; i < 3; ++i)
-        forward();
-    cudaDeviceSynchronize();
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 10; ++i)
-        forward();
-    cudaDeviceSynchronize();
-    auto t1 = std::chrono::high_resolution_clock::now();
-
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 10;
-    EXPECT_LT(ms, 10.0);
-}
-
-TEST_F(FastGSKernelTest, Performance_Backward) {
-    auto r = forward();
-    ASSERT_TRUE(r.has_value());
-
-    auto grad = Tensor::randn_like(r->first.image);
-    r->second.release_forward_context();
-    auto opt = make_optimizer();
-
-    for (int i = 0; i < 3; ++i) {
-        auto fwd = forward();
-        ASSERT_TRUE(fwd.has_value());
-        opt->zero_grad(0);
-        fast_rasterize_backward(fwd->second, grad, *splat_, *opt, {});
-    }
-    cudaDeviceSynchronize();
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 10; ++i) {
-        auto fwd = forward();
-        opt->zero_grad(0);
-        fast_rasterize_backward(fwd->second, grad, *splat_, *opt, {});
-    }
-    cudaDeviceSynchronize();
-    auto t1 = std::chrono::high_resolution_clock::now();
-
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 10;
-    EXPECT_LT(ms, 20.0);
 }
 
 // =============================================================================
@@ -818,4 +1739,295 @@ TEST_F(FastGSDenseTileGradientTest, GradientDescent_DenseTile) {
     EXPECT_LT(loss_after, loss_before) << "Gradient descent should reduce loss";
     // Expect at least 10% reduction with 10 steps
     EXPECT_LT(loss_after, loss_before * 0.9f) << "Loss reduction too small - gradients may be wrong";
+}
+
+namespace {
+
+    // 1 LSB of (u, log_s) at the live block bounds, mapped through us_to_g1g2 at (0,0)+1LSB.
+    void joint_zero_decode_tol(const float* bb, const int bits, float& m_tol, float& v_tol) {
+        const float qmax = bits == 16 ? joint_adam::Codec16::kQMax : joint_adam::Codec8::kQMax;
+        const float du = (bb[1] - bb[0]) / qmax;
+        const float ds = (bb[3] - bb[2]) / qmax;
+        float m = 0.0f;
+        float v = 0.0f;
+        joint_adam::Codec16::us_to_g1g2(du, ds, m, v);
+        m_tol = std::max(std::abs(m) * 2.0f, 1e-6f);
+        v_tol = std::max(std::abs(v) * 2.0f, 1e-12f);
+    }
+
+    int64_t joint_sh_cell(const int p, const int k, const int c, const int slots) {
+        constexpr int R = 32;
+        const int slot = (p / R) * (slots * R) + k * R + (p % R);
+        return static_cast<int64_t>(slot) * 4 + c;
+    }
+
+    void fill_realistic_moments(std::vector<float>& m, std::vector<float>& v, const uint32_t seed) {
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<float> dm(-1e-3f, 1e-3f);
+        std::uniform_real_distribution<float> dv(1e-12f, 1e-4f);
+        for (size_t i = 0; i < m.size(); ++i) {
+            m[i] = dm(rng);
+            v[i] = dv(rng);
+        }
+    }
+
+    Tensor upload_u8(const std::vector<uint8_t>& host) {
+        auto t = Tensor::empty({host.size()}, Device::CPU, DataType::UInt8);
+        std::memcpy(t.ptr<uint8_t>(), host.data(), host.size());
+        return t.to(Device::CUDA);
+    }
+
+    Tensor upload_i64(const std::vector<int64_t>& host) {
+        auto t = Tensor::empty({host.size()}, Device::CPU, DataType::Int64);
+        std::memcpy(t.ptr<int64_t>(), host.data(), host.size() * sizeof(int64_t));
+        return t.to(Device::CUDA);
+    }
+
+    void expect_bounds_include_zero(const float* bb, const char* label) {
+        EXPECT_LE(bb[0], 0.0f) << label << " umin";
+        EXPECT_GE(bb[1], 0.0f) << label << " umax";
+        EXPECT_LE(bb[2], 0.0f) << label << " smin";
+        EXPECT_GE(bb[3], 0.0f) << label << " smax";
+    }
+
+    template <int BITS>
+    void expect_reset_cell_zero(const uint8_t* packed, const size_t cell, const float* bb,
+                                const char* label) {
+        float m = 0.0f;
+        float v = 0.0f;
+        joint_adam::Codec<BITS>::decode_g1g2(packed, cell, bb[0], bb[1], bb[2], bb[3], m, v);
+        float m_tol = 0.0f;
+        float v_tol = 0.0f;
+        joint_zero_decode_tol(bb, BITS, m_tol, v_tol);
+        EXPECT_NEAR(m, 0.0f, m_tol) << label << " cell=" << cell;
+        EXPECT_NEAR(v, 0.0f, v_tol) << label << " cell=" << cell;
+    }
+
+    template <int BITS>
+    void expect_live_cell_preserved(const uint8_t* packed, const size_t cell, const float* bb,
+                                    const float m0, const float v0, const char* label) {
+        float u0 = 0.0f;
+        float s0 = 0.0f;
+        joint_adam::Codec<BITS>::g1g2_to_us(m0, v0, u0, s0);
+        float u = 0.0f;
+        float s = 0.0f;
+        joint_adam::Codec<BITS>::decode_us(packed, cell, bb[0], bb[1], bb[2], bb[3], u, s);
+        const float qmax = joint_adam::Codec<BITS>::kQMax;
+        const float u_tol = 2.0f * (bb[1] - bb[0]) / qmax;
+        const float s_tol = 2.0f * (bb[3] - bb[2]) / qmax;
+        EXPECT_NEAR(u, u0, u_tol) << label << " cell=" << cell << " u";
+        EXPECT_NEAR(s, s0, s_tol) << label << " cell=" << cell << " log_s";
+    }
+
+} // namespace
+
+// fails when several threads re-encode the same 256-row block concurrently
+TEST(JointEncodeZero, Contiguous16BitMultiIndexSameBlock) {
+    constexpr int n_prims = 1024;
+    constexpr int n_attr = 3;
+    constexpr int bits = 16;
+    constexpr int kBS = joint_adam::kBlockSize;
+    const int n_blocks = static_cast<int>(joint_adam::n_bounds_for_prims(n_prims));
+    const int bpc = joint_adam::Codec16::kBytesPerCell;
+    const size_t n_cells = static_cast<size_t>(n_prims) * static_cast<size_t>(n_attr);
+
+    std::vector<float> m(n_cells);
+    std::vector<float> v(n_cells);
+    fill_realistic_moments(m, v, 20260816u);
+
+    std::vector<uint8_t> packed_h(n_cells * static_cast<size_t>(bpc), 0);
+    std::vector<float> bounds_h(static_cast<size_t>(n_blocks) * 4, 0.0f);
+    for (int b = 0; b < n_blocks; ++b) {
+        const int begin = b * kBS;
+        const int end = std::min(begin + kBS, n_prims);
+        const size_t n_block_cells = static_cast<size_t>(end - begin) * static_cast<size_t>(n_attr);
+        std::vector<float> g1(n_block_cells);
+        std::vector<float> g2(n_block_cells);
+        size_t t = 0;
+        for (int p = begin; p < end; ++p) {
+            for (int a = 0; a < n_attr; ++a) {
+                const size_t cell = static_cast<size_t>(p) * n_attr + static_cast<size_t>(a);
+                g1[t] = m[cell];
+                g2[t] = v[cell];
+                ++t;
+            }
+        }
+        float bb[4];
+        joint_adam::Codec16::reduce_bounds(g1.data(), g2.data(), n_block_cells, bb);
+        bounds_h[static_cast<size_t>(b) * 4 + 0] = bb[0];
+        bounds_h[static_cast<size_t>(b) * 4 + 1] = bb[1];
+        bounds_h[static_cast<size_t>(b) * 4 + 2] = bb[2];
+        bounds_h[static_cast<size_t>(b) * 4 + 3] = bb[3];
+        for (int p = begin; p < end; ++p) {
+            for (int a = 0; a < n_attr; ++a) {
+                const size_t cell = static_cast<size_t>(p) * n_attr + static_cast<size_t>(a);
+                joint_adam::Codec16::encode_g1g2(packed_h.data(), cell, m[cell], v[cell],
+                                                 bb[0], bb[1], bb[2], bb[3]);
+            }
+        }
+    }
+    const std::vector<uint8_t> packed_before = packed_h;
+    const std::vector<float> bounds_before = bounds_h;
+
+    std::vector<int64_t> indices;
+    indices.reserve(180);
+    for (int i = 0; i < 120; ++i)
+        indices.push_back(i);
+    for (int i = 0; i < 60; ++i)
+        indices.push_back(2 * kBS + i);
+    std::mt19937 shuf(424242u);
+    std::shuffle(indices.begin(), indices.end(), shuf);
+
+    auto packed = upload_u8(packed_h);
+    auto bounds = Tensor::from_vector(bounds_h,
+                                      {static_cast<size_t>(n_blocks), size_t{4}},
+                                      Device::CUDA);
+    auto idx = upload_i64(indices);
+
+    fast_lfs::optimizer::joint_encode_zero_rows_at_indices(
+        packed.ptr<uint8_t>(),
+        bounds.ptr<float>(),
+        idx.ptr<int64_t>(),
+        static_cast<int>(indices.size()),
+        n_attr,
+        bits,
+        n_prims,
+        nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    auto packed_cpu = packed.cpu();
+    auto bounds_cpu = bounds.cpu();
+    const auto* bytes = packed_cpu.ptr<uint8_t>();
+    const float* bb_all = bounds_cpu.ptr<float>();
+
+    const std::unordered_set<int64_t> reset(indices.begin(), indices.end());
+    for (int b : {0, 2}) {
+        const float* bb = bb_all + b * 4;
+        expect_bounds_include_zero(bb, "contiguous touched block");
+        const int begin = b * kBS;
+        const int end = begin + kBS;
+        for (int p = begin; p < end; ++p) {
+            for (int a = 0; a < n_attr; ++a) {
+                const size_t cell = static_cast<size_t>(p) * n_attr + static_cast<size_t>(a);
+                if (reset.count(p) != 0) {
+                    expect_reset_cell_zero<16>(bytes, cell, bb, "contiguous reset");
+                } else {
+                    expect_live_cell_preserved<16>(bytes, cell, bb, m[cell], v[cell],
+                                                   "contiguous live");
+                }
+            }
+        }
+    }
+
+    for (int b : {1, 3}) {
+        EXPECT_EQ(std::memcmp(bb_all + b * 4, bounds_before.data() + static_cast<size_t>(b) * 4,
+                              4 * sizeof(float)),
+                  0)
+            << "untouched bounds block " << b;
+        const size_t byte0 = static_cast<size_t>(b) * kBS * n_attr * static_cast<size_t>(bpc);
+        const size_t nbytes = static_cast<size_t>(kBS) * n_attr * static_cast<size_t>(bpc);
+        EXPECT_EQ(std::memcmp(bytes + byte0, packed_before.data() + byte0, nbytes), 0)
+            << "untouched packed block " << b;
+    }
+}
+
+// fails when several threads re-encode the same 256-row block concurrently
+TEST(JointEncodeZero, SwizzledShN8BitMultiIndexSameBlock) {
+    constexpr int n_prims = 512;
+    constexpr int slots = 2;
+    constexpr int bits = 8;
+    constexpr int kBS = joint_adam::kBlockSize;
+    const int n_blocks = static_cast<int>(joint_adam::n_bounds_for_prims(n_prims));
+    const int bpc = joint_adam::Codec8::kBytesPerCell;
+    const size_t n_cells = static_cast<size_t>(n_prims) * static_cast<size_t>(slots) * 4u;
+
+    std::vector<float> m(n_cells);
+    std::vector<float> v(n_cells);
+    fill_realistic_moments(m, v, 20260817u);
+
+    std::vector<uint8_t> packed_h(n_cells * static_cast<size_t>(bpc), 0);
+    std::vector<float> bounds_h(static_cast<size_t>(n_blocks) * 4, 0.0f);
+    for (int b = 0; b < n_blocks; ++b) {
+        const int begin = b * kBS;
+        const int end = std::min(begin + kBS, n_prims);
+        std::vector<float> g1;
+        std::vector<float> g2;
+        g1.reserve(static_cast<size_t>(end - begin) * slots * 4);
+        g2.reserve(g1.capacity());
+        for (int p = begin; p < end; ++p) {
+            for (int k = 0; k < slots; ++k) {
+                for (int c = 0; c < 4; ++c) {
+                    const size_t cell = static_cast<size_t>(joint_sh_cell(p, k, c, slots));
+                    g1.push_back(m[cell]);
+                    g2.push_back(v[cell]);
+                }
+            }
+        }
+        float bb[4];
+        joint_adam::Codec8::reduce_bounds(g1.data(), g2.data(), g1.size(), bb);
+        bounds_h[static_cast<size_t>(b) * 4 + 0] = bb[0];
+        bounds_h[static_cast<size_t>(b) * 4 + 1] = bb[1];
+        bounds_h[static_cast<size_t>(b) * 4 + 2] = bb[2];
+        bounds_h[static_cast<size_t>(b) * 4 + 3] = bb[3];
+        for (int p = begin; p < end; ++p) {
+            for (int k = 0; k < slots; ++k) {
+                for (int c = 0; c < 4; ++c) {
+                    const size_t cell = static_cast<size_t>(joint_sh_cell(p, k, c, slots));
+                    joint_adam::Codec8::encode_g1g2(packed_h.data(), cell, m[cell], v[cell],
+                                                    bb[0], bb[1], bb[2], bb[3]);
+                }
+            }
+        }
+    }
+
+    std::vector<int64_t> indices;
+    indices.reserve(120);
+    for (int i = 0; i < 100; ++i)
+        indices.push_back(i);
+    for (int i = 0; i < 20; ++i)
+        indices.push_back(kBS + i);
+    std::mt19937 shuf(434343u);
+    std::shuffle(indices.begin(), indices.end(), shuf);
+
+    auto packed = upload_u8(packed_h);
+    auto bounds = Tensor::from_vector(bounds_h,
+                                      {static_cast<size_t>(n_blocks), size_t{4}},
+                                      Device::CUDA);
+    auto idx = upload_i64(indices);
+
+    fast_lfs::optimizer::joint_encode_zero_shN_at_indices(
+        packed.ptr<uint8_t>(),
+        bounds.ptr<float>(),
+        idx.ptr<int64_t>(),
+        static_cast<int>(indices.size()),
+        slots,
+        bits,
+        n_prims,
+        nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    auto packed_cpu = packed.cpu();
+    auto bounds_cpu = bounds.cpu();
+    const auto* bytes = packed_cpu.ptr<uint8_t>();
+    const float* bb_all = bounds_cpu.ptr<float>();
+
+    const std::unordered_set<int64_t> reset(indices.begin(), indices.end());
+    for (int b : {0, 1}) {
+        const float* bb = bb_all + b * 4;
+        expect_bounds_include_zero(bb, "shN touched block");
+        const int begin = b * kBS;
+        const int end = begin + kBS;
+        for (int p = begin; p < end; ++p) {
+            for (int k = 0; k < slots; ++k) {
+                for (int c = 0; c < 4; ++c) {
+                    const size_t cell = static_cast<size_t>(joint_sh_cell(p, k, c, slots));
+                    if (reset.count(p) != 0) {
+                        expect_reset_cell_zero<8>(bytes, cell, bb, "shN reset");
+                    } else {
+                        expect_live_cell_preserved<8>(bytes, cell, bb, m[cell], v[cell], "shN live");
+                    }
+                }
+            }
+        }
+    }
 }

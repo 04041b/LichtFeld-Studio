@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "gui/rmlui/rmlui_manager.hpp"
+
 #include <RmlUi/Core/DataModelHandle.h>
 #include <cstddef>
 #include <cstdint>
@@ -23,12 +25,11 @@ namespace lfs::vis {
 }
 namespace lfs::vis::gui {
 
-    class RmlUIManager;
-
     struct TabSnapshot {
         std::string id;
         std::string label;
         std::string dom_id;
+        bool closeable = false;
         bool operator==(const TabSnapshot&) const = default;
     };
 
@@ -59,9 +60,13 @@ namespace lfs::vis::gui {
         bool wantsInput() const { return wants_input_; }
         bool wantsKeyboard() const { return wants_keyboard_; }
         bool needsAnimationFrame() const;
+        [[nodiscard]] std::string animationDemandDescription() const;
         CursorRequest getCursorRequest() const;
+        [[nodiscard]] float tabStripScroll() const { return tab_scroll_left_; }
+        void setTabStripScroll(float value);
 
         std::function<void(const std::string&)> on_tab_changed;
+        std::function<void(const std::string&)> on_tab_closed;
         std::function<void(float)> on_splitter_delta;
         std::function<void()> on_splitter_end;
         std::function<void(float)> on_resize_delta;
@@ -102,6 +107,9 @@ namespace lfs::vis::gui {
         bool splitter_dragging_ = false;
 
         bool resize_dragging_ = false;
+        bool last_over_resize_handle_ = false;
+        Rml::Element* last_blurred_focus_ = nullptr;
+        Rml::Element* last_hover_element_ = nullptr;
 
         CursorRequest cursor_request_{};
         float prev_mouse_x_ = 0;
@@ -114,6 +122,8 @@ namespace lfs::vis::gui {
         float last_splitter_h_ = -1.0f;
         bool input_dirty_ = false;
         bool last_over_interactive_ = false;
+        bool rml_pointer_inside_ = false;
+        CachedVulkanContextRender direct_cache_;
     };
 
 } // namespace lfs::vis::gui

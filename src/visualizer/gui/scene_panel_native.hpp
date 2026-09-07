@@ -8,10 +8,15 @@
 #include "gui/panel_registry.hpp"
 #include "gui/rmlui/rml_input_utils.hpp"
 #include "gui/rmlui/rml_panel_host.hpp"
+#include "gui/scene_tree_session.hpp"
 
 #include <RmlUi/Core/EventListener.h>
 #include <cstdint>
+#include <deque>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 
 namespace Rml {
     class Element;
@@ -27,21 +32,34 @@ namespace lfs::vis::gui {
     class NativeScenePanel : public IPanel {
     public:
         explicit NativeScenePanel(RmlUIManager* manager);
+        ~NativeScenePanel() override;
 
         void draw(const PanelDrawContext& ctx) override;
         void preload(const PanelDrawContext& ctx) override;
-        void preloadDirect(float w, float h, const PanelDrawContext& ctx,
-                           float clip_y_min, float clip_y_max,
-                           const PanelInputState* input) override;
-        bool supportsDirectDraw() const override { return true; }
-        void drawDirect(float x, float y, float w, float h, const PanelDrawContext& ctx) override;
-        float getDirectDrawHeight() const override { return host_.getContentHeight(); }
-        void setInputClipY(float y_min, float y_max) override { host_.setInputClipY(y_min, y_max); }
-        void setInput(const PanelInputState* input) override { host_.setInput(input); }
-        void setForcedHeight(float h) override { host_.setForcedHeight(h); }
-        bool wantsKeyboard() const override { return host_.wantsKeyboard(); }
-        bool needsAnimationFrame() const override { return host_.needsAnimationFrame(); }
+        PanelRenderCapabilities renderCapabilities() const override {
+            return {.direct = true};
+        }
+        PanelDirectRenderResult renderDirect(const PanelDirectRenderRequest& request,
+                                             const PanelDrawContext& ctx) override;
+        bool needsAnimationFrame() const override;
+        std::optional<double> nextScheduledAnimationDelay() const override {
+            return host_.nextScheduledUpdateDelay();
+        }
         void reloadRmlResources() override;
+        void releaseRendererResources() override { host_.releaseRendererResources(); }
+        [[nodiscard]] std::string projectActiveTab() const;
+        void setProjectActiveTab(std::string_view tab);
+        [[nodiscard]] SceneTreeSessionChrome captureTreeChrome(
+            const core::Scene& scene) const;
+        void applyTreeChrome(const SceneTreeSessionChrome& chrome);
+        void resetTreeChrome();
+        [[nodiscard]] bool selectAllIfFocused();
+        [[nodiscard]] bool toggleSelectionVisibilityIfFocused();
+        [[nodiscard]] bool toggleSelectionTrainingIfFocused();
+        [[nodiscard]] bool groupSelectedNodesIfFocused();
+        [[nodiscard]] bool ungroupSelectedNodeIfFocused();
+        [[nodiscard]] bool requestDeleteSelectionIfAvailable();
+        [[nodiscard]] std::unordered_set<int> visibleCameraUids() const;
 
     private:
         struct EventListener : Rml::EventListener {
@@ -61,19 +79,50 @@ namespace lfs::vis::gui {
             Error,
         };
 
+        struct SyncStamp {
+            Tab active_tab = Tab::Scene;
+            uint64_t scene_generation = 0;
+            uint64_t selection_generation = 0;
+            int64_t num_gaussians = 0;
+            bool training_running = false;
+            std::string training_state;
+            int eval_psnr_milli = 0;
+            int eval_ssim_milli = 0;
+            uint64_t history_generation = 0;
+            uint64_t log_generation = 0;
+            lfs::core::LogLevel log_level = lfs::core::LogLevel::Off;
+            uint64_t language_generation = 0;
+            uint64_t render_settings_generation = 0;
+            int dp_ratio_milli = 1000;
+            bool invert_masks = false;
+            bool scene_graph_selection_markers = false;
+
+            bool operator==(const SyncStamp&) const = default;
+        };
+
         bool ensureInitialized();
+        void preloadDirect(float w, float h, const PanelDrawContext& ctx,
+                           float clip_y_min, float clip_y_max,
+                           const PanelInputState* input);
+        void drawDirect(float x, float y, float w, float h, const PanelDrawContext& ctx);
+        bool drawDirectCached(float x, float y, float w, float h,
+                              const PanelDrawContext& ctx);
         void clearElementCache();
         void cacheElements();
         void syncPanel(const PanelDrawContext& ctx);
+        bool shouldSyncPanel(const PanelInputState* input) const;
+        SyncStamp makeSyncStamp() const;
         bool syncSceneState(const PanelDrawContext& ctx);
         bool syncHistoryState();
         bool syncLoggingState();
         bool syncLocale();
         bool syncTabState();
         bool syncSummaryChips();
+        bool syncSelectionActions();
         bool syncSceneVisibility();
         bool handleEvent(Rml::Event& event);
         void applyFilterInputValue();
+        void applyPendingTreeChrome();
         void applyLogLevelSelection();
         void copyBufferedLogsToClipboard();
         void exportBufferedLogsToTextFile();
@@ -93,12 +142,23 @@ namespace lfs::vis::gui {
         Rml::Element* chip_row_el_ = nullptr;
         Rml::Element* summary_model_chip_el_ = nullptr;
         Rml::Element* summary_node_chip_el_ = nullptr;
-        Rml::Element* summary_selection_chip_el_ = nullptr;
         Rml::Element* summary_filter_chip_el_ = nullptr;
         Rml::Element* scene_view_el_ = nullptr;
         Rml::Element* search_container_el_ = nullptr;
         Rml::Element* filter_input_el_ = nullptr;
         Rml::Element* filter_clear_el_ = nullptr;
+        Rml::Element* selection_action_bar_el_ = nullptr;
+        Rml::Element* selection_action_count_el_ = nullptr;
+        Rml::Element* selection_clear_el_ = nullptr;
+        Rml::Element* selection_visibility_el_ = nullptr;
+        Rml::Element* selection_visibility_icon_el_ = nullptr;
+        Rml::Element* selection_training_el_ = nullptr;
+        Rml::Element* selection_training_icon_el_ = nullptr;
+        Rml::Element* selection_delete_el_ = nullptr;
+        std::string visible_icon_source_;
+        std::string hidden_icon_source_;
+        std::string locked_icon_source_;
+        std::string unlocked_icon_source_;
         Rml::Element* empty_state_el_ = nullptr;
         Rml::Element* empty_primary_el_ = nullptr;
         Rml::Element* empty_secondary_el_ = nullptr;
@@ -130,14 +190,22 @@ namespace lfs::vis::gui {
         Rml::Element* logging_empty_el_ = nullptr;
 
         Tab active_tab_ = Tab::Scene;
+        std::optional<SceneTreeSessionChrome> pending_tree_chrome_;
         std::string last_language_;
         uint64_t last_history_generation_ = 0;
         uint64_t last_log_generation_ = 0;
         lfs::core::LogLevel last_log_level_ = lfs::core::LogLevel::Off;
         uint64_t last_prepare_frame_ = 0;
+        SyncStamp last_sync_stamp_{};
+        bool has_last_sync_stamp_ = false;
         std::string logging_feedback_text_;
         FeedbackTone logging_feedback_tone_ = FeedbackTone::Info;
         bool logging_feedback_dirty_ = false;
+        bool syncing_logging_selection_ = false;
+        std::deque<Rml::Element*> logging_rows_;
+
+        bool rebuildLoggingRows(const std::vector<lfs::core::LogEntrySnapshot>& entries);
+        bool appendLoggingRows(const std::vector<lfs::core::LogEntrySnapshot>& entries);
     };
 
 } // namespace lfs::vis::gui

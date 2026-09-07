@@ -1,7 +1,28 @@
 #!/bin/bash
 
+child_pid=
+abort_script() {
+    trap - INT TERM
+    if [[ -n "${child_pid}" ]]; then
+        kill -TERM "${child_pid}" 2>/dev/null || true
+        wait "${child_pid}" 2>/dev/null || true
+    fi
+    exit 130
+}
+trap abort_script INT TERM
+
+run_child() {
+    "$@" &
+    child_pid=$!
+    wait "${child_pid}"
+    local status=$?
+    child_pid=
+    return "${status}"
+}
+
 SCENE_DIR="data"
 RESULT_DIR="results/mrnf"
+STRATEGY_NAME="MRNF"
 SCENE_LIST="garden bicycle stump bonsai counter kitchen room" # treehill flowers
 
 # Check if results directory exists and prompt for deletion
@@ -31,18 +52,23 @@ do
     echo "Running $SCENE with images_${DATA_FACTOR}"
     echo "========================================="
 
-    # Run training with evaluation
-    ./build/LichtFeld-Studio \
+    # Run training with evaluation, capturing wall-clock duration.
+    mkdir -p "$RESULT_DIR/$SCENE"
+    scene_start=$(date +%s.%N)
+    run_child ./build/LichtFeld-Studio \
         -d $SCENE_DIR/$SCENE/ \
         -o $RESULT_DIR/$SCENE/ \
         --images images_${DATA_FACTOR} \
         --test-every 8 \
         --eval \
         --headless \
-        --save-eval-images \
-        --config eval/mrnf_optimization_params.json
+        --export ply \
+        --config eval/mrnf_optimization_params.json || exit $?
+    scene_end=$(date +%s.%N)
+    scene_elapsed=$(echo "$scene_end - $scene_start" | bc -l)
+    printf "%.2f\n" "$scene_elapsed" > "$RESULT_DIR/$SCENE/training_time_seconds.txt"
 
-    echo "Completed $SCENE"
+    echo "Completed $SCENE (training: ${scene_elapsed}s)"
     echo
 done
 
@@ -59,18 +85,37 @@ format_with_commas() {
     echo $num | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta'
 }
 
+# Format seconds as either "Xs" or "MmSs" (e.g. "212.34s" or "3m32.34s")
+format_duration() {
+    local total=$1
+    if [ -z "$total" ] || [ "$total" = "0" ]; then
+        echo "n/a"
+        return
+    fi
+    local minutes=$(echo "$total / 60" | bc)
+    local secs=$(echo "$total - $minutes * 60" | bc -l)
+    if [ "$minutes" -gt 0 ]; then
+        printf "%dm%05.2fs" "$minutes" "$secs"
+    else
+        printf "%.2fs" "$total"
+    fi
+}
+
 # Print formatted results table
 echo
-echo "========================================================================"
-echo "QUALITY METRICS SUMMARY"
-echo "========================================================================"
-printf "%-10s %-10s %-10s %-10s %-15s\n" "scene" "iteration" "psnr" "ssim" "num_gaussians"
-echo "------------------------------------------------------------------------"
+echo "================================================================================"
+echo "QUALITY METRICS SUMMARY $STRATEGY_NAME"
+echo "================================================================================"
+printf "%-10s %-10s %-10s %-10s %-10s %-12s %-15s\n" "scene" "iteration" "psnr" "ssim" "lpips" "time" "num_gaussians"
+echo "--------------------------------------------------------------------------------"
 
 # Collect and format results for each scene
 total_psnr=0
 total_ssim=0
+total_lpips=0
+lpips_count=0
 total_gaussians=0
+total_time=0
 valid_scenes=0
 
 for SCENE in $SCENE_LIST;
@@ -80,28 +125,45 @@ do
         # Get the last line of metrics (final iteration)
         final_metrics=$(tail -n 1 "$csv_file")
 
-        # Parse CSV values (format: iteration,psnr,ssim,time_per_image,num_gaussians)
-        IFS=',' read -r iteration psnr ssim time_per_image num_gaussians <<< "$final_metrics"
+        # Parse CSV values (format: iteration,psnr,ssim,lpips,time_per_image,num_gaussians)
+        IFS=',' read -r iteration psnr ssim lpips time_per_image num_gaussians _metrics_tail <<< "$final_metrics"
+
+        # Read training wall-clock time for this scene
+        time_file="$RESULT_DIR/$SCENE/training_time_seconds.txt"
+        if [ -f "$time_file" ]; then
+            scene_time=$(cat "$time_file")
+        else
+            scene_time=0
+        fi
 
         # Format the numbers
         psnr_fmt=$(format_number $psnr 4)
         ssim_fmt=$(format_number $ssim 6)
+        if [ -n "$lpips" ]; then lpips_fmt=$(format_number "$lpips" 6); else lpips_fmt="n/a"; fi
         gaussians_fmt=$(format_with_commas $num_gaussians)
+        time_fmt=$(format_duration "$scene_time")
 
         # Print formatted row
-        printf "%-10s %-10s %-10s %-10s %-15s\n" \
+        printf "%-10s %-10s %-10s %-10s %-10s %-12s %-15s\n" \
             "$SCENE" \
             "$iteration" \
             "$psnr_fmt" \
             "$ssim_fmt" \
+            "$lpips_fmt" \
+            "$time_fmt" \
             "$gaussians_fmt"
 
-        echo "------------------------------------------------------------------------"
+        echo "--------------------------------------------------------------------------------"
 
         # Accumulate for mean calculation
         total_psnr=$(echo "$total_psnr + $psnr" | bc -l)
         total_ssim=$(echo "$total_ssim + $ssim" | bc -l)
+        if [ -n "$lpips" ]; then
+            total_lpips=$(echo "$total_lpips + $lpips" | bc -l)
+            lpips_count=$((lpips_count + 1))
+        fi
         total_gaussians=$((total_gaussians + num_gaussians))
+        total_time=$(echo "$total_time + $scene_time" | bc -l)
         valid_scenes=$((valid_scenes + 1))
     fi
 done
@@ -110,22 +172,32 @@ done
 if [ $valid_scenes -gt 0 ]; then
     mean_psnr=$(echo "$total_psnr / $valid_scenes" | bc -l)
     mean_ssim=$(echo "$total_ssim / $valid_scenes" | bc -l)
+    if [ "$lpips_count" -gt 0 ]; then
+        mean_lpips=$(echo "$total_lpips / $lpips_count" | bc -l)
+        mean_lpips_fmt=$(format_number "$mean_lpips" 6)
+    else
+        mean_lpips_fmt="n/a"
+    fi
     mean_gaussians=$((total_gaussians / valid_scenes))
+    mean_time=$(echo "$total_time / $valid_scenes" | bc -l)
 
     mean_psnr_fmt=$(format_number $mean_psnr 4)
     mean_ssim_fmt=$(format_number $mean_ssim 6)
     mean_gaussians_fmt=$(format_with_commas $mean_gaussians)
+    mean_time_fmt=$(format_duration "$mean_time")
 
-    echo "========================================================================"
-    printf "%-10s %-10s %-10s %-10s %-15s\n" \
+    echo "================================================================================"
+    printf "%-10s %-10s %-10s %-10s %-10s %-12s %-15s\n" \
         "mean" \
         "30000" \
         "$mean_psnr_fmt" \
         "$mean_ssim_fmt" \
+        "$mean_lpips_fmt" \
+        "$mean_time_fmt" \
         "$mean_gaussians_fmt"
 fi
 
-echo "========================================================================"
+echo "================================================================================"
 
 
 # Add two blank lines at the end
