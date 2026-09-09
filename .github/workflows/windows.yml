@@ -193,3 +193,14 @@ jobs:
           }
           Write-Host "Found nvJPEG2000 runtime: $runtime"
           $extensions | ForEach-Object { Write-Host "Found nvjpeg2k extension: $($_.FullName)" }
+
+      - name: Install package
+        shell: pwsh
+        run: cmake --install $env:BUILD_DIR --prefix dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichtfeld-studio-windows-${{ matrix.build_type }}
+          path: dist
+          if-no-files-found: error
