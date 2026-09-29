@@ -393,7 +393,7 @@ namespace lfs::vis::op {
             auto normalized = lfs::core::Tensor::zeros({total_size}, device, dtype);
             const size_t copy_count = std::min(total_size, normalized_dtype.numel());
             if (copy_count > 0 && normalized_dtype.ndim() == 1) {
-                normalized.slice(0, 0, copy_count) = normalized_dtype.slice(0, 0, copy_count);
+                normalized.slice(0, 0, copy_count).copy_from(normalized_dtype.slice(0, 0, copy_count));
             }
             return normalized;
         }
@@ -2727,7 +2727,7 @@ namespace lfs::vis::op {
         }
 
         const int flat_size = static_cast<int>(element_count_);
-        auto flat = current->contiguous().reshape({flat_size});
+        auto flat = current->contiguous().reshape({flat_size}).clone();
         applyTensorSwapStorage(flat, storage_);
         *current = flat.reshape(tensor_shape_).contiguous();
         if (scene_) {
