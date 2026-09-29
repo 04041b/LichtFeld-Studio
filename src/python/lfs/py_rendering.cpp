@@ -448,7 +448,8 @@ namespace lfs::python {
             const PreviewReadback readback,
             const std::optional<glm::vec3>& background_color_override,
             const std::optional<bool> orthographic_override = std::nullopt,
-            const std::optional<float> ortho_scale_override = std::nullopt) {
+            const std::optional<float> ortho_scale_override = std::nullopt,
+            const int reference_height = 0) {
             if (width <= 0 || height <= 0 || !std::isfinite(fov_degrees) || fov_degrees <= 0.0f) {
                 return std::nullopt;
             }
@@ -471,7 +472,8 @@ namespace lfs::python {
                     height,
                     background_color_override,
                     orthographic_override,
-                    ortho_scale_override);
+                    ortho_scale_override,
+                    reference_height);
             } else {
                 image = rendering_manager->renderPreviewImage(
                     scene_manager,
@@ -502,7 +504,8 @@ namespace lfs::python {
             const PreviewReadback readback,
             const std::optional<glm::vec3>& background_color_override,
             const std::optional<bool> orthographic_override = std::nullopt,
-            const std::optional<float> ortho_scale_override = std::nullopt) {
+            const std::optional<float> ortho_scale_override = std::nullopt,
+            const int reference_height = 0) {
             auto invoke_render = [&]() -> std::optional<core::Tensor> {
                 return renderViewOnViewerThread(
                     rotation,
@@ -513,7 +516,8 @@ namespace lfs::python {
                     readback,
                     background_color_override,
                     orthographic_override,
-                    ortho_scale_override);
+                    ortho_scale_override,
+                    reference_height);
             };
 
             auto* const viewer = get_visualizer();
@@ -724,6 +728,13 @@ namespace lfs::python {
             };
             group.properties.push_back(std::move(meta));
         };
+
+        add_float(&Proxy::color_exposure, "color_exposure", "Splat exposure", "Splat brightness multiplier", 1.0, 0.1, 8.0);
+        add_int_enum(&Proxy::color_tonemapping, "color_tonemapping", "Tone mapping", "Splat display tone mapping",
+                     {{"None", "none", 0}, {"Linear", "linear", 1}, {"Filmic", "filmic", 2}, {"Hejl", "hejl", 3}, {"ACES", "aces", 4}, {"ACES 2", "aces2", 5}, {"Neutral", "neutral", 6}}, 0);
+        add_int_enum(&Proxy::splat_render_profile, "splat_render_profile", "Splat rendering profile",
+                     "Preserve the source scene rendering when importing from the gallery",
+                     {{"Studio", "studio", 0}, {"Standard portal", "standard", 1}}, 0);
 
         // Background
         add_color3(&Proxy::background_color, "background_color", "Color", "Viewport background color", {0.0, 0.0, 0.0});
@@ -1118,23 +1129,15 @@ namespace lfs::python {
             return rotation;
         }
 
-        [[nodiscard]] std::optional<float> scaledViewInfoOrthoScale(const vis::ViewInfo& view_info,
-                                                                    const int target_height) {
+        [[nodiscard]] std::optional<float> viewInfoOrthoScale(const vis::ViewInfo& view_info) {
             if (!view_info.orthographic) {
                 return std::nullopt;
             }
-            if (view_info.height <= 0 || target_height <= 0 ||
-                !std::isfinite(view_info.ortho_scale) || view_info.ortho_scale <= 0.0f) {
+            if (!std::isfinite(view_info.ortho_scale) || view_info.ortho_scale <= 0.0f) {
                 return std::nullopt;
             }
 
-            const double scale = static_cast<double>(view_info.ortho_scale) *
-                                 static_cast<double>(target_height) /
-                                 static_cast<double>(view_info.height);
-            if (!std::isfinite(scale) || scale <= 0.0) {
-                return std::nullopt;
-            }
-            return static_cast<float>(scale);
+            return view_info.ortho_scale;
         }
 
         [[nodiscard]] core::Tensor toU8Hwc(core::Tensor image) {
@@ -1169,7 +1172,8 @@ namespace lfs::python {
                 PreviewReadback::UInt8Rgb,
                 background_color_override,
                 view_info.orthographic,
-                scaledViewInfoOrthoScale(view_info, height));
+                viewInfoOrthoScale(view_info),
+                view_info.height);
             if (!image || !image->is_valid()) {
                 throw std::runtime_error("viewport export render failed");
             }
@@ -1216,8 +1220,9 @@ namespace lfs::python {
                     .focal_length_mm = lfs::rendering::vFovToFocalLength(view_info.fov),
                     .width = width,
                     .height = height,
+                    .reference_height = view_info.height,
                     .orthographic_override = view_info.orthographic,
-                    .ortho_scale_override = scaledViewInfoOrthoScale(view_info, height),
+                    .ortho_scale_override = viewInfoOrthoScale(view_info),
                     .mode = mode,
                 };
                 return rendering_manager->renderExportImage(scene_manager, request);

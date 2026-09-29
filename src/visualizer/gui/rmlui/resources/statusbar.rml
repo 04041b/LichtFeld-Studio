@@ -70,6 +70,10 @@
             <span class="separator zoom-sep" data-style-color="zoom_sep_color">|</span>
             <span id="zoom-text" data-style-color="zoom_color">{{ zoom_text }}</span>
         </div>
+        <div id="preview-reduced-section" class="hidden" data-class-hidden="!preview_reduced">
+            <span class="separator">|</span>
+            <span>{{ preview_reduced_text }}</span>
+        </div>
         <div id="status-message-section" class="hidden" data-class-hidden="!show_status_message">
             <span class="separator">|</span>
             <span id="status-message" data-style-color="status_message_color">{{ status_message_text }}</span>
@@ -95,10 +99,6 @@
                     <button id="mcp-preferences" class="btn btn--primary mcp-edit-button">{{ mcp_preferences_label }}</button>
                 </div>
             </div>
-        </div>
-        <div id="account-chip" data-class-warning="account_membership_required" data-attr-title="account_tooltip" data-style-color="account_color">
-            <span id="account-label">{{ account_label }}</span>
-            <span id="account-tier" class="hidden" data-class-hidden="!account_show_tier">{{ account_tier }}</span>
         </div>
         <span id="gpu-model" class="dim hidden" data-class-hidden="!show_gpu_model">{{ gpu_model_text }}</span>
         <img id="gpu-icon" data-class-active="gpu_panel_active" title="@tr:ui.perf_hud_tooltip" src="../icon/gpu.png" />

@@ -129,16 +129,16 @@ namespace lfs::vis::gui {
         void removeSaveStep(size_t step);
         void clearSaveStepHover();
         void attachElementListeners();
-        void bindReactiveStore();
+        LFS_VIS_API void bindReactiveStore();
         void markModelDirty();
 
         RmlUIManager* rml_manager_ = nullptr;
         Rml::Context* rml_context_ = nullptr;
         Rml::ElementDocument* document_ = nullptr;
+        bool document_registered_ = false;
         Rml::DataModelHandle model_handle_;
         Rml::EventListener* git_commit_listener_ = nullptr;
         Rml::EventListener* gpu_icon_listener_ = nullptr;
-        Rml::EventListener* account_listener_ = nullptr;
         Rml::EventListener* mcp_toggle_listener_ = nullptr;
         Rml::EventListener* mcp_power_listener_ = nullptr;
         Rml::EventListener* mcp_preferences_listener_ = nullptr;
@@ -241,12 +241,6 @@ namespace lfs::vis::gui {
             std::string zoom_text;
             std::string zoom_color;
             std::string zoom_sep_color;
-            std::string account_label;
-            std::string account_tier;
-            std::string account_tooltip;
-            std::string account_color;
-            bool account_show_tier = false;
-            bool account_membership_required = false;
             std::string lfs_mem_text;
             std::string lfs_mem_color;
             bool show_gpu_model = false;
@@ -257,6 +251,8 @@ namespace lfs::vis::gui {
             std::string fps_value;
             std::string fps_color;
             std::string fps_label;
+            bool preview_reduced = false;
+            std::string preview_reduced_text;
             std::string git_commit;
             bool mcp_details_expanded = false;
             std::string mcp_summary;

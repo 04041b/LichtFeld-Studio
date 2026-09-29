@@ -1546,6 +1546,10 @@ namespace lfs::core {
                             DataType dtype = DataType::Float32);
         static Tensor zeros_direct(TensorShape shape, size_t capacity, Device device = Device::CUDA,
                                    DataType dtype = DataType::Float32);
+        // Uninitialized CUDA storage of exactly the requested size, stream-ordered
+        // and outside the size buckets. For large buffers retained across steps,
+        // where bucket rounding would be permanent waste.
+        static Tensor empty_exact(TensorShape shape, DataType dtype = DataType::Float32);
         static Tensor ones(TensorShape shape, Device device = Device::CUDA,
                            DataType dtype = DataType::Float32);
         static Tensor full(TensorShape shape, float value, Device device = Device::CUDA,
@@ -1934,6 +1938,7 @@ namespace lfs::core {
             return storage_meta_ ? storage_meta_->exportable_bound_generation : 0u;
         }
         static std::string storage_memory_summary();
+        static std::size_t cuda_direct_storage_live_bytes();
         static void log_storage_memory();
         static void log_storage_memory(std::string_view label);
 
@@ -2306,7 +2311,7 @@ namespace lfs::core {
         const auto scalar_value = validated_scalar_operand(                                \
             other, #name, {DataType::Float32, DataType::Int32});                           \
         DataType result_dtype = promote_dtypes(dtype_, scalar_operand_dtype<T>());         \
-        if (true_division && result_dtype != DataType::Float32) {                          \
+        if constexpr (true_division) {                                                     \
             result_dtype = DataType::Float32;                                              \
         }                                                                                  \
         if (numel() == 0) {                                                                \
@@ -2343,7 +2348,7 @@ namespace lfs::core {
         const auto scalar_value = validated_scalar_operand(                                \
             other, #name, {DataType::Float32, DataType::Int32});                           \
         DataType result_dtype = promote_dtypes(dtype_, scalar_operand_dtype<T>());         \
-        if (true_division && result_dtype != DataType::Float32) {                          \
+        if constexpr (true_division) {                                                     \
             result_dtype = DataType::Float32;                                              \
         }                                                                                  \
         if (numel() == 0) {                                                                \

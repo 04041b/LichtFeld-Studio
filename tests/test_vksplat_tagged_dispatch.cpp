@@ -7,6 +7,7 @@
 #include "rendering/rasterizer/vulkan/src/barrier_planner.h"
 #include "rendering/rasterizer/vulkan/src/gs_pipeline.h"
 #include "rendering/rasterizer/vulkan/src/gs_renderer.h"
+#include "rendering/rasterizer/vulkan/src/indirect_layout.h"
 #include "rendering/rasterizer/vulkan/src/viewport_scratch_bucket.h"
 #include "rendering/vulkan_wait.hpp"
 
@@ -878,8 +879,10 @@ TEST(VkSplatTaggedDispatch, CreateDestroyBufferTrackForget) {
 namespace {
 
     // Catalog-derived hand-written barrier struct counts (EPIC_1496_BARRIER_SPEC.md §2.6).
-    constexpr std::size_t kAuditMapLodIndices = 4;                   // 3 pre + 1 post
-    constexpr std::size_t kAuditSelectLodThresholdWithReadback = 24; // 12+5+2 + 4+1
+    constexpr std::size_t kAuditMapLodIndices = 4; // 3 pre + 1 post
+    // Base selection/compact/readback plus 16 gate/retry pairs: six writable
+    // bindings per dispatch and the indirect-command read dependency.
+    constexpr std::size_t kAuditSelectLodThresholdWithReadback = 24 + 16 * (2 * 6 + 1);
 
     // Frozen branch config for the audit recording.
     constexpr std::uint32_t kAuditLodCount = 64;
@@ -1038,12 +1041,12 @@ namespace {
             forge_pair(pipeline_rasterize_forward_batches_plain, 0x56D0);
 
             // Pre-sized host-visible readback so ensureLodSelectionReadback is a no-op.
-            // ensureLodSelectionReadback(chunk_capacity) allocates (2+chunk_capacity) words;
-            // copies end at word (6 + protected + 2*miss).
+            // ensureLodSelectionReadback(chunk_capacity) allocates (3+chunk_capacity) words;
+            // copies end at word (7 + protected + 2*miss).
             constexpr std::size_t kPayloadWords =
                 4 + kLodCompactProtectedCap + 2 * kLodCompactMissCap;
             const VkDeviceSize readback_bytes =
-                (2 + kPayloadWords) * sizeof(std::uint32_t);
+                (3 + kPayloadWords) * sizeof(std::uint32_t);
             lod_selection_readback_buffer_ = makeBuffer(0xF001, readback_bytes);
             lod_selection_readback_mapped_ = reinterpret_cast<std::uint32_t*>(
                 static_cast<std::uintptr_t>(0xBEEF0000));
@@ -1285,7 +1288,7 @@ TEST(VkSplatTaggedDispatch, LodChainAuditMapAndSelectWithinBaseline) {
     // Capacities must absorb resize/clear without real VMA allocation.
     forge_owned(buffers.lod_logical_indices, 0xA001, kAuditLodCount);
     forge_owned(buffers.lod_indices, 0xA002, kAuditLodCount);
-    forge_owned(buffers.lod_gpu_counts, 0xA003, 2);
+    forge_owned(buffers.lod_gpu_counts, 0xA003, 6);
     forge_owned(buffers.lod_gpu_indices, 0xA004, kAuditOutputCapacity);
     forge_owned(buffers.lod_gpu_logical_indices, 0xA005, kAuditOutputCapacity);
     forge_owned_f(buffers.lod_gpu_weights, 0xA006, kAuditOutputCapacity);
@@ -1407,6 +1410,8 @@ TEST(VkSplatTaggedDispatch, LodChainAuditMapAndSelectWithinBaseline) {
          "chunk_touch fill→select"},
         {buffers.lod_chunk_touch.deviceBuffer.buffer, BM::COMPUTE_SHADER_WRITE, BM::COMPUTE_SHADER_READ,
          "chunk_touch select→compact"},
+        {buffers.lod_gpu_counts.deviceBuffer.buffer, BM::COMPUTE_SHADER_WRITE, BM::INDIRECT_DISPATCH_READ,
+         "budget gate → indirect retry"},
         // compact_counts is ComputeWrite in lod_compact_touch.slang (not R/W).
         {buffers.lod_compact_counts.deviceBuffer.buffer, BM::TRANSFER_WRITE, BM::COMPUTE_SHADER_WRITE,
          "compact_counts fill→compact"},
@@ -2417,8 +2422,8 @@ namespace {
         // Macro workspace (also used by macro path resizes).
         forge_owned_i32(buffers.tile_batch_counts, 0xF630, alloc_tiles);
         forge_owned_i32(buffers.tile_batch_offsets, 0xF631, alloc_tiles);
-        // macro_wave_args: 2 * HIGS_RASTER_MAX_WAVES * 3 = 96 words
-        forge_owned(buffers.macro_wave_args, 0xF632, 96);
+        forge_owned(buffers.macro_wave_args, 0xF632,
+                    lfs::rendering::vulkan::indirect_layout::MacroWaveDispatch::kLayout.word_count);
         // partials / active_mask sized like the production macro path:
         // ceil(K / RASTER_BATCH_SIZE) + macro tiles over the bucketed grid.
         const std::size_t alloc_grid_w = _CEIL_DIV(scratch_bucket.alloc_w,

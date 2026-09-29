@@ -9,6 +9,7 @@
 #include "core/path_utils.hpp"
 #include "io/atomic_output.hpp"
 #include "io/filesystem_utils.hpp"
+#include "io/loaders/loader_utils.hpp"
 #include "io/loaders/missing_dataset_images.hpp"
 #include <algorithm>
 #include <array>
@@ -777,51 +778,6 @@ namespace lfs::io {
         return formatted;
     }
 
-    static std::unordered_map<std::string, BasenameLayoutInfo>
-    scan_image_basename_layout(const fs::path& images_path,
-                               const LoadOptions& options = {}) {
-        std::unordered_map<std::string, BasenameLayoutInfo> layout;
-
-        if (!safe_is_directory(images_path)) {
-            return layout;
-        }
-
-        std::error_code ec;
-        size_t scanned_entries = 0;
-        for (fs::recursive_directory_iterator it(
-                 images_path,
-                 fs::directory_options::skip_permission_denied,
-                 ec),
-             end;
-             !ec && it != end;
-             it.increment(ec)) {
-            if (should_poll_cancel(scanned_entries)) {
-                throw_if_load_cancel_requested(options, "COLMAP image layout scan cancelled");
-            }
-            ++scanned_entries;
-
-            const auto& entry = *it;
-            std::error_code file_ec;
-            if (!entry.is_regular_file(file_ec) || file_ec || !is_image_file(entry.path())) {
-                continue;
-            }
-
-            const fs::path relative_path = entry.path().lexically_relative(images_path);
-            if (relative_path.empty()) {
-                continue;
-            }
-
-            const std::string basename_key = detail::normalize_lookup_key(entry.path().filename());
-            auto& info = layout[basename_key];
-            ++info.file_count;
-            if (info.sample_relative_paths.size() < 2) {
-                info.sample_relative_paths.push_back(relative_path);
-            }
-        }
-
-        return layout;
-    }
-
     static std::unexpected<Error> make_nested_image_contract_error(
         const fs::path& images_path,
         const std::string& image_name,
@@ -890,11 +846,23 @@ namespace lfs::io {
     static ColmapDatasetCaches build_colmap_dataset_caches(
         const fs::path& base,
         const fs::path& images_path,
-        const LoadOptions& options) {
+        const LoadOptions& options,
+        std::unordered_map<std::string, BasenameLayoutInfo>& basename_layout) {
         ColmapDatasetCaches caches;
         tbb::task_group tasks;
         tasks.run([&] {
-            caches.images = std::make_unique<RecursiveFileCache>(images_path, options.cancel_requested);
+            caches.images = std::make_unique<RecursiveFileCache>(
+                images_path, options.cancel_requested, [&](const fs::path& relative_path) {
+                    if (!is_image_file(relative_path)) {
+                        return;
+                    }
+                    const std::string basename_key = detail::normalize_lookup_key(relative_path.filename());
+                    auto& info = basename_layout[basename_key];
+                    ++info.file_count;
+                    if (info.sample_relative_paths.size() < 2) {
+                        info.sample_relative_paths.push_back(relative_path);
+                    }
+                });
         });
         tasks.run([&] {
             caches.masks = std::make_unique<MaskDirCache>(base, options.cancel_requested);
@@ -925,11 +893,11 @@ namespace lfs::io {
         }
 
         log_unused_sidecars(base, options);
-        const auto basename_layout = scan_image_basename_layout(images_path, options);
+        std::unordered_map<std::string, BasenameLayoutInfo> basename_layout;
         ColmapDatasetCaches caches;
         {
             LOG_TIMER_DEBUG("COLMAP assemble: caches");
-            caches = build_colmap_dataset_caches(base, images_path, options);
+            caches = build_colmap_dataset_caches(base, images_path, options, basename_layout);
         }
 
         std::unordered_map<std::string, size_t> basename_only_metadata_counts;
@@ -1250,7 +1218,12 @@ namespace lfs::io {
     // -----------------------------------------------------------------------------
     //  Helper to extract scale factor from folder name
     // -----------------------------------------------------------------------------
-    static float extract_scale_from_folder(const std::string& folder_name) {
+    static float extract_scale_from_folder(const std::string& images_folder) {
+        auto folder_path = lfs::core::utf8_to_path(images_folder);
+        if (!folder_path.has_filename()) {
+            folder_path = folder_path.parent_path();
+        }
+        const std::string folder_name = lfs::core::path_to_utf8(folder_path.filename());
         size_t underscore_pos = folder_name.rfind('_');
         if (underscore_pos != std::string::npos) {
             std::string suffix = folder_name.substr(underscore_pos + 1);
@@ -1735,10 +1708,9 @@ namespace lfs::io {
             colors[i * 3 + 2] = points[i].color[2];
         }
 
-        Tensor means = Tensor::from_vector(positions, {N, 3}, Device::CUDA);
-        Tensor colors_tensor = Tensor::from_blob(colors.data(), {N, 3}, Device::CPU, DataType::UInt8)
-                                   .to(Device::CUDA)
-                                   .contiguous();
+        Tensor means = Tensor::from_vector(positions, {N, 3}, Device::CPU);
+        Tensor colors_tensor = Tensor::empty({N, 3}, Device::CPU, DataType::UInt8);
+        std::memcpy(colors_tensor.data_ptr(), colors.data(), colors.size());
 
         PointCloud cloud(std::move(means), std::move(colors_tensor));
         return cloud;
@@ -2840,6 +2812,7 @@ namespace lfs::io {
         std::vector<const CameraDataIntermediate*> camera_data;
         camera_images.reserve(images.size());
         camera_data.reserve(images.size());
+        PriorResolutionSummary prior_resolutions;
         SkipTally image_tally;
         std::vector<std::string> missing_images;
 
@@ -2851,6 +2824,7 @@ namespace lfs::io {
             bool missing_image = false;
             bool depth_matched = false;
             bool normal_matched = false;
+            std::array<int, 4> depth_sizes{}, normal_sizes{};
             size_t undistort_crop_failures = 0;
             size_t undistort_fisheye_crop_failures = 0;
         };
@@ -3080,31 +3054,22 @@ namespace lfs::io {
                 if (image_file_present && options.load_depths && !depth_path.empty()) {
                     auto [img_w, img_h, img_c] = get_image_info_cached();
                     auto [depth_w, depth_h, depth_c] = lfs::core::get_image_info(depth_path);
-                    if (!sidecar_dimensions_match_contract(depth_w,
-                                                           depth_h,
-                                                           img_w,
-                                                           img_h,
-                                                           cam_data.original_width,
-                                                           cam_data.original_height)) {
+                    if (depth_c != 1 || !sidecar_dimensions_match_contract(depth_w, depth_h, img_w, img_h)) {
                         errors[i] = make_error(
                                         ErrorCode::DEPTH_SIZE_MISMATCH,
-                                        std::format("Depth map '{}' is {}x{} but image '{}' is {}x{}",
+                                        std::format("Depth map '{}' is {}x{} but image '{}' is {}x{}; expected a 1-channel map with aspect ratio within 1%",
                                                     lfs::core::path_to_utf8(depth_path.filename()), depth_w, depth_h,
                                                     img.name, img_w, img_h),
                                         depth_path)
                                         .error();
                         return;
                     }
+                    output.depth_sizes = {depth_w, depth_h, img_w, img_h};
                 }
                 if (image_file_present && options.load_normals && !normal_path.empty()) {
                     auto [img_w, img_h, img_c] = get_image_info_cached();
                     auto [normal_w, normal_h, normal_c] = lfs::core::get_image_info(normal_path);
-                    if (!sidecar_dimensions_match_contract(normal_w,
-                                                           normal_h,
-                                                           img_w,
-                                                           img_h,
-                                                           cam_data.original_width,
-                                                           cam_data.original_height)) {
+                    if (normal_c != 3 || !sidecar_dimensions_match_contract(normal_w, normal_h, img_w, img_h)) {
                         if (options.normal_auto_generate) {
                             LOG_WARN("Normal map '{}' is {}x{} but image '{}' is {}x{}; "
                                      "ignoring it so auto-generate can overwrite that file",
@@ -3115,7 +3080,7 @@ namespace lfs::io {
                         } else {
                             errors[i] = make_error(
                                             ErrorCode::NORMAL_SIZE_MISMATCH,
-                                            std::format("Normal map '{}' is {}x{} but image '{}' is {}x{}",
+                                            std::format("Normal map '{}' is {}x{} but image '{}' is {}x{}; expected a 3-channel map with aspect ratio within 1%",
                                                         lfs::core::path_to_utf8(normal_path.filename()), normal_w, normal_h,
                                                         img.name, img_w, img_h),
                                             normal_path)
@@ -3123,6 +3088,8 @@ namespace lfs::io {
                             return;
                         }
                     }
+                    if (!normal_path.empty())
+                        output.normal_sizes = {normal_w, normal_h, img_w, img_h};
                 }
 
                 // Create Camera
@@ -3192,6 +3159,8 @@ namespace lfs::io {
                 if (output.missing_image) {
                     missing_images.push_back(output.image->name);
                 }
+                prior_resolutions.add(output.depth_sizes, false);
+                prior_resolutions.add(output.normal_sizes, true);
                 depth_matched_count += output.depth_matched ? 1 : 0;
                 normal_matched_count += output.normal_matched ? 1 : 0;
                 undistort_camera_count += 1;
@@ -3199,6 +3168,8 @@ namespace lfs::io {
                 undistort_fisheye_crop_failures += output.undistort_fisheye_crop_failures;
             }
         }
+
+        prior_resolutions.log();
 
         std::atomic<bool> observation_cancelled = false;
         {

@@ -8,6 +8,7 @@ add_library(lfs_io_cuda STATIC
         cuda/morton_encoding.cu
         cuda/kmeans.hpp
         cuda/kmeans.cu
+        cuda/splat_decimate.cu
         cuda/image_format_kernels.cuh
         cuda/image_format_kernels.cu
 )
@@ -38,11 +39,11 @@ set_target_properties(lfs_io_cuda PROPERTIES
 # CUDA compiler options for lfs_io_cuda
 target_compile_options(lfs_io_cuda PRIVATE
         # CUDA device code + MSVC host compiler flags (Windows only)
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
 
         # CUDA device code for non-Windows
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -lineinfo --extended-lambda --expt-relaxed-constexpr>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
 )
 
@@ -81,9 +82,9 @@ set_target_properties(lfs_io_rad_quant_cuda PROPERTIES
 )
 
 target_compile_options(lfs_io_rad_quant_cuda PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g -lineinfo --fmad=false -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 --fmad=false -Xcompiler=/O2 -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g -lineinfo --fmad=false>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --fmad=false -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 --fmad=false -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --fmad=false>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 --fmad=false>
 )
 
@@ -126,6 +127,8 @@ add_library(lfs_video STATIC
         video/video_encoder.cpp
         video/color_convert.cuh
         video/color_convert.cu
+        video/cuda_frame_handoff.hpp
+        video/cuda_frame_handoff.cpp
         video_frame_extractor.hpp
         video_frame_extractor.cpp
         hdr_tonemap.hpp
@@ -155,6 +158,7 @@ target_link_libraries(lfs_video
         PkgConfig::FFMPEG
         spdlog::spdlog
         CUDA::cudart
+        CUDA::cuda_driver
 )
 
 # libplacebo's static pkg-config dependency chain includes shaderc and
@@ -180,8 +184,8 @@ set_target_properties(lfs_video PROPERTIES
 )
 
 target_compile_options(lfs_video PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --extended-lambda -Xcompiler=/Od -Xcompiler=/Z7 -Xcompiler=/utf-8>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda -Xcompiler=/O2 -Xcompiler=/utf-8>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --extended-lambda -Xcompiler=/utf-8>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda -Xcompiler=/utf-8>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --extended-lambda>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda>
 )
@@ -224,7 +228,7 @@ set_target_properties(lfs_tinyusdz PROPERTIES
         POSITION_INDEPENDENT_CODE ON
 )
 if(MSVC)
-    target_compile_options(lfs_tinyusdz PRIVATE /EHs-c- /bigobj)
+    target_compile_options(lfs_tinyusdz PRIVATE /bigobj)
 else()
     target_compile_options(lfs_tinyusdz PRIVATE -fno-exceptions)
 endif()
@@ -232,6 +236,7 @@ endif()
 add_library(lfs_io STATIC
         # Implementation file only (header is in include/io/)
         loader.cpp
+        splat_decimate.cpp
 
         # Internal implementation files
         # Core interfaces and types
@@ -249,6 +254,8 @@ add_library(lfs_io STATIC
         formats/transforms.cpp
         formats/sogs.hpp
         formats/sogs.cpp
+        formats/ssog.hpp
+        formats/ssog.cpp
         formats/html.hpp
         formats/html.cpp
         formats/rad.hpp
@@ -282,6 +289,8 @@ add_library(lfs_io STATIC
         loaders/blender_loader.cpp
         loaders/sogs_loader.hpp
         loaders/sogs_loader.cpp
+        loaders/ssog_loader.hpp
+        loaders/ssog_loader.cpp
         loaders/spz_loader.hpp
         loaders/spz_loader.cpp
         loaders/usd_loader.hpp
@@ -319,6 +328,8 @@ add_library(lfs_io STATIC
         project/project_document.cpp
         project/project_preview.cpp
         project/project_recovery.cpp
+        project/project_inspector.cpp
+        project/project_operations.cpp
         project/splat_chapter.cpp
         project/scene_chapter_adapter.cpp
         project/geometry_payload.cpp
@@ -336,6 +347,10 @@ target_include_directories(lfs_io
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/rendering/include
         ${CMAKE_SOURCE_DIR}/external/spz
+        # Project-container sources include core CUDA runtime declarations.
+        # Keep the toolkit include explicit for MSVC compile-database entries;
+        # relying on lfs_core's transitive include is not sufficient there.
+        ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_include_directories(lfs_io SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/external
@@ -394,6 +409,7 @@ target_link_libraries(lfs_io
         ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
         $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
         zstd::libzstd          # .licht project container chunk compression
+        OpenSSL::Crypto
         xxHash::xxhash         # REFS fingerprints and embedded-payload provenance
         CUDA::cudart           # CUDA runtime for nvImageCodec
         lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
@@ -467,3 +483,9 @@ message(STATUS "I/O module configured with SOG support")
 message(STATUS "  IO CUDA library: lfs_io_cuda (morton, k-means)")
 message(STATUS "  WebP decoder library: ${WEBP_DECODE_LIB}")
 message(STATUS "  Archive library: ${ARCHIVE_LIB}")
+
+# Reference decimation needs IEEE arithmetic despite the IO CUDA fast-math defaults.
+set_source_files_properties(cuda/splat_decimate.cu PROPERTIES
+    COMPILE_OPTIONS "--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true")
+set_source_files_properties(splat_decimate.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")

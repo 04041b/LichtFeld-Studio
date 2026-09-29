@@ -154,6 +154,10 @@ namespace lfs::training {
         float* edge_score_out = nullptr;
     };
 
+    [[nodiscard]] fast_lfs::rasterization::FusedAdamSettings make_fastgs_fused_adam_settings(
+        const FastGSFusedAdamState& optimizer_fused,
+        const FastGSFusedExtraGradients& fused_extra_gradients = {});
+
     // Explicit forward pass - returns render output and context for backward
     // Optional tile parameters for memory-efficient training (tile_width/height=0 means full image)
     // bg_image is optional - if provided, uses per-pixel background blending instead of solid color
@@ -167,7 +171,8 @@ namespace lfs::training {
         int tile_height = 0,
         bool mip_filter = false,
         const lfs::core::Tensor& bg_image = {},
-        bool render_normal = false);
+        bool render_normal = false,
+        bool render_depth = true);
 
     // Backward pass with optional extra alpha gradient for masked training
     void fast_rasterize_backward(

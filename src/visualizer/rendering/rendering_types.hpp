@@ -10,11 +10,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace lfs::vis {
 
@@ -68,6 +70,26 @@ namespace lfs::vis {
 
     [[nodiscard]] inline bool splitViewUsesPLYComparison(const SplitViewMode mode) {
         return mode == SplitViewMode::PLYComparison;
+    }
+
+    // Ordered pair of visible splat-node indices for a PLY-comparison offset.
+    // The sequence walks unique unordered pairs (0,1), (0,2), ..., (n-2,n-1).
+    [[nodiscard]] inline std::optional<std::pair<size_t, size_t>>
+    plyComparisonPairForOffset(const size_t node_count, const size_t offset) {
+        if (node_count < 2) {
+            return std::nullopt;
+        }
+
+        size_t remaining = offset % ((node_count * (node_count - 1)) / 2);
+        for (size_t left = 0; left + 1 < node_count; ++left) {
+            const size_t row_count = node_count - left - 1;
+            if (remaining < row_count) {
+                return std::pair<size_t, size_t>{left, left + 1 + remaining};
+            }
+            remaining -= row_count;
+        }
+
+        return std::nullopt;
     }
 
     [[nodiscard]] inline bool splitViewUsesGTComparison(const SplitViewMode mode) {
@@ -188,6 +210,15 @@ namespace lfs::vis {
                                            splitViewDividerPixel(total_width, current_split_position))) <= margin;
     }
 
+    // Normalized texture coordinates address pixel centers at (pixel + 0.5) / extent.
+    // Using extent - 1 here stretches clipped comparison panels by a different amount
+    // whenever their cached widths change, so a divider refresh appears to reframe them.
+    [[nodiscard]] inline float splitViewPixelCenterUv(
+        const int pixel, const int rect_origin, const int rect_extent) {
+        return (static_cast<float>(pixel - rect_origin) + 0.5f) /
+               static_cast<float>(std::max(rect_extent, 1));
+    }
+
     enum class SelectionPreviewMode {
         Centers,
         Rectangle,
@@ -272,6 +303,11 @@ namespace lfs::vis {
                                AUTO = 1 };
         PPISPMode ppisp_mode = PPISPMode::AUTO;
         PPISPOverrides ppisp_overrides;
+
+        // Display color: tone IDs match none, linear, filmic, hejl, aces, aces2, neutral.
+        float color_exposure = 1.0f;
+        int color_tonemapping = 0;
+        int splat_render_profile = 0; // 0: Studio, 1: standard portal
 
         // Background
         glm::vec3 background_color = glm::vec3(0.0f, 0.0f, 0.0f);

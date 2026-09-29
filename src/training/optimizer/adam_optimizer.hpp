@@ -144,9 +144,14 @@ namespace lfs::training {
                                      float median_extent,
                                      float r_min,
                                      float r_max);
-        void set_mean_step_far_mask(const bool* mask, int n);
+        // Retain the allocation for both explicit and fused Adam; CPU inputs are uploaded.
+        void set_mean_step_far_mask(lfs::core::Tensor mask);
         void set_screen_share_cap(const float* max_share, int n, float limit, float penalty);
         void refresh_screen_share_buffer();
+        // Collection is independent of the hinge: refinement can still consume
+        // projected sizes while the strategy defers scale shrinkage.
+        void set_collect_projected_screen_share(bool enabled) noexcept { collect_projected_screen_share_ = enabled; }
+        [[nodiscard]] bool collect_projected_screen_share() const noexcept { return collect_projected_screen_share_; }
         [[nodiscard]] bool per_splat_mean_step() const noexcept { return per_splat_mean_step_; }
         [[nodiscard]] const bool* mean_step_far_mask() const noexcept {
             return mean_step_far_mask_;
@@ -192,6 +197,8 @@ namespace lfs::training {
 
         // Low-level state manipulation
         void reset_state_at_indices(ParamType type, const std::vector<int64_t>& indices);
+        // Keeps CUDA-resident indices on device; accepts int32 or int64 tensors.
+        void reset_state_at_indices(ParamType type, const lfs::core::Tensor& indices);
         void extend_state_for_new_params(ParamType type, size_t n_new);
         void extend_state_by_gather(ParamType type, const lfs::core::Tensor& indices);
 
@@ -228,12 +235,14 @@ namespace lfs::training {
         float mean_step_median_extent_ = 0.0f;
         float mean_step_r_min_ = 1.0f;
         float mean_step_r_max_ = 300.0f;
+        lfs::core::Tensor mean_step_far_mask_storage_;
         const bool* mean_step_far_mask_ = nullptr;
         int mean_step_far_mask_n_ = 0;
         const float* screen_share_max_ = nullptr;
         int screen_share_n_ = 0;
         float screen_share_limit_ = 0.0f;
         float screen_share_penalty_ = 0.0f;
+        bool collect_projected_screen_share_ = false;
         int64_t fused_step_iteration_ = -1;
         bool last_step_zeroed_gradients_ = false;
 
@@ -242,6 +251,7 @@ namespace lfs::training {
         void init_state(ParamType type, bool allocate_grad = false);
         void ensure_grad(ParamType type);
         void step_param(ParamType type, int iteration);
+        void validate_mean_step_far_mask();
         size_t compute_new_capacity(size_t current_capacity, size_t required_size) const;
 
         // Quantized-moment helpers. Moments are uint8 (m signed @ zero-point 128, v as

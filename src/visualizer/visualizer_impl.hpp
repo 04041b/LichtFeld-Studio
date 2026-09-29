@@ -21,6 +21,7 @@
 #include "scene/scene_manager.hpp"
 #include "tools/tool_base.hpp"
 #include "training/training_manager.hpp"
+#include "training/training_progress_publisher.hpp"
 #include "visualizer/visualizer.hpp"
 #include "window/window_manager.hpp"
 #include <atomic>
@@ -108,7 +109,8 @@ namespace lfs::vis {
         projectCreateAt(
             const std::filesystem::path& path,
             ProjectSwitchDisposition disposition =
-                ProjectSwitchDisposition::RequireClean) override;
+                ProjectSwitchDisposition::RequireClean,
+            bool allow_existing_destination_replacement = false) override;
         lfs::Result<void> projectSaveAsExplicit(
             const std::filesystem::path& path,
             bool regenerate_preview = true);
@@ -139,14 +141,22 @@ namespace lfs::vis {
         projectHasPath() override;
         lfs::Result<ProjectInfo>
         projectGetInfo() override;
+        ProjectDisplayInfo projectGetDisplayInfo() override;
         lfs::Result<std::optional<lfs::io::project::ProjectLicense>>
         projectGetLicense() override;
         lfs::Result<void> projectSetLicense(
             const lfs::io::project::ProjectLicense& license) override;
         lfs::Result<void> projectClearLicense() override;
+        lfs::Result<void>
+        projectSetPreview(
+            std::span<const std::byte> png_bytes,
+            const std::filesystem::path& expected_path = {},
+            std::string expected_project_uuid = {}) override;
         lfs::Result<ProjectWritePoll>
         projectPollWrite() override;
         bool consumeProjectSaveStarted() override;
+        bool consumeProjectCreateSucceeded() override;
+        bool projectCreatePending() const override;
         void projectWaitWrite() override;
         lfs::Result<ProjectMenuInfo>
         projectGetMenuInfo() override;
@@ -266,21 +276,29 @@ namespace lfs::vis {
         JobRegistry job_registry_;
         friend class gui::GuiManager;
         friend class project::ProjectLifecycle;
+        friend class VisualizerImplResetTest_ActiveProjectPreviewWritePreservesEditsAndQueuesSave_Test;
         friend class VisualizerImplResetTest_OpenWithoutRestoreKeepsCheckpointBytesOnSave_Test;
         friend class VisualizerImplResetTest_StoredSessionAtPrmsIterationsReportsCompleted_Test;
         friend class VisualizerImplResetTest_StoredSessionBelowPrmsIterationsReportsNotCompleted_Test;
+        friend class VisualizerImplResetTest_StopStoredSessionWithoutResumingKeepsCheckpointAndEntersEditMode_Test;
         friend class VisualizerImplResetTest_OpenWithoutRestoreKeepsCheckpointBytesOnAutosave_Test;
         friend class VisualizerImplResetTest_CreateProjectAtWritesBindsAndRegistersMru_Test;
         friend class VisualizerImplResetTest_CreateProjectAtRefusesExistingDestination_Test;
+        friend class VisualizerImplResetTest_CreateProjectAtOverwriteReplacesExistingAtomically_Test;
+        friend class VisualizerImplResetTest_CreateProjectAtOverwriteLeavesUnreadableFileAndScene_Test;
+        friend class VisualizerImplResetTest_ProjectCreateEventWithoutOverwritePreservesOpenScene_Test;
         friend class VisualizerImplResetTest_CreateProjectAtRejectsScratchAndUnpublishedPaths_Test;
         friend class VisualizerImplResetTest_CreateProjectRequireCleanFailsOnDirtySession_Test;
         friend class VisualizerImplResetTest_TrainingStartAutoCreateSuffixesOnCollision_Test;
         friend class VisualizerImplResetTest_DatasetLoadIntoBlankCreatedProjectKeepsBinding_Test;
         friend class VisualizerImplResetTest_ProjectCreateOnDirtyEmitsCreatePath_Test;
+        friend class VisualizerImplResetTest_ProjectCreateOnDirtyForwardsOverwriteAuthorization_Test;
         friend class VisualizerImplResetTest_StartupScansLegacyWorkingTmpDirectory_Test;
         friend class VisualizerImplResetTest_StartupPruneNeverTouchesProjectLocation_Test;
         friend class VisualizerImplResetTest_ScratchDirectoryIsFixedUnderRootRegardlessOfPreferences_Test;
         friend class VisualizerImplResetTest_ProjectCreateWhileTrainingPromptsWithCreatePath_Test;
+        friend class VisualizerImplResetTest_ProjectCreateStopTrainingDefersWithoutBinding_Test;
+        friend class VisualizerImplResetTest_DeferredCreateLateCollisionDropsQueuedLoads_Test;
         friend class VisualizerImplResetTest_RecoveredScratchSaveStillRefusesAndStaysOutOfMru_Test;
         friend class VisualizerImplResetTest_EditModeWithoutHydratedSessionRetainsCheckpointHistory_Test;
         friend class VisualizerImplResetTest_RestoreThenTrainWritesNewCheckpoint_Test;
@@ -309,6 +327,7 @@ namespace lfs::vis {
         friend class VisualizerImplResetTest_NewProjectClearsRecoveryPromptPendingSoNextOpenProceeds_Test;
         friend class VisualizerImplResetTest_RecoveredPublishUsesRecoveredCommitKind_Test;
         friend class VisualizerImplResetTest_AutosaveStartsAfterFirstSaveAsWithoutReopen_Test;
+        friend class VisualizerImplResetTest_CleanProjectWorksAfterFirstSaveWithoutReopen_Test;
         friend class VisualizerImplResetTest_AsyncCaptureKeepsNewerSceneDirty_Test;
         friend class VisualizerImplResetTest_AutosaveSkipsWhileManualProjectWriteJobIsRunning_Test;
         friend class VisualizerImplResetTest_RecoveredProjectSwitchDeletesTempOnlyAfterReplacement_Test;
@@ -374,6 +393,7 @@ namespace lfs::vis {
         friend class VisualizerImplResetTest_BoundCheckpointIterationCacheSkipsHeaderWhenWarm_Test;
         friend class VisualizerImplResetTest_SelectedGaussiansAndSelectionToolSurviveSaveAndReopen_Test;
         friend class VisualizerImplResetTest_DatasetProjectWithoutCheckpointReloadsTrainer_Test;
+        friend class VisualizerImplResetTest_DatasetProjectWithoutCheckpointOpensReady_Test;
         friend class VisualizerImplResetTest_HydratedDatasetReopenMarksDeletedImageMissing_Test;
         friend class VisualizerImplResetTest_HydratedDatasetReopenIncludesRestoredImage_Test;
         friend class VisualizerImplResetTest_HydratedDatasetReopenAllImagesMissingDoesNotCrash_Test;
@@ -488,13 +508,17 @@ namespace lfs::vis {
             bool stop_training = false);
         void performNewProject(
             ProjectSwitchDisposition disposition);
-        void handleCreateProject(
+        [[nodiscard]] lfs::Result<void>
+        handleCreateProject(
             const std::filesystem::path& path,
             ProjectSwitchDisposition disposition,
-            bool stop_training = false);
-        void performCreateProject(
+            bool stop_training = false,
+            bool allow_existing_destination_replacement = false);
+        [[nodiscard]] lfs::Result<void>
+        performCreateProject(
             const std::filesystem::path& path,
-            ProjectSwitchDisposition disposition);
+            ProjectSwitchDisposition disposition,
+            bool allow_existing_destination_replacement = false);
         void handleOpenProject(
             const std::filesystem::path& path,
             ProjectSwitchDisposition disposition,
@@ -552,6 +576,14 @@ namespace lfs::vis {
                        viewport_resize_settle_ready;
             }
 
+            [[nodiscard]] bool onlySceneDirty() const {
+                return scene_dirty && !viewport_export_locked && !continuous_input &&
+                       !python_animation && !python_overlay && !python_redraw &&
+                       !gui_animation && !input_event && !posted_work && !render_work &&
+                       !store_dirty && !swapchain_resize_ready && !window_resize_paint_pending &&
+                       !viewport_resize_settle_ready;
+            }
+
             [[nodiscard]] bool needsContinuousLoop() const {
                 const bool resize_deferral_throttles_animation =
                     viewport_resize_deferring ||
@@ -603,6 +635,7 @@ namespace lfs::vis {
         std::unique_ptr<MainLoop> main_loop_;
 
         // Frame exception boundary state (viewer thread only).
+        friend class VisualizerImplResetTest_RendererDeadCancelsGpuWorkWithoutDrawing_Test;
         FrameStateMachine frame_state_;
         uint64_t suppressed_frame_errors_ = 0;
         std::chrono::steady_clock::time_point last_frame_error_log_{};
@@ -654,6 +687,9 @@ namespace lfs::vis {
                 ProjectSwitchDisposition::RequireClean;
         std::filesystem::path pending_open_path_;
         std::filesystem::path pending_create_project_path_;
+        bool pending_create_allow_existing_destination_replacement_ =
+            false;
+        bool last_project_create_succeeded_ = false;
         ProjectSwitchDisposition
             pending_open_disposition_ =
                 ProjectSwitchDisposition::RequireClean;
@@ -674,6 +710,7 @@ namespace lfs::vis {
         bool startup_project_open_attempted_ = false;
         bool close_save_notice_posted_ = false;
         std::atomic<bool> project_save_started_{false};
+        TrainingProgressPublisher training_progress_publisher_;
         bool pending_project_dataset_embed_ = false;
         std::optional<std::filesystem::path>
             pending_close_save_path_;

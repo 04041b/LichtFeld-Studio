@@ -20,8 +20,10 @@
 #include "io/cache_image_loader.hpp"
 #include "io/formats/colmap.hpp"
 #include "io/loader.hpp"
+#include "io/splat_path.hpp"
 #include "operation/undo_entry.hpp"
 #include "operation/undo_history.hpp"
+#include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering_manager.hpp"
@@ -829,14 +831,16 @@ namespace lfs::vis {
     std::expected<lfs::io::LoadResult, std::string> SceneManager::stageSplatFile(
         const std::filesystem::path& path,
         lfs::io::ProgressCallback progress,
-        lfs::io::CancelCallback cancel_requested) {
+        lfs::io::CancelCallback cancel_requested, const bool preserve_raw) {
         LOG_TIMER("SceneManager::stageSplatFile");
 
         try {
             LOG_INFO("Loading splat file: {}", lfs::core::path_to_utf8(path));
             LOG_DEBUG("Creating loader for splat file");
             auto loader = lfs::io::Loader::create();
-            auto splat_allocator = makeExternalSplatAllocator();
+            // Import gallery coefficients directly into float-capable renderer
+            // storage; otherwise loader migration encodes the pooled SH to q16.
+            auto splat_allocator = makeViewerSplatTensorAllocator(preserve_raw);
             lfs::io::LoadOptions options{
                 .resize_factor = -1,
                 .max_width = 0,
@@ -845,7 +849,7 @@ namespace lfs::vis {
                 .progress = std::move(progress),
                 .cancel_requested = std::move(cancel_requested),
                 .splat_tensor_allocator = splat_allocator,
-                .shN_q16 = lfs::core::sh_value_quant::enabled()};
+                .shN_q16 = !preserve_raw && lfs::core::sh_value_quant::enabled()};
 
             LOG_TRACE("Loading splat file with loader");
             auto load_result = loader->load(path, options);
@@ -867,7 +871,8 @@ namespace lfs::vis {
                                                     const std::string& name_hint,
                                                     const bool is_visible,
                                                     lfs::io::LoadResult load_result,
-                                                    const bool replace_scene) {
+                                                    const bool replace_scene,
+                                                    const bool defer_import_license) {
         LOG_TIMER("SceneManager::attachLoadedSplatFile");
         (void)is_visible;
 
@@ -890,7 +895,7 @@ namespace lfs::vis {
 
             std::string attached_name;
 
-            const std::string base_name = name_hint.empty() ? lfs::core::path_to_utf8(path.stem()) : name_hint;
+            const std::string base_name = name_hint.empty() ? lfs::io::splat_import_name(path) : name_hint;
             std::string name = base_name;
             if (!replace_scene) {
                 int counter = 1;
@@ -902,7 +907,7 @@ namespace lfs::vis {
             auto ext = path.extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
             state::SceneLoaded::Type file_type = state::SceneLoaded::Type::PLY;
-            if (ext == ".sog") {
+            if (ext == ".sog" || lfs::io::is_ssog_path(path)) {
                 file_type = state::SceneLoaded::Type::SOG;
             } else if (ext == ".spz") {
                 file_type = state::SceneLoaded::Type::SPZ;
@@ -1061,6 +1066,8 @@ namespace lfs::vis {
                 .voxel_size = DEFAULT_VOXEL_SIZE}
                 .emit();
 
+            if (!defer_import_license && load_result.license_bytes && import_license_callback_)
+                import_license_callback_(load_result.license_bytes);
             return attached_name;
 
         } catch (const std::exception& e) {
@@ -1130,7 +1137,9 @@ namespace lfs::vis {
     std::string SceneManager::attachLoadedSplatNode(const std::filesystem::path& path,
                                                     const std::string& name_hint,
                                                     const bool is_visible,
-                                                    lfs::io::LoadResult load_result) {
+                                                    lfs::io::LoadResult load_result,
+                                                    const bool preserve_raw, const core::NodeId parent,
+                                                    const bool defer_import_license) {
         LOG_TIMER_TRACE("SceneManager::attachLoadedSplatNode");
 
         try {
@@ -1144,9 +1153,10 @@ namespace lfs::vis {
                     throw std::runtime_error(migrated.error().format());
                 }
             }
-            quantizeViewerLoadedPlyShN(path, load_result);
+            if (!preserve_raw)
+                quantizeViewerLoadedPlyShN(path, load_result);
 
-            const std::string base_name = name_hint.empty() ? lfs::core::path_to_utf8(path.stem()) : name_hint;
+            const std::string base_name = name_hint.empty() ? lfs::io::splat_import_name(path) : name_hint;
             std::string name = base_name;
             int counter = 1;
             while (scene_.getNode(name) != nullptr) {
@@ -1195,7 +1205,7 @@ namespace lfs::vis {
             const size_t gaussian_count = (*splat_data)->size();
             const core::NodeId node_id = scene_.addSplat(
                 name,
-                std::make_unique<lfs::core::SplatData>(std::move(**splat_data)));
+                std::make_unique<lfs::core::SplatData>(std::move(**splat_data)), parent);
             if (node_id == core::NULL_NODE) {
                 throw std::runtime_error("Failed to add splat node '" + name + "'");
             }
@@ -1243,13 +1253,15 @@ namespace lfs::vis {
             if (is_visible)
                 selectNode(node_id);
 
-            auto ppisp_path = lfs::training::find_ppisp_companion(path);
+            auto ppisp_path = preserve_raw ? std::filesystem::path{} : lfs::training::find_ppisp_companion(path);
             if (!ppisp_path.empty()) {
                 LOG_INFO("Found PPISP companion file: {}", lfs::core::path_to_utf8(ppisp_path));
                 loadPPISPCompanion(ppisp_path);
             }
 
             LOG_DEBUG("Added '{}' ({} gaussians)", added_name, gaussian_count);
+            if (!defer_import_license && load_result.license_bytes && import_license_callback_)
+                import_license_callback_(load_result.license_bytes);
             return added_name;
 
         } catch (const std::exception& e) {
@@ -1263,7 +1275,7 @@ namespace lfs::vis {
                                            const bool is_visible) {
         if (content_type_ != ContentType::SplatFiles) {
             loadSplatFile(path);
-            return lfs::core::path_to_utf8(path.stem());
+            return lfs::io::splat_import_name(path);
         }
 
         auto load_result = stageSplatFile(path);
@@ -1419,6 +1431,11 @@ namespace lfs::vis {
                     return false;
                 }
             }
+        }
+
+        if (services().sceneOrNull() == this &&
+            op::operators().activeModalId() == op::to_string(op::BuiltinOp::AlignPickPoint)) {
+            op::operators().cancelModalOperator();
         }
 
         selection_.clearNodeSelection();
@@ -2228,7 +2245,7 @@ namespace lfs::vis {
             }
 
             glm::vec3 vertex(int64_t i) const {
-                assert(i >= 0 && i < verts_cpu.size(0));
+                assert(i >= 0 && static_cast<uint64_t>(i) < verts_cpu.size(0));
                 const float* p = verts_cpu.ptr<float>() + i * 3;
                 return {p[0], p[1], p[2]};
             }
@@ -3381,6 +3398,11 @@ namespace lfs::vis {
             return;
         }
 
+        if (services().sceneOrNull() == this &&
+            op::operators().activeModalId() == op::to_string(op::BuiltinOp::AlignPickPoint)) {
+            op::operators().cancelModalOperator();
+        }
+
         core::Scene::Transaction txn(scene_);
 
         // Preserve the model's world transform so the trained model
@@ -3451,7 +3473,7 @@ namespace lfs::vis {
         return nullptr;
     }
 
-    SceneRenderState SceneManager::buildRenderState() const {
+    SceneRenderState SceneManager::buildRenderState(const SceneRenderStateOptions options) const {
         if (selection_service_) {
             selection_service_->pollPendingSelectionCounts();
         }
@@ -3461,14 +3483,20 @@ namespace lfs::vis {
         const auto selection_generation = static_cast<std::uint64_t>(selection_.generation());
         const auto gaussian_selection_generation = scene_.selectionGeneration();
         const auto local_scene_generation = scene_.renderGeneration();
-        const auto* current_model = content_type_ == ContentType::Dataset
-                                        ? scene_.getTrainingModel()
-                                        : scene_.getCombinedModel();
+        const auto* current_model = options.metadata_only
+                                        ? nullptr
+                                        : (content_type_ == ContentType::Dataset
+                                               ? scene_.getTrainingModel()
+                                               : scene_.getCombinedModel());
         // PointCloud tensors are public and can be edited in place without a Scene mutation
         // notification. Keep the small node scan, but do not reuse a state that owns a merged
         // point cloud unless those tensors acquire an explicit generation in the future.
         const auto visible_point_cloud_nodes = collectVisiblePointCloudNodes(scene_);
-        const bool point_cloud_fallback = !hasRenderableGaussians(current_model) &&
+        const auto node_active_sh_degrees = content_type_ == ContentType::SplatFiles
+                                                ? scene_.getVisibleNodeActiveShDegrees()
+                                                : std::vector<int>{};
+        const bool point_cloud_fallback = !options.metadata_only &&
+                                          !hasRenderableGaussians(current_model) &&
                                           !visible_point_cloud_nodes.empty();
         if (!point_cloud_fallback && cached_render_state_ &&
             cached_render_scene_generation_ == scene_generation &&
@@ -3476,16 +3504,20 @@ namespace lfs::vis {
             cached_render_gaussian_selection_generation_ == gaussian_selection_generation &&
             cached_render_scene_generation_local_ == local_scene_generation &&
             cached_render_model_ == current_model &&
-            cached_render_content_type_ == content_type_)
+            cached_render_content_type_ == content_type_ &&
+            cached_render_metadata_only_ == options.metadata_only &&
+            cached_render_state_->node_active_sh_degrees == node_active_sh_degrees)
             return *cached_render_state_;
 
         SceneRenderState state;
+        state.node_active_sh_degrees = node_active_sh_degrees;
 
-        // Get combined model or point cloud
+        // Get combined model or point cloud. Comparison and GUI overlays pass
+        // metadata_only so this snapshot cannot start a combined-model worker.
         bool hidden_dataset_training_model = false;
-        if (content_type_ == ContentType::SplatFiles) {
+        if (!options.metadata_only && content_type_ == ContentType::SplatFiles) {
             state.combined_model = scene_.getCombinedModel();
-        } else if (content_type_ == ContentType::Dataset) {
+        } else if (!options.metadata_only && content_type_ == ContentType::Dataset) {
             state.combined_model = scene_.getTrainingModel();
             hidden_dataset_training_model =
                 state.combined_model != nullptr &&
@@ -3494,7 +3526,7 @@ namespace lfs::vis {
 
         // Fall back to the visible point cloud whenever the active splat model is absent or empty.
         // This keeps dataset "ready" scenes renderable before training has produced gaussians.
-        if (!hasRenderableGaussians(state.combined_model)) {
+        if (!options.metadata_only && !hasRenderableGaussians(state.combined_model)) {
             if (visible_point_cloud_nodes.size() > 1) {
                 state.owned_point_cloud = buildMergedVisiblePointCloud(scene_, visible_point_cloud_nodes);
                 state.point_cloud = state.owned_point_cloud.get();
@@ -3532,7 +3564,9 @@ namespace lfs::vis {
             for (auto& transform : state.model_transforms) {
                 transform = rendering::dataWorldTransformToVisualizerWorld(transform);
             }
-            state.transform_indices = scene_.getTransformIndices();
+            if (!options.metadata_only && state.model_transforms.size() > 1) {
+                state.transform_indices = scene_.getTransformIndices();
+            }
 
             // Get node visibility mask (for consolidated models)
             state.node_visibility_mask = scene_.getNodeVisibilityMask();
@@ -3549,8 +3583,9 @@ namespace lfs::vis {
         }
 
         // Renderers consume masks in visible-model order. Scene selection state remains full-scene
-        // so hidden-node selections survive visibility toggles.
-        if (!hidden_dataset_training_model) {
+        // so hidden-node selections survive visibility toggles. metadata_only must not
+        // gather the combined-visible selection tensor.
+        if (!options.metadata_only && !hidden_dataset_training_model) {
             state.selection_mask = scene_.getVisibleSelectionMask();
         }
         const size_t render_splat_count = state.combined_model
@@ -3563,8 +3598,9 @@ namespace lfs::vis {
         // Authoritative non-empty selection (Scene::has_selection_ / hasSelection()).
         // Mask pointer validity alone is not enough: a size-matched all-zero tensor
         // must not report has_selection (see uploadOverlayBindings gate).
-        state.has_selection = scene_.hasSelection() && state.selection_mask &&
-                              state.selection_mask->is_valid();
+        state.has_selection = scene_.hasSelection() &&
+                              (options.metadata_only ||
+                               (state.selection_mask && state.selection_mask->is_valid()));
 
         // Get cropboxes (before lock — no selection dependency)
         state.cropboxes = scene_.getRenderableCropBoxes();
@@ -3612,6 +3648,7 @@ namespace lfs::vis {
         cached_render_scene_generation_local_ = local_scene_generation;
         cached_render_model_ = current_model;
         cached_render_content_type_ = content_type_;
+        cached_render_metadata_only_ = options.metadata_only;
         return *cached_render_state_;
     }
 
@@ -3641,12 +3678,16 @@ namespace lfs::vis {
                 // Determine specific type from extension
                 auto ext = info.source_path.extension().string();
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                if (ext == ".sog") {
+                if (lfs::io::is_ssog_path(info.source_path)) {
+                    info.source_type = "SSOG";
+                } else if (ext == ".sog") {
                     info.source_type = "SOG";
                 } else if (ext == ".ply") {
                     info.source_type = "PLY";
                 } else if (ext == ".spz") {
                     info.source_type = "SPZ";
+                } else if (ext == ".glb") {
+                    info.source_type = "GLB";
                 } else if (ext == ".rad") {
                     info.source_type = "RAD";
                 }
@@ -5949,8 +5990,11 @@ namespace lfs::vis {
         scene_.clearSelection();
         scene_.notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
 
+        if (selection_service_)
+            selection_service_->suppressPassiveHoverPreview();
         if (auto* rm = services().renderingOrNull()) {
             rm->clearCursorPreviewState();
+            rm->clearPreviewSelection();
             rm->markDirty(DirtyFlag::SPLATS | DirtyFlag::SELECTION);
         }
 

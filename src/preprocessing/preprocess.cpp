@@ -744,6 +744,13 @@ namespace {
                                          path_to_string(lfw_path) + ": " +
                                          std::string(loaded.error().detail()));
             model_ = std::move(*loaded);
+            int device = 0;
+            cudaDeviceProp properties{};
+            if (cudaGetDevice(&device) != cudaSuccess ||
+                cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+                throw std::runtime_error("Failed to query native MoGe CUDA device");
+            }
+            LOG_INFO("Normal estimation: native engine on CUDA device {} ({})", device, properties.name);
         }
 
         HeadMaps run(const Image& image, int64_t num_tokens) {
@@ -1134,12 +1141,13 @@ namespace {
             auto outputs = std::make_shared<const HeadMaps>(run_inference(loaded.inference, params.num_tokens));
             const double inference_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - inference_start).count();
+            const std::string image_filename = path_to_string(job.image_path.filename());
             if (bar)
-                bar->report(i + 1, job.image_path.filename().string(), inference_ms);
+                bar->report(i + 1, image_filename, inference_ms);
             else if (!progress)
                 std::cout << "  inference " << inference_ms << " ms\n";
             if (progress)
-                progress(i + 1, plan.jobs.size(), job.image_path.filename().string());
+                progress(i + 1, plan.jobs.size(), image_filename);
 
             while (!writes.empty() && writes.front().wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 writes.front().get();
@@ -1247,6 +1255,9 @@ namespace lfs::preprocessing {
     }
 
     int run_preprocess(const lfs::core::param::PreprocessParameters& params) {
+        // The standalone CLI bypasses training's logger setup.
+        if (!lfs::core::Logger::get().is_ready())
+            lfs::core::Logger::get().init();
         const auto result = run_preprocess_ex(params, {});
         if (!result.ok) {
             std::cerr << "preprocess: " << result.error << "\n";

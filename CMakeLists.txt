@@ -24,7 +24,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LFS_VCPKG_OVERL
 # cache values are visible before project(), when the vcpkg toolchain resolves
 # manifest features.
 list(REMOVE_ITEM VCPKG_MANIFEST_FEATURES tests vulkan-validation)
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
 
@@ -96,6 +96,11 @@ lfs_validate_vcpkg_profile()
 
 project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CUDA CXX C)
 
+if(WIN32)
+    enable_language(RC)
+endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsVersionResource.cmake")
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SelectFastLinker.cmake")
 
 # On Linux, hide symbols pulled in from third-party image / compression static
@@ -166,8 +171,10 @@ add_custom_target(lfs_git_version ALL
 )
 
 option(BUILD_TESTS "Build tests" OFF)
+option(BUILD_PANEL_LAYOUT_TESTS "Build focused panel layout and registry tests" OFF)
+option(BUILD_VISUALIZER_TESTS "Build CPU-only visualizer tests without LibTorch" OFF)
 option(BUILD_FORMAT_TESTS "Build only the CPU-only .licht format tests (no CUDA)" OFF)
-option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path test (no CUDA)" OFF)
+option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path tests (no CUDA runtime linkage)" OFF)
 option(BUILD_LOCALIZATION_TESTS "Register headless localization contract tests without LibTorch" OFF)
 option(LFS_FAST_COMPILE "Optimize measured slow C++ components for build speed instead of runtime speed (WIN32 only)" OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -328,6 +335,17 @@ else()
     message(STATUS "Compiler cache: disabled")
 endif()
 
+if(MSVC)
+    foreach(_lfs_language IN ITEMS C CXX CUDA)
+        set(CMAKE_${_lfs_language}_COMPILER_LAUNCHER
+            "${CMAKE_COMMAND}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/NormalizeMsvcFlags.cmake"
+            --
+            ${CMAKE_${_lfs_language}_COMPILER_LAUNCHER})
+    endforeach()
+    unset(_lfs_language)
+endif()
+
 # Minimum SM for PTX-only (75=Turing, 80=Ampere, 86=GA102, 89=Ada, 90=Hopper)
 set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
 
@@ -377,7 +395,7 @@ if(NVIDIA_SMI)
         set(LichtFeld-Studio_CUDA_ARCH "native")
     endif()
 else()
-    message(WARNING "nvidia-smi not found! We are likely in CI, default to 8.6.")
+    message(STATUS "nvidia-smi not found; using CUDA architecture 8.6 for this build")
     set(DETECTED_COMPUTE_CAP 8.6)
     set(LichtFeld-Studio_CUDA_ARCH "86")
 endif()
@@ -555,6 +573,10 @@ endif()
 
 if(LFS_ENABLE_CUDA_DEVICE_DEBUG)
     add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-G>)
+else()
+    # Device debug already includes line information; passing both flags makes
+    # nvcc and ptxas warn about the redundant, overridden -lineinfo option.
+    add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-lineinfo>)
 endif()
 
 add_compile_definitions(
@@ -596,6 +618,8 @@ add_executable(${PROJECT_NAME}
     src/app/mcp_sequencer_tools.cpp
     src/app/mcp_ui_registry_tools.cpp
     src/app/converter.cpp
+    src/app/converter_output_paths.cpp
+    src/app/converter_overwrite.cpp
     resources/lichtfeld-studio.rc
     resources/lichtfeld-studio.manifest
 )
@@ -604,6 +628,18 @@ add_dependencies(${PROJECT_NAME} lfs_core_abi_stamp)
 target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
     "${LFS_CORE_ABI_INCLUDE_DIR}"
 )
+
+# Give every first-party Windows binary a consistent product identity. This
+# also covers lfs_core.dll, which Defender has flagged in local source builds.
+lfs_add_windows_version_resource(${PROJECT_NAME} "LichtFeld Studio")
+lfs_add_windows_version_resource(lfs_core "LichtFeld Studio core and tensor runtime")
+lfs_add_windows_version_resource(lfs_diagnostics "LichtFeld Studio diagnostics")
+lfs_add_windows_version_resource(lfs_logger "LichtFeld Studio logging")
+lfs_add_windows_version_resource(lfs_event_bridge "LichtFeld Studio event bridge")
+lfs_add_windows_version_resource(lfs_visualizer "LichtFeld Studio visualizer")
+lfs_add_windows_version_resource(lfs_mcp "LichtFeld Studio MCP server")
+lfs_add_windows_version_resource(lfs_python_runtime "LichtFeld Studio Python runtime")
+lfs_add_windows_version_resource(lfs_py "LichtFeld Studio Python module")
 
 # The binary only carries code for these architectures; the app refuses to start on anything
 # lower instead of dying inside the first kernel launch (#1540).
@@ -1179,13 +1215,17 @@ endif()
 # =============================================================================
 # TESTING (Optional)
 # =============================================================================
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS)
     enable_testing()
     add_subdirectory(tests)
     if(BUILD_UNICODE_TEST_ONLY)
         message(STATUS "Unicode path test enabled. Build with 'ninja unicode_path_test' and run with 'ctest -R UnicodePathTest'")
     elseif(BUILD_LOCALIZATION_TESTS AND NOT BUILD_TESTS)
         message(STATUS "Headless localization tests enabled. Build with 'ninja test_localization_contracts' and run with 'ctest -R LocalizationContracts'")
+    elseif(BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_TESTS)
+        message(STATUS "Panel layout tests enabled. Build target panel_layout_tests to run them")
+    elseif(BUILD_VISUALIZER_TESTS AND NOT BUILD_TESTS)
+        message(STATUS "CPU-only visualizer tests enabled. Build target lichtfeld_visualizer_tests and run with 'ctest -R lichtfeld_visualizer_tests'")
     elseif(NOT BUILD_TESTS)
         message(STATUS "Format tests enabled. Build with 'ninja lichtfeld_format_tests' and run with 'ctest -L format'")
     else()
@@ -1299,6 +1339,9 @@ if(TARGET nvimgcodec)
     install(TARGETS nvimgcodec
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        # Keep SDK headers out of the application's default runtime install.
+        PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            COMPONENT Development EXCLUDE_FROM_ALL
     )
     if(TARGET nvjpeg_ext)
         install(TARGETS nvjpeg_ext

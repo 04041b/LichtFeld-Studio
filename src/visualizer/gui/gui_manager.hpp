@@ -204,8 +204,8 @@ namespace lfs::vis {
 
             bool isCapturingInput() const;
             bool isModalWindowOpen() const;
-            [[nodiscard]] bool selectionRingCursorActive(float mouse_x, float mouse_y) const;
             [[nodiscard]] bool isHardwareSelectionRingActive() const;
+            [[nodiscard]] bool selectionCursorNeedsRender(float mouse_x, float mouse_y) const;
             [[nodiscard]] bool passiveMouseMoveNeedsRender(float mouse_x, float mouse_y) const;
             [[nodiscard]] std::optional<double> secondsUntilTooltipReveal() const;
             [[nodiscard]] bool isStartupVisible() const { return startup_overlay_.isVisible(); }
@@ -441,6 +441,7 @@ namespace lfs::vis {
             RmlViewportOverlay rml_viewport_overlay_;
             RmlMenuBar rml_menu_bar_;
             bool menu_pointer_capture_active_ = false;
+            bool startup_overlay_pointer_capture_active_ = false;
             RmlStatusBar rml_status_bar_;
             std::unique_ptr<GlobalContextMenu> global_context_menu_;
             bool deferred_startup_work_pending_ = false;

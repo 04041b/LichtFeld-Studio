@@ -28,9 +28,12 @@
 #include "core/pinned_memory_allocator.hpp"
 #include "core/point_cloud.hpp"
 #include "core/scene.hpp"
+#include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "io/exporter.hpp"
+#include "io/project_document.hpp"
+#include "licht_test_support.hpp"
 #include "ppisp_fixture.hpp"
 #include "python/python_runtime.hpp"
 #include "training/components/bilateral_grid.hpp"
@@ -1344,9 +1347,11 @@ namespace lfs::python {
                     const size_t requested_capacity,
                     const core::DataType dtype,
                     const std::string_view name) {
-                EXPECT_EQ(dtype, core::DataType::Float32);
+                EXPECT_EQ(dtype, name == "SplatData.shN" ? core::DataType::Float16 : core::DataType::Float32)
+                    << name;
                 calls->push_back({std::string{name}, requested_capacity});
-                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::CUDA);
+                auto tensor =
+                    core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::CUDA, dtype);
                 tensor.set_name(std::string{name});
                 return tensor;
             };
@@ -1367,8 +1372,8 @@ namespace lfs::python {
         EXPECT_LE(model->scaling_raw().capacity(), capacity);
         EXPECT_LE(model->rotation_raw().capacity(), capacity);
         EXPECT_LE(model->opacity_raw().capacity(), capacity);
-        EXPECT_LE(model->shN_raw().capacity(),
-                  core::sh_swizzled_float_count(capacity, core::sh_rest_coefficients_for_degree(1)));
+        const auto rest = static_cast<std::uint32_t>(core::sh_rest_coefficients_for_degree(1));
+        EXPECT_LE(model->shN_raw().capacity(), core::sh_value_quant::sh_value_u16_count(capacity, rest));
 
         const auto max_capacity_for = [&](const std::string_view name) -> size_t {
             size_t max_capacity = 0;
@@ -1384,8 +1389,9 @@ namespace lfs::python {
         EXPECT_EQ(max_capacity_for("SplatData.scaling"), capacity);
         EXPECT_EQ(max_capacity_for("SplatData.rotation"), capacity);
         EXPECT_EQ(max_capacity_for("SplatData.opacity"), capacity);
-        EXPECT_EQ(max_capacity_for("SplatData.shN"),
-                  core::sh_swizzled_float_count(capacity, core::sh_rest_coefficients_for_degree(1)));
+        EXPECT_EQ(max_capacity_for("SplatData.shN"), core::sh_value_quant::sh_value_u16_count(capacity, rest));
+        EXPECT_EQ(max_capacity_for("SplatData.shN_value_bounds"),
+                  core::sh_value_quant::n_bounds_for_prims(capacity) * 2);
     }
 
     TEST_F(SceneValidityTest, MigrateTrainingModelAcceptsCudaOnlyExportableStorage) {
@@ -1543,6 +1549,38 @@ namespace lfs::python {
         EXPECT_EQ(get_application_scene(), &scene_manager.getScene());
         EXPECT_EQ(scene_manager.getContentType(), lfs::vis::SceneManager::ContentType::Empty);
         EXPECT_EQ(scene_manager.getScene().getNodeCount(), 0u);
+    }
+
+    TEST_F(SceneValidityTest, GalleryPreviewAttachmentLeavesProjectLicenseUntouched) {
+        auto document = lfs::io::project::ProjectDocument::create(lfs::core::generate_uuid_v4());
+        ASSERT_TRUE(document);
+        lfs::vis::SceneManager manager;
+        int license_callbacks = 0;
+        manager.setImportLicenseCallback([&](const auto& bytes) {
+            ++license_callbacks;
+            EXPECT_TRUE(document->adopt_import_license(bytes));
+        });
+
+        const std::string notice = "License: Preview terms";
+        const auto attach = [&](const bool defer) {
+            lfs::io::LoadResult loaded;
+            loaded.data = std::shared_ptr<lfs::core::SplatData>(lfs::test::licht::make_splat(1).release());
+            loaded.license_bytes = std::vector<uint8_t>(notice.begin(), notice.end());
+            const auto group = manager.getScene().addGroup(defer ? "preview" : "regular");
+            ASSERT_NE(group, lfs::core::NULL_NODE);
+            EXPECT_FALSE(manager.attachLoadedSplatNode("preview.sog", "splat", true,
+                                                       std::move(loaded), true, group, defer)
+                             .empty());
+        };
+
+        attach(true);
+        EXPECT_EQ(license_callbacks, 0);
+        EXPECT_FALSE(document->project().license().value().has_value());
+
+        attach(false);
+        EXPECT_EQ(license_callbacks, 1);
+        EXPECT_EQ(document->project().license().value(),
+                  (lfs::io::project::ProjectLicense{"LicenseRef-Previewterms", notice}));
     }
 
     TEST_F(SceneValidityTest, ColmapSparsePathTracksSuccessfulLoadAndClearsOnReset) {

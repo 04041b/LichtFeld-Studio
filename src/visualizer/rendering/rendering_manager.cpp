@@ -439,6 +439,11 @@ namespace lfs::vis {
             vksplat_idle_frame_count_ = 0;
             return;
         }
+        // A parked refresh polls for its turn on the training arena; releasing
+        // here would cancel the reservation it is waiting on.
+        if (parked_arena_retry_ != 0) {
+            return;
+        }
 
         auto* const arena = lfs::core::GlobalArenaManager::instance().try_get_arena();
         const bool under_pressure = arena != nullptr && arena->is_under_memory_pressure();
@@ -650,6 +655,11 @@ namespace lfs::vis {
     bool RenderingManager::isGTComparisonActive() const {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         return split_view_service_.isGTComparisonActive(settings_);
+    }
+
+    bool RenderingManager::isPLYComparisonActive() const {
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        return splitViewUsesPLYComparison(settings_.split_view_mode);
     }
 
     GTComparisonMode RenderingManager::getGTComparisonMode() const {

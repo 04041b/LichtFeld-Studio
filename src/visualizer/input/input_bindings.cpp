@@ -23,8 +23,8 @@ namespace lfs::vis::input {
 
         std::atomic<bool> g_persistence_enabled{true};
 
-        constexpr int PROFILE_VERSION = 26; // Version 26 adds scene graph grouping actions.
-        constexpr Action LAST_ACTION = Action::UNGROUP_SELECTED_SCENE_NODE;
+        constexpr int PROFILE_VERSION = 29; // Migrate version 28 window controls and add gallery shortcuts.
+        constexpr Action LAST_ACTION = Action::ASSET_REFRESH;
         constexpr int REMOVED_TOOL_MODE_2 = 2;
         constexpr int REMOVED_ACTION_39 = 39;
         constexpr int REMOVED_ACTION_66 = 66;
@@ -111,8 +111,9 @@ namespace lfs::vis::input {
                 } else if constexpr (std::is_same_v<T, MouseDragTrigger>) {
                     return lhs.button == rhs.button && lhs.modifiers == rhs.modifiers &&
                            lhs.chord_key == rhs.chord_key;
+                } else {
+                    return false;
                 }
-                return false;
             },
                               a);
         }
@@ -359,11 +360,31 @@ namespace lfs::vis::input {
 
             current_profile_name_ = profile_name;
             bindings_.clear();
+            size_t rewritten = 0;
+            bool legacy_window_profile = false;
 
             for (const auto& b : j["bindings"]) {
                 const int mode_value = b.value("mode", 0);
-                const int action_value = b["action"].get<int>();
+                int action_value = b["action"].get<int>();
                 const std::string stored_description = b.value("description", "");
+                if (stored_description == "Window size" || stored_description == "Window drag" ||
+                    stored_description == "Adjust Window Size" || stored_description == "Drag Depth Window" ||
+                    (version == 28 && (action_value == 85 || action_value == 86))) {
+                    legacy_window_profile = true;
+                    ++rewritten;
+                    continue;
+                }
+                // Version 28 inserted two window controls before grouping. They
+                // are unavailable here; their IDs must not invoke grouping.
+                if (version == 28) {
+                    if (action_value == 87) {
+                        action_value = static_cast<int>(Action::GROUP_SELECTED_SCENE_NODES);
+                        ++rewritten;
+                    } else if (action_value == 88) {
+                        action_value = static_cast<int>(Action::UNGROUP_SELECTED_SCENE_NODE);
+                        ++rewritten;
+                    }
+                }
                 const bool transient_scene_graph_binding =
                     version == 24 &&
                     (stored_description == "Select Scene Hierarchy" ||
@@ -374,12 +395,14 @@ namespace lfs::vis::input {
                 if (transient_scene_graph_binding) {
                     LOG_INFO("Replacing transient version 24 Scene Graph binding: '{}'",
                              stored_description);
+                    ++rewritten;
                     continue;
                 }
                 if (mode_value == REMOVED_TOOL_MODE_2 ||
                     action_value == REMOVED_ACTION_39 ||
                     action_value == REMOVED_ACTION_66) {
                     LOG_INFO("Dropping input binding for removed tool/action");
+                    ++rewritten;
                     continue;
                 }
 
@@ -403,6 +426,7 @@ namespace lfs::vis::input {
                                      static_cast<int>(*remapped), getActionName(*remapped));
                             binding.action = *remapped;
                             binding.description = getActionName(*remapped);
+                            ++rewritten;
                         }
                     }
                 }
@@ -460,8 +484,8 @@ namespace lfs::vis::input {
                          added_bindings, current_profile_name_);
             }
 
-            const size_t collapsed = collapseRedundantModeBindings(version);
-            const size_t migrated = collapsed + migrateLoadedProfile(version);
+            rewritten += collapseRedundantModeBindings(version);
+            rewritten += migrateLoadedProfile(legacy_window_profile && version == 27 ? 28 : version);
 
             rebuildLookupMaps();
             LOG_INFO("Loaded profile '{}' ({} bindings) from {}", current_profile_name_, bindings_.size(), lfs::core::path_to_utf8(path));
@@ -469,7 +493,7 @@ namespace lfs::vis::input {
             // Auto-persist the canonical Default profile so disk stays current
             // after a versioned migration. User-imported files are left untouched;
             // the migration still applies in memory.
-            if (migrated > 0 && version < PROFILE_VERSION) {
+            if (rewritten > 0 && version >= 1 && version < PROFILE_VERSION) {
                 std::error_code ec;
                 const auto config_dir = getConfigDir();
                 const auto config_default = config_dir
@@ -537,7 +561,11 @@ namespace lfs::vis::input {
                   def.action == Action::TOGGLE_SCENE_SELECTION_TRAINING)) ||
                 (version < 26 &&
                  (def.action == Action::GROUP_SELECTED_SCENE_NODES ||
-                  def.action == Action::UNGROUP_SELECTED_SCENE_NODE));
+                  def.action == Action::UNGROUP_SELECTED_SCENE_NODE)) ||
+                ((version < 27 || version == 28) &&
+                 (def.action == Action::ASSET_GALLERY_PRIMARY ||
+                  def.action == Action::ASSET_GALLERY_COPY_LINK ||
+                  def.action == Action::ASSET_REFRESH));
             if (!should_add) {
                 continue;
             }
@@ -867,8 +895,9 @@ namespace lfs::vis::input {
             } else if constexpr (std::is_same_v<T, MouseDragTrigger>) {
                 std::string chord = t.chord_key.has_value() ? getKeyName(*t.chord_key) + " + " : "";
                 return chord + result + getMouseButtonName(t.button) + " Drag";
+            } else {
+                return "Unknown";
             }
-            return "Unknown";
         },
                           *trigger);
     }
@@ -1030,6 +1059,9 @@ namespace lfs::vis::input {
             {KeyTrigger{KEY_C, MODIFIER_CTRL}, Action::COPY_SELECTION, "Copy"},
             {KeyTrigger{KEY_X, MODIFIER_CTRL}, Action::CUT_SELECTION, "Cut"},
             {KeyTrigger{KEY_V, MODIFIER_CTRL}, Action::PASTE_SELECTION, "Paste"},
+            {KeyTrigger{KEY_ENTER, MODIFIER_CTRL}, Action::ASSET_GALLERY_PRIMARY, "Gallery Primary Action"},
+            {KeyTrigger{KEY_C, MODIFIER_CTRL | MODIFIER_SHIFT}, Action::ASSET_GALLERY_COPY_LINK, "Copy Gallery Link"},
+            {KeyTrigger{KEY_F5, MODIFIER_NONE}, Action::ASSET_REFRESH, "Refresh Assets"},
             // Selection mode shortcuts
             {KeyTrigger{KEY_T, MODIFIER_CTRL}, Action::CYCLE_SELECTION_VIS, "Sel vis"},
             {KeyTrigger{KEY_1, MODIFIER_CTRL}, Action::SELECT_MODE_CENTERS, "Centers"},
@@ -1229,6 +1261,9 @@ namespace lfs::vis::input {
         case Action::TOGGLE_SCENE_SELECTION_VISIBILITY: return "Toggle Scene Selection Visibility";
         case Action::TOGGLE_SCENE_SELECTION_TRAINING: return "Toggle Scene Selection Training";
         case Action::GROUP_SELECTED_SCENE_NODES: return "Group Selected Scene Nodes";
+        case Action::ASSET_GALLERY_PRIMARY: return "Gallery Primary Action";
+        case Action::ASSET_GALLERY_COPY_LINK: return "Copy Gallery Link";
+        case Action::ASSET_REFRESH: return "Refresh Assets";
         case Action::UNGROUP_SELECTED_SCENE_NODE: return "Ungroup Selected Scene Node";
         default: return "Unknown";
         }
@@ -1320,27 +1355,12 @@ namespace lfs::vis::input {
         case Action::TOGGLE_SCENE_SELECTION_VISIBILITY: return "toggle_scene_selection_visibility";
         case Action::TOGGLE_SCENE_SELECTION_TRAINING: return "toggle_scene_selection_training";
         case Action::GROUP_SELECTED_SCENE_NODES: return "group_selected_scene_nodes";
+        case Action::ASSET_GALLERY_PRIMARY: return "asset_gallery_primary";
+        case Action::ASSET_GALLERY_COPY_LINK: return "asset_gallery_copy_link";
+        case Action::ASSET_REFRESH: return "asset_refresh";
         case Action::UNGROUP_SELECTED_SCENE_NODE: return "ungroup_selected_scene_node";
         default: return {};
         }
-    }
-
-    std::optional<Action> actionFromName(std::string_view name) {
-        static const auto table = [] {
-            std::unordered_map<std::string, Action> m;
-            for (int i = 0; i <= static_cast<int>(LAST_ACTION); ++i) {
-                const auto action = static_cast<Action>(i);
-                const auto key = actionNameKey(action);
-                if (!key.empty())
-                    m.emplace(key, action);
-            }
-            return m;
-        }();
-        std::string normalized(name);
-        std::ranges::transform(normalized, normalized.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-        const auto it = table.find(normalized);
-        return it == table.end() ? std::nullopt : std::optional<Action>(it->second);
     }
 
     namespace {
@@ -1369,6 +1389,35 @@ namespace lfs::vis::input {
             {ToolMode::CROP_BOX, "crop_box", "Crop Box"},
         };
     } // namespace
+
+    std::optional<Action> actionFromName(std::string_view name) {
+        static const auto table = [] {
+            std::unordered_map<std::string, Action> m;
+            for (int i = 0; i <= static_cast<int>(LAST_ACTION); ++i) {
+                const auto action = static_cast<Action>(i);
+                const auto key = actionNameKey(action);
+                if (!key.empty())
+                    m.emplace(key, action);
+            }
+            return m;
+        }();
+        std::string normalized(name);
+        std::ranges::transform(normalized, normalized.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+        const auto it = table.find(normalized);
+        return it == table.end() ? std::nullopt : std::optional<Action>(it->second);
+    }
+
+    ToolMode toolModeFromName(std::string_view name) {
+        std::string normalized(name);
+        std::ranges::transform(normalized, normalized.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+        for (const auto& [mode, suffix, english] : kToolModeEntries) {
+            if (suffix == normalized)
+                return mode;
+        }
+        return ToolMode::GLOBAL;
+    }
 
     std::string getLocalizedActionName(const Action action) {
         const auto suffix = actionNameKey(action);
@@ -2022,6 +2071,9 @@ namespace lfs::vis::input {
         case Action::TOGGLE_SCENE_SELECTION_VISIBILITY:
         case Action::TOGGLE_SCENE_SELECTION_TRAINING:
         case Action::GROUP_SELECTED_SCENE_NODES:
+        case Action::ASSET_GALLERY_PRIMARY:
+        case Action::ASSET_GALLERY_COPY_LINK:
+        case Action::ASSET_REFRESH:
         case Action::UNGROUP_SELECTED_SCENE_NODE:
             return d_ui_key;
         case Action::HISTOGRAM_ZOOM_MARKED:

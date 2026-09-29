@@ -19,6 +19,7 @@
 #include "training/components/ppisp_controller_pool.hpp"
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <glm/vec2.hpp>
 #include <mutex>
 #include <optional>
@@ -106,16 +107,23 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<lfs::io::LoadResult, std::string> stageSplatFile(
             const std::filesystem::path& path,
             lfs::io::ProgressCallback progress = {},
-            lfs::io::CancelCallback cancel_requested = {});
+            lfs::io::CancelCallback cancel_requested = {}, bool preserve_raw = false);
         [[nodiscard]] std::string attachLoadedSplatFile(const std::filesystem::path& path,
                                                         const std::string& name_hint,
                                                         bool is_visible,
                                                         lfs::io::LoadResult load_result,
-                                                        bool replace_scene);
+                                                        bool replace_scene,
+                                                        bool defer_import_license = false);
         [[nodiscard]] std::string attachLoadedSplatNode(const std::filesystem::path& path,
                                                         const std::string& name_hint,
                                                         bool is_visible,
-                                                        lfs::io::LoadResult load_result);
+                                                        lfs::io::LoadResult load_result,
+                                                        bool preserve_raw = false,
+                                                        core::NodeId parent = core::NULL_NODE,
+                                                        bool defer_import_license = false);
+        void setImportLicenseCallback(std::function<void(const std::optional<std::vector<uint8_t>>&)> callback) {
+            import_license_callback_ = std::move(callback);
+        }
         std::string addSplatFile(const std::filesystem::path& path, const std::string& name = "", bool is_visible = true);
         std::string addGeneratedSplatNode(std::unique_ptr<core::SplatData> model,
                                           const std::string& source_name,
@@ -217,8 +225,10 @@ namespace lfs::vis {
         const lfs::core::SplatData* getModelForRendering() const;
 
         // Build complete render state from scene graph
-        // This is the single source of truth for all rendering data
-        SceneRenderState buildRenderState() const;
+        // This is the single source of truth for all rendering data.
+        // metadata_only skips combined-model concatenation and per-gaussian
+        // transform/selection aggregates; the two caches are distinct.
+        SceneRenderState buildRenderState(SceneRenderStateOptions options = {}) const;
 
         // Direct info queries
         struct SceneInfo {
@@ -438,6 +448,7 @@ namespace lfs::vis {
         std::optional<core::Scene::SelectionStateSnapshot> selection_preview_before_;
         std::mutex consolidated_compaction_mutex_;
         std::jthread consolidated_compaction_thread_;
+        std::function<void(const std::optional<std::vector<uint8_t>>&)> import_license_callback_;
         bool consolidated_compaction_running_ = false;
         bool consolidated_compaction_pending_ = false;
 
@@ -448,6 +459,7 @@ namespace lfs::vis {
         mutable std::uint64_t cached_render_scene_generation_local_ = 0;
         mutable const lfs::core::SplatData* cached_render_model_ = nullptr;
         mutable ContentType cached_render_content_type_ = ContentType::Empty;
+        mutable bool cached_render_metadata_only_ = false;
     };
 
 } // namespace lfs::vis

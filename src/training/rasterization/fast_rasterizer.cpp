@@ -12,6 +12,7 @@
 #include "lfs/training/sh_value_storage.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/rasterization/fastgs/rasterization/include/forward.h"
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <ctime>
@@ -23,17 +24,81 @@
 
 namespace lfs::training {
 
+    fast_lfs::rasterization::FusedAdamSettings make_fastgs_fused_adam_settings(
+        const FastGSFusedAdamState& optimizer_fused,
+        const FastGSFusedExtraGradients& fused_extra_gradients) {
+        fast_lfs::rasterization::FusedAdamSettings fused_adam;
+        auto convert_param = [](const FastGSFusedAdamParam& src) {
+            fast_lfs::rasterization::FusedAdamParam dst;
+            dst.param = src.param;
+            dst.joint_packed = src.joint_packed;
+            dst.joint_bounds = src.joint_bounds;
+            dst.joint_bits = src.joint_bits;
+            dst.sh_value_bounds = src.sh_value_bounds;
+            dst.sh_value_bits = src.sh_value_bits;
+            dst.sh_value_n_cells = src.sh_value_n_cells;
+            dst.n_primitives = src.n_primitives;
+            dst.frozen_mask = src.frozen_mask;
+            dst.frozen_mask_size = src.frozen_mask_size;
+            dst.frozen_lr_scale = src.frozen_lr_scale;
+            dst.crop_damping_mask = src.crop_damping_mask;
+            dst.crop_damping_mask_size = src.crop_damping_mask_size;
+            dst.cropbox_lr_scale = src.cropbox_lr_scale;
+            dst.n_elements = src.n_elements;
+            dst.n_attributes = src.n_attributes;
+            dst.step_size = src.step_size;
+            dst.bias_correction2_sqrt_rcp = src.bias_correction2_sqrt_rcp;
+            dst.enabled = src.enabled;
+            dst.screen_share_max = src.screen_share_max;
+            dst.screen_share_n = src.screen_share_n;
+            dst.screen_share_limit = src.screen_share_limit;
+            dst.screen_share_penalty = src.screen_share_penalty;
+            return dst;
+        };
+        fused_adam.enabled = optimizer_fused.enabled;
+        fused_adam.beta1 = optimizer_fused.beta1;
+        fused_adam.beta2 = optimizer_fused.beta2;
+        fused_adam.eps = optimizer_fused.eps;
+        fused_adam.scale_reg_weight = fused_extra_gradients.scale_reg_weight;
+        fused_adam.flatten_reg_weight = fused_extra_gradients.flatten_reg_weight;
+        fused_adam.opacity_reg_weight = fused_extra_gradients.opacity_reg_weight;
+        fused_adam.scale_reg_loss_out = fused_extra_gradients.scale_reg_loss_out;
+        fused_adam.opacity_reg_loss_out = fused_extra_gradients.opacity_reg_loss_out;
+        fused_adam.sparsity_opa_sigmoid = fused_extra_gradients.sparsity_opa_sigmoid;
+        fused_adam.sparsity_z = fused_extra_gradients.sparsity_z;
+        fused_adam.sparsity_u = fused_extra_gradients.sparsity_u;
+        fused_adam.sparsity_n = fused_extra_gradients.sparsity_n;
+        fused_adam.sparsity_rho = fused_extra_gradients.sparsity_rho;
+        fused_adam.sparsity_grad_loss = fused_extra_gradients.sparsity_grad_loss;
+        fused_adam.means = convert_param(optimizer_fused.means);
+        fused_adam.scaling = convert_param(optimizer_fused.scaling);
+        fused_adam.rotation = convert_param(optimizer_fused.rotation);
+        fused_adam.opacity = convert_param(optimizer_fused.opacity);
+        fused_adam.sh0 = convert_param(optimizer_fused.sh0);
+        fused_adam.shN = convert_param(optimizer_fused.shN);
+        fused_adam.per_splat_mean_step = optimizer_fused.per_splat_mean_step;
+        fused_adam.mean_step_median_extent = optimizer_fused.mean_step_median_extent;
+        fused_adam.mean_step_r_min = optimizer_fused.mean_step_r_min;
+        fused_adam.mean_step_r_max = optimizer_fused.mean_step_r_max;
+        // The kernel compares an unsigned row index with this count. Reject
+        // nonpositive counts and limit the mask to live mean rows.
+        if (optimizer_fused.mean_step_far_mask != nullptr &&
+            optimizer_fused.mean_step_far_mask_n > 0 && optimizer_fused.means.n_primitives > 0) {
+            fused_adam.mean_step_far_mask = optimizer_fused.mean_step_far_mask;
+            fused_adam.mean_step_far_mask_n = std::min(
+                optimizer_fused.mean_step_far_mask_n, optimizer_fused.means.n_primitives);
+        }
+        return fused_adam;
+    }
+
     namespace {
         struct FastRasterizerThreadLocalCaches {
             core::Tensor image;
             core::Tensor alpha;
             core::Tensor depth;
             core::Tensor normal;
-            core::Tensor grad_alpha;
             int width = -1;
             int height = -1;
-            int grad_alpha_height = 0;
-            int grad_alpha_width = 0;
         };
 
         thread_local FastRasterizerThreadLocalCaches fast_rasterizer_thread_caches;
@@ -291,7 +356,8 @@ namespace lfs::training {
         int tile_height,
         bool mip_filter,
         const core::Tensor& bg_image,
-        bool render_normal) {
+        bool render_normal,
+        bool render_depth) {
         // Get camera parameters
         const int full_width = viewpoint_camera.image_width();
         const int full_height = viewpoint_camera.image_height();
@@ -356,28 +422,32 @@ namespace lfs::training {
         // Reallocate when either the shape or owning stream changes. Calling
         // Tensor::set_stream on a cache backed by a destroyed stream would try
         // to bridge from that dead handle before re-homing it.
-        if (!image.is_valid() || !alpha.is_valid() || !depth.is_valid() ||
+        if (!image.is_valid() || !alpha.is_valid() ||
             last_width != width || last_height != height ||
-            image.stream() != raster_stream || alpha.stream() != raster_stream ||
-            depth.stream() != raster_stream) {
-            image = core::Tensor::empty({3, static_cast<size_t>(height), static_cast<size_t>(width)});
-            alpha = core::Tensor::empty({1, static_cast<size_t>(height), static_cast<size_t>(width)});
-            depth = core::Tensor::empty({1, static_cast<size_t>(height), static_cast<size_t>(width)});
+            image.stream() != raster_stream || alpha.stream() != raster_stream) {
+            image = core::Tensor::empty_exact({3, static_cast<size_t>(height), static_cast<size_t>(width)});
+            alpha = core::Tensor::empty_exact({1, static_cast<size_t>(height), static_cast<size_t>(width)});
+            depth = core::Tensor();
             normal = core::Tensor();
             if (image.stream() != raster_stream)
                 image.set_stream(raster_stream);
             if (alpha.stream() != raster_stream)
                 alpha.set_stream(raster_stream);
-            if (depth.stream() != raster_stream)
-                depth.set_stream(raster_stream);
             last_width = width;
             last_height = height;
+        }
+        if (!render_depth) {
+            depth = core::Tensor();
+        } else if (!depth.is_valid() || depth.stream() != raster_stream) {
+            depth = core::Tensor::empty_exact({1, static_cast<size_t>(height), static_cast<size_t>(width)});
+            if (depth.stream() != raster_stream)
+                depth.set_stream(raster_stream);
         }
         if (render_normal &&
             (!normal.is_valid() ||
              normal.shape() != core::TensorShape({3, static_cast<size_t>(height), static_cast<size_t>(width)}) ||
              normal.stream() != raster_stream)) {
-            normal = core::Tensor::empty({3, static_cast<size_t>(height), static_cast<size_t>(width)});
+            normal = core::Tensor::empty_exact({3, static_cast<size_t>(height), static_cast<size_t>(width)});
             if (normal.stream() != raster_stream)
                 normal.set_stream(raster_stream);
         }
@@ -424,7 +494,7 @@ namespace lfs::training {
                 cam_position_ptr,
                 image.ptr<float>(),
                 alpha.ptr<float>(),
-                depth.ptr<float>(),
+                render_depth ? depth.ptr<float>() : nullptr,
                 render_normal ? normal.ptr<float>() : nullptr,
                 bg_color_ptr,
                 bg_image_ptr,
@@ -602,61 +672,36 @@ namespace lfs::training {
         const core::Tensor& grad_depth,
         const core::Tensor& grad_normal) {
 
-        // Compute grad_alpha from background blending: output = image + (1 - alpha) * bg
-        int H, W;
-        bool is_chw_layout;
-
-        if (grad_image.shape()[0] == 3) {
-            is_chw_layout = true;
-            H = checked_dim_to_int(grad_image.shape()[1], "grad_image height");
-            W = checked_dim_to_int(grad_image.shape()[2], "grad_image width");
-        } else if (grad_image.shape()[2] == 3) {
-            is_chw_layout = false;
-            H = checked_dim_to_int(grad_image.shape()[0], "grad_image height");
-            W = checked_dim_to_int(grad_image.shape()[1], "grad_image width");
-        } else {
-            throw std::runtime_error("Unexpected grad_image shape");
+        if (grad_image.ndim() != 3 || grad_image.shape()[0] != 3) {
+            throw std::runtime_error("FastGS backward expects a [3, H, W] image gradient");
         }
-
-        auto& cached_grad_alpha = fast_rasterizer_thread_caches.grad_alpha;
-        auto& cached_ga_h = fast_rasterizer_thread_caches.grad_alpha_height;
-        auto& cached_ga_w = fast_rasterizer_thread_caches.grad_alpha_width;
+        const int H = checked_dim_to_int(grad_image.shape()[1], "grad_image height");
+        const int W = checked_dim_to_int(grad_image.shape()[2], "grad_image width");
         const cudaStream_t stream = grad_image.stream();
-        if (!cached_grad_alpha.is_valid() || cached_ga_h != H || cached_ga_w != W ||
-            cached_grad_alpha.stream() != stream) {
-            cached_grad_alpha = core::Tensor::empty({static_cast<size_t>(H), static_cast<size_t>(W)}, core::Device::CUDA);
-            if (cached_grad_alpha.stream() != stream)
-                cached_grad_alpha.set_stream(stream);
-            cached_ga_h = H;
-            cached_ga_w = W;
-        }
-        auto& grad_alpha = cached_grad_alpha;
 
-        // Use background image kernel if available, otherwise use solid color kernel
-        if (has_background_image(ctx.bg_image) && is_chw_layout) {
+        // The blend backward derives the background alpha gradient per pixel
+        // from grad_image and the background; no [H, W] map is materialized.
+        fast_lfs::rasterization::BackgroundAlphaGradient background_grad;
+        if (has_background_image(ctx.bg_image)) {
             core::pin_operands({&grad_image, &ctx.bg_image});
-            kernels::launch_fused_grad_alpha_with_image(
-                grad_image.ptr<float>(),
-                ctx.bg_image.ptr<float>(),
-                grad_alpha.ptr<float>(),
-                H, W,
-                stream);
-        } else {
+            background_grad.bg_image = ctx.bg_image.ptr<float>();
+        } else if (ctx.bg_color.is_valid() && ctx.bg_color.numel() >= 3) {
             core::pin_operands({&grad_image, &ctx.bg_color});
-            kernels::launch_fused_grad_alpha(
-                grad_image.ptr<float>(),
-                ctx.bg_color.ptr<float>(),
-                grad_alpha.ptr<float>(),
-                H, W,
-                is_chw_layout,
-                stream);
+            background_grad.bg_color = ctx.bg_color.ptr<float>();
         }
-
+        core::Tensor grad_alpha_extra_2d;
         if (grad_alpha_extra.is_valid() && grad_alpha_extra.numel() > 0) {
-            auto extra = (grad_alpha_extra.ndim() == 3 && grad_alpha_extra.shape()[0] == 1)
-                             ? grad_alpha_extra.squeeze(0)
-                             : grad_alpha_extra;
-            grad_alpha.add_(extra);
+            grad_alpha_extra_2d = (grad_alpha_extra.ndim() == 3 && grad_alpha_extra.shape()[0] == 1)
+                                      ? grad_alpha_extra.squeeze(0)
+                                      : grad_alpha_extra;
+            if (!(grad_alpha_extra_2d.ndim() == 2 &&
+                  checked_dim_to_int(grad_alpha_extra_2d.shape()[0], "grad_alpha_extra height") == H &&
+                  checked_dim_to_int(grad_alpha_extra_2d.shape()[1], "grad_alpha_extra width") == W &&
+                  grad_alpha_extra_2d.dtype() == core::DataType::Float32)) {
+                throw std::runtime_error("grad_alpha_extra must have shape [H, W] or [1, H, W]");
+            }
+            grad_alpha_extra_2d = grad_alpha_extra_2d.contiguous();
+            background_grad.grad_alpha_extra = grad_alpha_extra_2d.ptr<float>();
         }
 
         core::Tensor grad_depth_2d;
@@ -666,10 +711,11 @@ namespace lfs::training {
             if (grad_depth_2d.ndim() == 3 && grad_depth_2d.shape()[0] == 1) {
                 grad_depth_2d = grad_depth_2d.squeeze(0);
             }
-            assert(grad_depth_2d.ndim() == 2 &&
-                   checked_dim_to_int(grad_depth_2d.shape()[0], "grad_depth height") == H &&
-                   checked_dim_to_int(grad_depth_2d.shape()[1], "grad_depth width") == W &&
-                   "grad_depth must have shape [H, W] or [1, H, W]");
+            if (!(grad_depth_2d.ndim() == 2 &&
+                  checked_dim_to_int(grad_depth_2d.shape()[0], "grad_depth height") == H &&
+                  checked_dim_to_int(grad_depth_2d.shape()[1], "grad_depth width") == W)) {
+                throw std::runtime_error("grad_depth must have shape [H, W] or [1, H, W]");
+            }
             if (grad_depth_2d.device() != core::Device::CUDA) {
                 grad_depth_2d = grad_depth_2d.cuda();
             }
@@ -683,11 +729,12 @@ namespace lfs::training {
         const float* grad_normal_ptr = nullptr;
         if (grad_normal.is_valid() && grad_normal.numel() > 0) {
             grad_normal_chw = grad_normal;
-            assert(grad_normal_chw.ndim() == 3 &&
-                   grad_normal_chw.shape()[0] == 3 &&
-                   checked_dim_to_int(grad_normal_chw.shape()[1], "grad_normal height") == H &&
-                   checked_dim_to_int(grad_normal_chw.shape()[2], "grad_normal width") == W &&
-                   "grad_normal must have shape [3, H, W]");
+            if (!(grad_normal_chw.ndim() == 3 &&
+                  grad_normal_chw.shape()[0] == 3 &&
+                  checked_dim_to_int(grad_normal_chw.shape()[1], "grad_normal height") == H &&
+                  checked_dim_to_int(grad_normal_chw.shape()[2], "grad_normal width") == W)) {
+                throw std::runtime_error("grad_normal must have shape [3, H, W]");
+            }
             if (grad_normal_chw.device() != core::Device::CUDA) {
                 grad_normal_chw = grad_normal_chw.cuda();
             }
@@ -729,56 +776,8 @@ namespace lfs::training {
         // loss path); do not allocate a separate pre-blend cache.
         auto raw_image = ctx.image;
 
-        fast_lfs::rasterization::FusedAdamSettings fused_adam;
-        const auto optimizer_fused = optimizer.prepare_fastgs_fused_adam(iteration, stream);
-        auto convert_param = [](const FastGSFusedAdamParam& src) {
-            fast_lfs::rasterization::FusedAdamParam dst;
-            dst.param = src.param;
-            dst.joint_packed = src.joint_packed;
-            dst.joint_bounds = src.joint_bounds;
-            dst.joint_bits = src.joint_bits;
-            dst.sh_value_bounds = src.sh_value_bounds;
-            dst.sh_value_bits = src.sh_value_bits;
-            dst.sh_value_n_cells = src.sh_value_n_cells;
-            dst.n_primitives = src.n_primitives;
-            dst.frozen_mask = src.frozen_mask;
-            dst.frozen_mask_size = src.frozen_mask_size;
-            dst.frozen_lr_scale = src.frozen_lr_scale;
-            dst.crop_damping_mask = src.crop_damping_mask;
-            dst.crop_damping_mask_size = src.crop_damping_mask_size;
-            dst.cropbox_lr_scale = src.cropbox_lr_scale;
-            dst.n_elements = src.n_elements;
-            dst.n_attributes = src.n_attributes;
-            dst.step_size = src.step_size;
-            dst.bias_correction2_sqrt_rcp = src.bias_correction2_sqrt_rcp;
-            dst.enabled = src.enabled;
-            dst.screen_share_max = src.screen_share_max;
-            dst.screen_share_n = src.screen_share_n;
-            dst.screen_share_limit = src.screen_share_limit;
-            dst.screen_share_penalty = src.screen_share_penalty;
-            return dst;
-        };
-        fused_adam.enabled = optimizer_fused.enabled;
-        fused_adam.beta1 = optimizer_fused.beta1;
-        fused_adam.beta2 = optimizer_fused.beta2;
-        fused_adam.eps = optimizer_fused.eps;
-        fused_adam.scale_reg_weight = fused_extra_gradients.scale_reg_weight;
-        fused_adam.flatten_reg_weight = fused_extra_gradients.flatten_reg_weight;
-        fused_adam.opacity_reg_weight = fused_extra_gradients.opacity_reg_weight;
-        fused_adam.scale_reg_loss_out = fused_extra_gradients.scale_reg_loss_out;
-        fused_adam.opacity_reg_loss_out = fused_extra_gradients.opacity_reg_loss_out;
-        fused_adam.sparsity_opa_sigmoid = fused_extra_gradients.sparsity_opa_sigmoid;
-        fused_adam.sparsity_z = fused_extra_gradients.sparsity_z;
-        fused_adam.sparsity_u = fused_extra_gradients.sparsity_u;
-        fused_adam.sparsity_n = fused_extra_gradients.sparsity_n;
-        fused_adam.sparsity_rho = fused_extra_gradients.sparsity_rho;
-        fused_adam.sparsity_grad_loss = fused_extra_gradients.sparsity_grad_loss;
-        fused_adam.means = convert_param(optimizer_fused.means);
-        fused_adam.scaling = convert_param(optimizer_fused.scaling);
-        fused_adam.rotation = convert_param(optimizer_fused.rotation);
-        fused_adam.opacity = convert_param(optimizer_fused.opacity);
-        fused_adam.sh0 = convert_param(optimizer_fused.sh0);
-        fused_adam.shN = convert_param(optimizer_fused.shN);
+        const auto fused_adam = make_fastgs_fused_adam_settings(
+            optimizer.prepare_fastgs_fused_adam(iteration, stream), fused_extra_gradients);
         if (!fused_adam.enabled) {
             throw std::runtime_error("FastGS fused Adam state is not available");
         }
@@ -813,7 +812,7 @@ namespace lfs::training {
             update_densification_info ? gaussian_model._densification_info.ptr<float>() : nullptr,
             use_pixel_error_densification ? error_map_2d.ptr<float>() : nullptr,
             grad_image.ptr<float>(),
-            grad_alpha.ptr<float>(),
+            background_grad,
             grad_depth_ptr,
             grad_normal_ptr,
             raw_image.ptr<float>(),
@@ -863,16 +862,12 @@ namespace lfs::training {
         fast_rasterizer_thread_caches.alpha = {};
         fast_rasterizer_thread_caches.depth = {};
         fast_rasterizer_thread_caches.normal = {};
-        fast_rasterizer_thread_caches.grad_alpha = {};
         fast_rasterizer_thread_caches.width = -1;
         fast_rasterizer_thread_caches.height = -1;
-        fast_rasterizer_thread_caches.grad_alpha_height = 0;
-        fast_rasterizer_thread_caches.grad_alpha_width = 0;
         return !fast_rasterizer_thread_caches.image.is_valid() &&
                !fast_rasterizer_thread_caches.alpha.is_valid() &&
                !fast_rasterizer_thread_caches.depth.is_valid() &&
-               !fast_rasterizer_thread_caches.normal.is_valid() &&
-               !fast_rasterizer_thread_caches.grad_alpha.is_valid();
+               !fast_rasterizer_thread_caches.normal.is_valid();
     }
 
     void release_fastgs_sort_workspace_buffers() noexcept {

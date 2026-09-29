@@ -6,12 +6,15 @@
 
 #include "diagnostics/vram_ledger_model.hpp"
 #include "diagnostics/vram_profiler.hpp"
+#include "diagnostics/vram_timeline.hpp"
 #include "visualizer/app_store.hpp"
 
 #include <RmlUi/Core/EventListener.h>
+#include <RmlUi/Core/Types.h>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,6 +25,7 @@ namespace Rml {
 } // namespace Rml
 
 namespace lfs::vis::gui {
+    class VramTimelineElement;
 
     class VramHudOverlay {
     public:
@@ -39,6 +43,8 @@ namespace lfs::vis::gui {
 
         void onDocumentLoaded(Rml::ElementDocument* document);
         void onDocumentDestroyed();
+        void setViewportGeometry(float origin_x, float origin_y, float width, float height);
+        [[nodiscard]] bool initializeGeometryAfterLayout();
 
         void setState(State state);
         [[nodiscard]] bool isVisible() const noexcept { return state_.visible || state_.perf_hud.visible; }
@@ -82,12 +88,19 @@ namespace lfs::vis::gui {
             VramHudOverlay* owner = nullptr;
             void ProcessEvent(Rml::Event& event) override;
         };
+        struct TimelineListener final : Rml::EventListener {
+            VramHudOverlay* owner = nullptr;
+            void ProcessEvent(Rml::Event& event) override;
+        };
 
         void attachListeners();
         void apply();
         void applyCompactStrip();
         void applySparklines();
         void pushSparklineSample();
+        void pushTimelineSample();
+        void applyTimeline();
+        void exportTimeline();
         [[nodiscard]] bool sparkline_tick_due() const noexcept;
         void applySummary(std::size_t process_used, std::size_t process_total);
         void applyLedger();
@@ -129,6 +142,9 @@ namespace lfs::vis::gui {
         bool ledger_default_collapse_applied_ = false;
 
         Rml::ElementDocument* document_ = nullptr;
+        Rml::Vector2f viewport_origin_{};
+        Rml::Vector2f viewport_size_{};
+        bool has_viewport_geometry_ = false;
         Rml::Element* root_ = nullptr;
         Rml::Element* perf_strip_ = nullptr;
         Rml::Element* perf_card_ = nullptr;
@@ -151,6 +167,21 @@ namespace lfs::vis::gui {
         Rml::Element* spark_ram_root_ = nullptr;
         Rml::Element* spark_gpu_root_ = nullptr;
         Rml::Element* spark_cpu_root_ = nullptr;
+        VramTimelineElement* timeline_element_ = nullptr;
+        VramTimelineElement* mini_timeline_element_ = nullptr;
+        Rml::Element* timeline_legend_ = nullptr;
+        Rml::Element* timeline_axis_ = nullptr;
+        Rml::Element* timeline_x_axis_ = nullptr;
+        Rml::Element* timeline_markers_ = nullptr;
+        Rml::Element* timeline_capacity_ = nullptr;
+        Rml::Element* timeline_tooltip_ = nullptr;
+        Rml::Element* timeline_crosshair_ = nullptr;
+        Rml::Element* peak_root_ = nullptr;
+        Rml::Element* movers_root_ = nullptr;
+        Rml::Element* mover_filter_ = nullptr;
+        Rml::Element* health_ = nullptr;
+        Rml::Element* strip_health_ = nullptr;
+        Rml::Element* export_path_ = nullptr;
         Rml::Element* header_ = nullptr;
         Rml::Element* resize_handle_ = nullptr;
         Rml::Element* filter_input_ = nullptr;
@@ -304,7 +335,9 @@ namespace lfs::vis::gui {
         TabListener tab_listener_;
         AnnoFilterListener anno_filter_listener_;
         AnnoFilterClearListener anno_filter_clear_listener_;
+        TimelineListener timeline_listener_;
         bool listeners_attached_ = false;
+        bool geometry_initialized_ = false;
 
         float pos_x_ = -1.0f;
         float pos_y_ = -1.0f;
@@ -321,6 +354,27 @@ namespace lfs::vis::gui {
         bool pointer_captured_ = false;
         bool geometry_dirty_ = false;
         bool persistence_dirty_ = false;
+        int window_seconds_ = 300;
+        std::uint16_t visible_categories_ = 0x3ff;
+        bool iteration_axis_ = false;
+        bool device_scale_ = false;
+        float opacity_ = 1.0f;
+        int snap_corner_ = 0;
+        bool movers_collapsed_ = false;
+        bool peak_collapsed_ = false;
+        lfs::diagnostics::VramTimeline timeline_;
+        std::array<std::int64_t, lfs::diagnostics::kVramOwnerCount> peak_bytes_{};
+        std::array<std::int64_t, lfs::diagnostics::kVramOwnerCount> category_peaks_{};
+        std::array<std::int64_t, lfs::diagnostics::kVramOwnerCount> baseline_bytes_{};
+        std::size_t peak_process_ = 0;
+        std::size_t peak_splats_ = 0;
+        std::size_t peak_gt_tile_bytes_ = 0;
+        std::unordered_map<std::string, std::size_t> baseline_rows_;
+        std::unordered_map<std::string, std::deque<std::size_t>> mover_history_;
+        std::deque<std::size_t> splat_history_;
+        std::string mover_filter_text_;
+        float timeline_drag_start_x_ = -1.0f;
+        std::int64_t last_timeline_rendered_ms_ = 0;
 
         std::chrono::steady_clock::time_point last_process_sample_{};
         std::chrono::steady_clock::time_point last_sparkline_sample_{};

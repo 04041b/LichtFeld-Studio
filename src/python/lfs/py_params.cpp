@@ -223,7 +223,14 @@ namespace lfs::python {
                 throw std::invalid_argument("Strategy must be 'mcmc', 'mrnf', or 'igs+'");
 
             if (auto* pm = get_parameter_manager()) {
-                pm->modifyActiveParams([&](auto&) { pm->setActiveStrategy(canonical_strategy); });
+                pm->modifyActiveParams([&](auto&) {
+                    pm->setActiveStrategy(canonical_strategy);
+                    // Presets retain independent editable values. A stale GUT
+                    // value in the destination IGS+ slot must not survive a
+                    // GUI/Python-driven strategy reset into an invalid state.
+                    if (canonical_strategy == core::param::kStrategyIGSPlus)
+                        pm->getActiveParams().gut = false;
+                });
             } else {
                 get_default_params() = core::param::OptimizationParameters::defaults_for_strategy(canonical_strategy);
             }
@@ -906,6 +913,11 @@ namespace lfs::python {
                 [](PyOptimizationParams& self) { return self.params().enable_eval; },
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.enable_eval = v; }); },
                 "Enable evaluation during training")
+            .def_prop_rw(
+                "eval_all",
+                [](PyOptimizationParams& self) { return self.params().eval_all; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.eval_all = v; }); },
+                "Train on every image and evaluate all of them; no image is held out")
             .def_prop_rw(
                 "background_improvements",
                 [](PyOptimizationParams& self) { return self.params().background_improvements; },

@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -188,14 +189,45 @@ namespace lfs::training {
         mean_step_r_min_ = r_min;
         mean_step_r_max_ = r_max;
         if (!enabled) {
-            mean_step_far_mask_ = nullptr;
-            mean_step_far_mask_n_ = 0;
+            set_mean_step_far_mask({});
         }
     }
 
-    void AdamOptimizer::set_mean_step_far_mask(const bool* mask, const int n) {
-        mean_step_far_mask_ = mask;
-        mean_step_far_mask_n_ = mask != nullptr ? n : 0;
+    void AdamOptimizer::set_mean_step_far_mask(lfs::core::Tensor mask) {
+        if (!mask.is_valid() || mask.numel() == 0) {
+            mean_step_far_mask_ = nullptr;
+            mean_step_far_mask_n_ = 0;
+            mean_step_far_mask_storage_ = {};
+            return;
+        }
+        LFS_ASSERT_MSG(mask.dtype() == lfs::core::DataType::Bool && mask.ndim() == 1,
+                       "AdamOptimizer mean-step far mask must be a 1D bool tensor");
+        LFS_ASSERT_MSG(mask.numel() <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                       "AdamOptimizer mean-step far mask exceeds the supported row count");
+        // Construct fresh handles: assignment to a view copies into its existing
+        // storage, even for mask = mask.cuda() or mask = mask.clone().
+        auto uploaded = mask.device() == lfs::core::Device::CUDA ? mask : mask.cuda();
+        auto storage = uploaded.is_contiguous() && uploaded.owns_memory()
+                           ? uploaded
+                           : uploaded.clone();
+        const auto* pointer = storage.ptr<bool>();
+        LFS_VALIDATE_CUDA_DEVICE_POINTER(pointer, "mean_step_far_mask");
+        // A raw pointer alone cannot keep a replaced strategy tensor alive.
+        mean_step_far_mask_storage_ = std::move(storage);
+        mean_step_far_mask_ = pointer;
+        mean_step_far_mask_n_ = static_cast<int>(mean_step_far_mask_storage_.numel());
+    }
+
+    void AdamOptimizer::validate_mean_step_far_mask() {
+        const auto& means = splat_data_.means();
+        const size_t n = means.is_valid() && means.ndim() > 0 ? means.shape()[0] : 0;
+        if (mean_step_far_mask_ != nullptr &&
+            (mean_step_far_mask_n_ < 0 || static_cast<size_t>(mean_step_far_mask_n_) != n)) {
+            LOG_WARN("AdamOptimizer: mean_step_far_mask row-count mismatch (mask={}, means={}); "
+                     "ignoring binding until the strategy republishes it",
+                     mean_step_far_mask_n_, n);
+            set_mean_step_far_mask({});
+        }
     }
 
     void AdamOptimizer::set_screen_share_cap(const float* max_share, const int n,
@@ -221,6 +253,7 @@ namespace lfs::training {
 
     void AdamOptimizer::step(const int iteration) {
         LFS_TRACE("kernel.adam.step");
+        validate_mean_step_far_mask();
         refresh_screen_share_buffer();
         if (fused_step_iteration_ == iteration) {
             last_step_zeroed_gradients_ = true;
@@ -310,6 +343,9 @@ namespace lfs::training {
             prepare_contiguous(type);
         }
         if (n_entries > 0) {
+            if (mean_step_far_mask_storage_.is_valid()) {
+                mean_step_far_mask_storage_.sync_to_stream(batch_stream);
+            }
             if (frozen_mask_.is_valid()) {
                 lfs::core::waitForCUDAStream(batch_stream, frozen_mask_.stream());
             }
@@ -767,6 +803,9 @@ namespace lfs::training {
                 throw std::runtime_error("Optimizer state desync: " + name);
             }
             const size_t feature_dim = param_live.numel() / param_size;
+            if (mean_step_far_mask_storage_.is_valid()) {
+                mean_step_far_mask_storage_.sync_to_stream(execution_stream);
+            }
             const float* mean_step_scale_raw = nullptr;
             int mean_step_scale_n = 0;
             if (type == ParamType::Means && per_splat_mean_step_) {
@@ -834,6 +873,10 @@ namespace lfs::training {
     FastGSFusedAdamState AdamOptimizer::prepare_fastgs_fused_adam(
         const int iteration,
         const cudaStream_t execution_stream) {
+        validate_mean_step_far_mask();
+        if (mean_step_far_mask_storage_.is_valid()) {
+            mean_step_far_mask_storage_.sync_to_stream(execution_stream);
+        }
         if (crop_damping_mask_.is_valid()) {
             crop_damping_mask_.sync_to_stream(execution_stream);
         }
@@ -1148,6 +1191,44 @@ namespace lfs::training {
         }
         state.exp_avg.set_stream(stream);
         LFS_CUDA_CHECK(cudaFreeAsync(d_indices, stream));
+    }
+
+    void AdamOptimizer::reset_state_at_indices(ParamType type, const lfs::core::Tensor& indices) {
+        if (!indices.is_valid() || indices.numel() == 0)
+            return;
+        if (indices.ndim() != 1)
+            throw std::runtime_error("reset_state_at_indices: indices must be one-dimensional");
+        if (indices.dtype() != lfs::core::DataType::Int32 &&
+            indices.dtype() != lfs::core::DataType::Int64) {
+            throw std::runtime_error("reset_state_at_indices: indices must be int32 or int64");
+        }
+
+        if (indices.device() == lfs::core::Device::CUDA) {
+            auto device_indices = indices.is_contiguous() ? indices : indices.contiguous();
+            if (device_indices.dtype() != lfs::core::DataType::Int64) {
+                device_indices = device_indices.to(lfs::core::DataType::Int64);
+            }
+            const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+            lfs::core::waitForCUDAStream(stream, device_indices.stream());
+            relocate_params_at_indices_gpu(
+                type, device_indices.ptr<int64_t>(), device_indices.numel());
+            device_indices.set_stream(stream);
+            return;
+        }
+
+        const auto cpu_indices = indices.is_contiguous() ? indices : indices.contiguous();
+        std::vector<int64_t> host_indices;
+        host_indices.reserve(cpu_indices.numel());
+        if (cpu_indices.dtype() == lfs::core::DataType::Int64) {
+            const auto* ptr = cpu_indices.ptr<int64_t>();
+            host_indices.assign(ptr, ptr + cpu_indices.numel());
+        } else {
+            const auto* ptr = cpu_indices.ptr<int32_t>();
+            for (size_t i = 0; i < cpu_indices.numel(); ++i) {
+                host_indices.push_back(static_cast<int64_t>(ptr[i]));
+            }
+        }
+        reset_state_at_indices(type, host_indices);
     }
 
     void AdamOptimizer::extend_state_by_gather(ParamType type, const lfs::core::Tensor& indices) {

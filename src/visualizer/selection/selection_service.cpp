@@ -18,9 +18,11 @@
 #include "rendering/model_renderability.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "rendering/selection_ops.hpp"
+#include "rendering/viewport_request_builder.hpp"
 #include "scene/scene_manager.hpp"
 #include "selection_group_mask.hpp"
 #include "training/training_manager.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer_impl.hpp"
 #include <algorithm>
 #include <array>
@@ -259,10 +261,12 @@ namespace lfs::vis {
             if (!scene_manager) {
                 return 0;
             }
-            if (const auto* const model = scene_manager->getModelForRendering()) {
+            // A count query can use an existing aggregate without starting one.
+            const auto& scene = scene_manager->getScene();
+            if (const auto* model = scene.peekCombinedModel()) {
                 return static_cast<size_t>(model->size());
             }
-            return scene_manager->getScene().getTotalGaussianCount();
+            return scene.getTotalGaussianCount();
         }
 
         [[nodiscard]] const core::Tensor* selectionMaskForSize(
@@ -1232,7 +1236,7 @@ namespace lfs::vis {
         }
 
         auto& scene = scene_manager_->getScene();
-        auto* const model = scene.getCombinedModel();
+        const auto* const model = scene.getCombinedModel();
         if (!model) {
             return {false, 0, "No model"};
         }
@@ -1628,7 +1632,83 @@ namespace lfs::vis {
         }
 
         auto render_lock = acquireLiveModelRenderLock(scene_manager_);
-        auto scene_state = scene_manager_->buildRenderState();
+        SceneRenderState scene_state;
+        std::shared_ptr<core::Tensor> screen_positions;
+        if (rendering_manager_->isPLYComparisonActive()) {
+            scene_state = scene_manager_->buildRenderState({.metadata_only = true});
+            const auto& scene = scene_manager_->getScene();
+            const auto sample = resolvePlyComparisonDepthSample(
+                scene, settings.split_view_offset, context.panel);
+            ScreenPositionCacheKey key{
+                .valid = true,
+                .signature = makeScreenPositionCacheSignature(
+                    scene_state,
+                    viewport,
+                    settings.equirectangular,
+                    rendering_manager_->getViewportProjectionGeneration()),
+            };
+            hashCombine(
+                key.signature,
+                sample.uses_owned_node_model ? reinterpret_cast<std::size_t>(sample.model) : 0u);
+            if (viewport_screen_position_keys_[panel_index] == key &&
+                viewport_screen_positions_[panel_index] &&
+                viewport_screen_positions_[panel_index]->is_valid()) {
+                return viewport_screen_positions_[panel_index];
+            }
+
+            if (sample.uses_owned_node_model && sample.node &&
+                hasRenderableGaussians(sample.model)) {
+                std::vector<glm::mat4> node_transforms{
+                    scene_coords::nodeVisualizerWorldTransform(scene, sample.node->id)};
+                auto local_positions = projectGaussianScreenPositions(
+                    *sample.model,
+                    viewport,
+                    settings.equirectangular,
+                    {.model_transforms = &node_transforms,
+                     .transform_indices = nullptr,
+                     .node_visibility_mask = {}});
+                const size_t visible_count = scene.getTotalGaussianCount();
+                const size_t local_count =
+                    local_positions && local_positions->is_valid()
+                        ? static_cast<size_t>(local_positions->size(0))
+                        : 0;
+                size_t gaussian_offset = 0;
+                bool found_node = false;
+                for (const auto& slot : scene.getVisibleSplatNodeSlots()) {
+                    if (!slot.node) {
+                        continue;
+                    }
+                    if (slot.node->id == sample.node->id) {
+                        found_node = true;
+                        break;
+                    }
+                    const size_t slot_count =
+                        slot.node->model
+                            ? static_cast<size_t>(slot.node->model->size())
+                            : slot.node->gaussian_count.load(std::memory_order_acquire);
+                    gaussian_offset += slot_count;
+                }
+                if (found_node && local_count > 0 &&
+                    gaussian_offset + local_count <= visible_count &&
+                    local_positions->ndim() == 2 && local_positions->size(1) == 2) {
+                    auto expanded = core::Tensor::full(
+                        {visible_count, size_t{2}},
+                        INVALID_SCREEN_POSITION,
+                        local_positions->device(),
+                        core::DataType::Float32);
+                    expanded.slice(0, gaussian_offset, gaussian_offset + local_count).copy_(*local_positions);
+                    screen_positions = std::make_shared<core::Tensor>(std::move(expanded));
+                    viewport_screen_positions_[panel_index] = screen_positions;
+                    viewport_screen_position_keys_[panel_index] = key;
+                    return screen_positions;
+                }
+            }
+            // Owned-panel projection was not possible (consolidated nodes, empty
+            // panel, or a projection failure). Hover must still work, so fall
+            // through to the production combined-model path.
+        }
+
+        scene_state = scene_manager_->buildRenderState();
         if (!hasRenderableGaussians(scene_state.combined_model)) {
             viewport_screen_positions_[panel_index].reset();
             viewport_screen_position_keys_[panel_index] = {};
@@ -1649,7 +1729,7 @@ namespace lfs::vis {
             return viewport_screen_positions_[panel_index];
         }
 
-        auto screen_positions = projectGaussianScreenPositions(
+        screen_positions = projectGaussianScreenPositions(
             *scene_state.combined_model,
             viewport,
             settings.equirectangular,
@@ -1676,6 +1756,7 @@ namespace lfs::vis {
 
         cancelInteractiveSelection();
 
+        passive_hover_suppressed_ = false;
         interactive_selection_ = {};
         interactive_selection_.active = true;
         interactive_selection_.shape = shape;
@@ -1937,6 +2018,8 @@ namespace lfs::vis {
         if (!scene_manager_ || !rendering_manager_ || interactive_selection_.active) {
             return;
         }
+        if (!allowPassiveHoverPreview(cursor_pos))
+            return;
 
         const auto context = resolveViewerViewportContext(cursor_pos);
         if (!context || !context->valid()) {
@@ -2055,6 +2138,8 @@ namespace lfs::vis {
                                                           const SelectionMode mode) {
         if (!scene_manager_ || !rendering_manager_ || interactive_selection_.active)
             return;
+        if (!allowPassiveHoverPreview(cursor_pos))
+            return;
 
         const auto context = resolveViewerViewportContext(cursor_pos);
         if (!context || !context->valid()) {
@@ -2069,6 +2154,21 @@ namespace lfs::vis {
         rendering_manager_->setCursorPreviewState(
             true, render_cursor.x, render_cursor.y, render_radius,
             mode != SelectionMode::Remove, nullptr, false, 0.0f, context->panel, -1, false);
+    }
+
+    void SelectionService::suppressPassiveHoverPreview() {
+        passive_hover_suppressed_ = last_passive_hover_position_.has_value();
+        if (rendering_manager_) {
+            rendering_manager_->clearCursorPreviewState();
+            rendering_manager_->clearPreviewSelection();
+        }
+    }
+
+    bool SelectionService::allowPassiveHoverPreview(const glm::vec2 cursor_pos) {
+        if (last_passive_hover_position_ != cursor_pos)
+            passive_hover_suppressed_ = false;
+        last_passive_hover_position_ = cursor_pos;
+        return !passive_hover_suppressed_;
     }
 
     void SelectionService::refreshInteractivePreview() {
@@ -2685,11 +2785,25 @@ namespace lfs::vis {
             selection_out = resetBoolScratchBuffer(session.working_selection, total);
             success = buildPolygonSelection(session.points, selection_out);
             break;
-        case SelectionShape::Rings:
-            selection_out = resetBoolScratchBuffer(session.working_selection, total);
-            success = buildRingSelection(
-                session.cursor_pos, selection_out, true, !include_polygon_cursor, picked_ring_id_out);
+        case SelectionShape::Rings: {
+            if (!session.working_selection.is_valid() || session.working_selection.numel() != total) {
+                (void)resetBoolScratchBuffer(session.working_selection, total);
+                session.ring_has_hit = false;
+            }
+            auto& hit = resetBoolScratchBuffer(session.live_delta_selection, total);
+            int picked_ring_id = -1;
+            if (buildRingSelection(session.cursor_pos, hit, true, false, &picked_ring_id)) {
+                applyFilters(hit, session.filters, effectiveNodeMask(session.filters.restrict_to_selected_nodes));
+                rendering::merge_selection_mask_or(session.working_selection, hit);
+                session.ring_has_hit |= picked_ring_id >= 0;
+            }
+            if (picked_ring_id_out) {
+                *picked_ring_id_out = picked_ring_id;
+            }
+            selection_out = session.working_selection;
+            success = session.ring_has_hit;
             break;
+        }
         case SelectionShape::Box:
         case SelectionShape::Sphere:
             selection_out = resetBoolScratchBuffer(session.working_selection, total);

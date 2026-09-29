@@ -19,6 +19,7 @@ namespace lfs::training::sh_value {
     class ShNMutationBatch;
 }
 
+class MRNFStrategyTest_PermutationRepublishesFarMask_Test;
 class MRNFStrategyTest_EdgeGuidanceFactorPrefersHigherPrecomputedEdgeScores_Test;
 class MRNFStrategyTest_GrowAndSplitResetsOptimizerStateForParents_Test;
 class MRNFStrategyTest_SHDegree0KeepsShNEmptyAndFusedAdamUsableAfterGrowth_Test;
@@ -28,6 +29,7 @@ class MRNFStrategyTest_GrowAndSplitWithoutMaxCapExtendsBookkeepingMasks_Test;
 class MRNFStrategyTest_DeletedMaskCapacityGrowthPreservesExistingRows_Test;
 class MRNFStrategyTest_GrowAndSplitReplacementSkipsZeroWeightCandidates_Test;
 class MRNFStrategyTest_GrowAndSplitReusesFreeSlotsBeforeAppending_Test;
+class MRNFStrategyTest_ChunkedChildPlacementMatchesSingleChunk_Test;
 class MRNFStrategyTest_SerializeRoundTripPreservesFreeMask_Test;
 class MRNFStrategyTest_SerializeRoundTripPreservesLrScheduleState_Test;
 class MRNFStrategyTest_DeserializeResizesTransientBuffersToLoadedModel_Test;
@@ -110,10 +112,13 @@ namespace lfs::training {
         void reserve_optimizer_capacity(size_t capacity) override;
         void set_optimization_params(const lfs::core::param::OptimizationParameters& params) override;
         void set_training_dataset(std::shared_ptr<CameraDataset> views) override;
+        std::shared_ptr<CameraDataset> get_training_dataset() const override { return _views; }
         lfs::core::Tensor edge_score_scratch(int iter) override;
         void on_edge_score_accumulated(int iter) override;
+        bool reads_render_depth(int iter) const override;
 
     private:
+        friend class ::MRNFStrategyTest_PermutationRepublishesFarMask_Test;
         friend class ::MRNFStrategyTest_EdgeWindowNormalizesViewsAndClosesBeforeRefineBackward_Test;
         friend class ::MRNFStrategyTest_EdgeGuidanceFactorPrefersHigherPrecomputedEdgeScores_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitResetsOptimizerStateForParents_Test;
@@ -124,6 +129,7 @@ namespace lfs::training {
         friend class ::MRNFStrategyTest_DeletedMaskCapacityGrowthPreservesExistingRows_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitReplacementSkipsZeroWeightCandidates_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitReusesFreeSlotsBeforeAppending_Test;
+        friend class ::MRNFStrategyTest_ChunkedChildPlacementMatchesSingleChunk_Test;
         friend class ::MRNFStrategyTest_SerializeRoundTripPreservesFreeMask_Test;
         friend class ::MRNFStrategyTest_SerializeRoundTripPreservesLrScheduleState_Test;
         friend class ::MRNFStrategyTest_DeserializeResizesTransientBuffersToLoadedModel_Test;
@@ -159,7 +165,13 @@ namespace lfs::training {
 
         void refine(int iter, RenderOutput& render_output);
         void grow_and_split(int iter, int pruned_count);
+        // Splits the given parents and places their children (free slots first,
+        // then appended rows) in chunks of at most chunk_rows children.
+        // Returns {children placed in free slots, children appended}.
+        std::pair<size_t, size_t> split_parents_into_children(const lfs::core::Tensor& split_indices,
+                                                              size_t chunk_rows);
         [[nodiscard]] int effective_grow_until_iter() const;
+        [[nodiscard]] bool screen_share_shrink_active(int iter) const;
         [[nodiscard]] lfs::core::Tensor compute_refine_candidates() const;
         void apply_decay(int iter);
         void inject_noise(int iter);
@@ -285,7 +297,6 @@ namespace lfs::training {
 
         DensifyNScratch _densify_n_scratch;
         GumbelTopKScratch _gumbel_scratch;
-        PositiveMedianScratch _median_scratch;
         lfs::core::Tensor _refine_counts_dev;
 
         std::size_t _strategy_required_peak_bytes = 0;

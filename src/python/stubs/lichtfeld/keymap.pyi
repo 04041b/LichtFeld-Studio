@@ -173,6 +173,12 @@ class Action(enum.Enum):
 
     GROUP_SELECTED_SCENE_NODES = 85
 
+    ASSET_GALLERY_PRIMARY = 87
+
+    ASSET_GALLERY_COPY_LINK = 88
+
+    ASSET_REFRESH = 89
+
     UNGROUP_SELECTED_SCENE_NODE = 86
 
 class ToolMode(enum.Enum):

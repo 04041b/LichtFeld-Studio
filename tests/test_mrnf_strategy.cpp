@@ -28,13 +28,21 @@ class MRNFStrategyTest_DirectAuxiliaryGrowthPreservesPrefix_Test;
 class MRNFStrategyTest_EdgeWindowNormalizesViewsAndClosesBeforeRefineBackward_Test;
 
 #include "core/camera.hpp"
+#include "core/cuda/memory_arena.hpp"
 #include "core/cuda/sh_layout.cuh"
+#include "core/logger.hpp"
 #include "core/parameters.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/tensor_ops.hpp"
+#include "io/formats/ply.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
+#include "lfs/training/live_model_mutation_guard.hpp"
 #include "lfs/training/mean_step_scale.cuh"
 #include "lfs/training/sh_value_codec.hpp"
+#include "lfs/training/sh_value_storage.hpp"
+#include "training/checkpoint.hpp"
 #include "training/dataset.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
 #include "training/optimizer/render_output.hpp"
@@ -50,11 +58,251 @@ class MRNFStrategyTest_EdgeWindowNormalizesViewsAndClosesBeforeRefineBackward_Te
 #include <gtest/gtest.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <vector>
 
 using namespace lfs::core;
 using namespace lfs::training;
+
+TEST(MRNFStrategyTest, PruneBoundsOrMatchesTensorChain) {
+    constexpr size_t n = 513;
+    std::vector<float> means_values(n * 3);
+    std::vector<float> scale_values(n);
+    for (size_t i = 0; i < n; ++i) {
+        means_values[3 * i] = static_cast<float>(static_cast<int>(i % 13) - 6);
+        means_values[3 * i + 1] = static_cast<float>(static_cast<int>(i % 7) - 3);
+        means_values[3 * i + 2] = static_cast<float>(static_cast<int>(i % 5) - 2);
+        scale_values[i] = static_cast<float>(static_cast<int>(i % 11) - 5) * 0.4f;
+    }
+    means_values[3] = std::numeric_limits<float>::quiet_NaN();
+    means_values[4] = 100.0f;
+    means_values[6] = std::numeric_limits<float>::infinity();
+    scale_values[7] = std::numeric_limits<float>::quiet_NaN();
+
+    const auto means = Tensor::from_vector(means_values, TensorShape({n, 3}), Device::CUDA);
+    const auto scale_max = Tensor::from_vector(scale_values, TensorShape({n}), Device::CUDA);
+    const auto initial = scale_max < -1.0f;
+    auto actual = initial.clone();
+    constexpr float center_values[3] = {0.25f, -0.5f, 0.75f};
+    const auto center = Tensor::from_vector(
+        std::vector<float>{center_values[0], center_values[1], center_values[2]},
+        TensorShape({1, 3}), Device::CUDA);
+    const auto expected = initial | (scale_max > 1.25f) |
+                          ((means - center).abs().max(1) > 3.5f);
+
+    mrnf_strategy::launch_prune_bounds_or(
+        means.ptr<float>(), scale_max.ptr<float>(), actual.ptr<bool>(),
+        n, center_values, 3.5f, 1.25f);
+    const auto actual_host = actual.cpu();
+    const auto expected_host = expected.cpu();
+    EXPECT_EQ(std::memcmp(actual_host.ptr<bool>(), expected_host.ptr<bool>(), n * sizeof(bool)), 0);
+}
+
+TEST(MRNFStrategyTest, ReplaceParentWeightsMatchesTensorProducts) {
+    constexpr size_t n = 513;
+    std::vector<float> opacity_values(n);
+    std::vector<float> visibility_values(n);
+    std::vector<float> edge_values(n);
+    std::vector<bool> active_values(n);
+    std::vector<bool> trainable_values(n);
+    for (size_t i = 0; i < n; ++i) {
+        opacity_values[i] = static_cast<float>(i % 17) / 16.0f;
+        visibility_values[i] = i % 3 == 0 ? 0.0f : static_cast<float>(i % 5);
+        edge_values[i] = 0.5f + static_cast<float>(i % 11) / 10.0f;
+        active_values[i] = i % 7 != 0;
+        trainable_values[i] = i % 13 != 0;
+    }
+    opacity_values[1] = std::numeric_limits<float>::quiet_NaN();
+    opacity_values[2] = std::numeric_limits<float>::infinity();
+    opacity_values[3] = -0.0f;
+    edge_values[4] = std::numeric_limits<float>::quiet_NaN();
+    edge_values[5] = -0.0f;
+
+    const auto opacities = Tensor::from_vector(opacity_values, TensorShape({n}), Device::CUDA);
+    const auto visibility = Tensor::from_vector(visibility_values, TensorShape({n}), Device::CUDA);
+    const auto active = Tensor::from_vector(active_values, TensorShape({n}), Device::CUDA);
+    const auto trainable = Tensor::from_vector(trainable_values, TensorShape({n}), Device::CUDA);
+    const auto edge = Tensor::from_vector(edge_values, TensorShape({n}), Device::CUDA);
+
+    for (int options = 0; options < 8; ++options) {
+        auto expected = opacities * (visibility > 0.0f);
+        if (options & 1)
+            expected = expected * active;
+        if (options & 2)
+            expected = expected * trainable;
+        if (options & 4)
+            expected = expected * edge;
+
+        auto actual = Tensor::empty({n}, Device::CUDA);
+        mrnf_strategy::launch_replace_parent_weights(
+            opacities.ptr<float>(), visibility.ptr<float>(),
+            options & 1 ? active.ptr<bool>() : nullptr,
+            options & 2 ? trainable.ptr<bool>() : nullptr,
+            options & 4 ? edge.ptr<float>() : nullptr,
+            actual.ptr<float>(), n);
+        const auto actual_host = actual.cpu();
+        const auto expected_host = expected.cpu();
+        EXPECT_EQ(std::memcmp(actual_host.ptr<float>(), expected_host.ptr<float>(), n * sizeof(float)), 0)
+            << "options=" << options;
+    }
+}
+
+namespace {
+    // The largest trained splat model in the test data folder.
+    std::filesystem::path largest_scene_ply() {
+        std::filesystem::path best;
+        std::uintmax_t best_size = 0;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(TEST_DATA_DIR, ec)) {
+            if (entry.path().extension() != ".ply" || !entry.is_regular_file(ec))
+                continue;
+            const auto size = entry.file_size(ec);
+            if (!ec && size > best_size) {
+                best = entry.path();
+                best_size = size;
+            }
+        }
+        return best;
+    }
+} // namespace
+
+TEST(MRNFStrategyTest, RefinePredicatesAndIndicesMatchTensorReferenceOnRealScene) {
+    const auto scene = largest_scene_ply();
+    if (scene.empty())
+        GTEST_SKIP() << "no splat model in " << TEST_DATA_DIR;
+    const auto loaded = lfs::io::load_ply(scene);
+    ASSERT_TRUE(loaded.has_value()) << lfs::format_for_developer(loaded.error());
+    const SplatData& splat = loaded->value;
+    const size_t n = static_cast<size_t>(splat.size());
+    ASSERT_GT(n, 100000u);
+    const auto means = splat.means();
+    const auto scale_max = splat.scaling_raw().max(1);
+    const auto initial = splat.opacity_raw().squeeze(-1) < -2.0f;
+    const auto center_host = means.slice(0, 0, 1).contiguous().cpu();
+    const float center_values[3] = {center_host.ptr<float>()[0], center_host.ptr<float>()[1],
+                                    center_host.ptr<float>()[2]};
+    const auto center = Tensor::from_vector(
+        std::vector<float>{center_values[0], center_values[1], center_values[2]},
+        TensorShape({1, 3}), Device::CUDA);
+    auto opacities = splat.get_opacity().squeeze(-1);
+    const auto visibility = (scale_max > -10.0f).to(DataType::Float32);
+    const auto active = means.slice(1, 0, 1).squeeze(-1) > center_values[0];
+    const auto trainable = means.slice(1, 1, 2).squeeze(-1) > center_values[1];
+    const auto edge = scale_max.abs() + 0.25f;
+
+    for (const float max_allowed : {1.0f, 5.0f, 20.0f, 100.0f}) {
+        const float log_max_allowed = std::log(max_allowed);
+        auto actual_mask = initial.clone();
+        const auto reference_mask = initial | (scale_max > log_max_allowed) |
+                                    ((means - center).abs().max(1) > max_allowed);
+        mrnf_strategy::launch_prune_bounds_or(
+            means.ptr<float>(), scale_max.ptr<float>(), actual_mask.ptr<bool>(),
+            n, center_values, max_allowed, log_max_allowed);
+        const auto actual_mask_host = actual_mask.cpu();
+        const auto reference_mask_host = reference_mask.cpu();
+        EXPECT_EQ(std::memcmp(actual_mask_host.ptr<bool>(), reference_mask_host.ptr<bool>(), n), 0);
+
+        const size_t count = actual_mask.count_nonzero();
+        const auto reference_indices = actual_mask.nonzero().squeeze(-1);
+        auto indices = Tensor::empty({count}, Device::CUDA, DataType::Int64);
+        indices.set_stream(actual_mask.stream());
+        const size_t actual_count = tensor_ops::launch_nonzero_bool(
+            actual_mask.ptr<unsigned char>(), indices.ptr<int64_t>(), n, count,
+            actual_mask.stream());
+        ASSERT_EQ(actual_count, count);
+        ASSERT_EQ(reference_indices.numel(), count);
+        if (count) {
+            const auto indices_host = indices.cpu();
+            const auto reference_host = reference_indices.cpu();
+            EXPECT_EQ(std::memcmp(indices_host.ptr<int64_t>(), reference_host.ptr<int64_t>(),
+                                  count * sizeof(int64_t)),
+                      0);
+        }
+
+        const auto expected_weights = opacities * (visibility > 0.0f) * active * trainable * edge;
+        auto actual_weights = Tensor::empty({n}, Device::CUDA);
+        mrnf_strategy::launch_replace_parent_weights(
+            opacities.ptr<float>(), visibility.ptr<float>(), active.ptr<bool>(),
+            trainable.ptr<bool>(), edge.ptr<float>(), actual_weights.ptr<float>(), n);
+        const auto actual_weights_host = actual_weights.cpu();
+        const auto expected_weights_host = expected_weights.cpu();
+        EXPECT_EQ(std::memcmp(actual_weights_host.ptr<float>(), expected_weights_host.ptr<float>(),
+                              n * sizeof(float)),
+                  0);
+    }
+}
+
+TEST(MRNFStrategyTest, ShNBatchArenaMatchesCatFallbackOnRealScene) {
+    struct QuantReset {
+        ~QuantReset() { sh_value::set_sh_value_quant_enabled_for_testing(std::nullopt); }
+    } reset;
+    sh_value::set_sh_value_quant_enabled_for_testing(true);
+    const auto scene = largest_scene_ply();
+    if (scene.empty())
+        GTEST_SKIP() << "no splat model in " << TEST_DATA_DIR;
+    auto loaded = lfs::io::load_ply(scene);
+    ASSERT_TRUE(loaded.has_value()) << lfs::format_for_developer(loaded.error());
+    SplatData base = std::move(loaded->value);
+    ASSERT_TRUE(sh_value::apply_shN_value_quant(base));
+    const size_t n = static_cast<size_t>(base.size());
+    constexpr size_t kScatter = 3000;
+    constexpr size_t kZero = 700;
+    ASSERT_GT(n, kScatter);
+    std::vector<int> src_host(kScatter), dest_host(kScatter), zero_host(kZero);
+    for (size_t i = 0; i < kScatter; ++i) {
+        src_host[i] = static_cast<int>((113 * i + 17) % n);
+        dest_host[i] = static_cast<int>((67 * i + 5) % n);
+    }
+    for (size_t i = 0; i < kZero; ++i)
+        zero_host[i] = static_cast<int>((67 * i + 6) % n);
+    const auto src_indices = Tensor::from_vector(src_host, TensorShape({kScatter}), Device::CUDA)
+                                 .to(DataType::Int64);
+    const auto dest_indices = Tensor::from_vector(dest_host, TensorShape({kScatter}), Device::CUDA)
+                                  .to(DataType::Int64);
+    const auto zero_indices = Tensor::from_vector(zero_host, TensorShape({kZero}), Device::CUDA)
+                                  .to(DataType::Int64);
+    Tensor canonical;
+    sh_value::gather_shN_to_canonical(base, src_indices, canonical);
+    ASSERT_EQ(canonical.shape()[0], kScatter);
+
+    auto arena_splat = base.clone();
+    auto fallback_splat = base.clone();
+    auto& arena = GlobalArenaManager::instance().get_arena();
+    const cudaStream_t stream = getCurrentCUDAStream();
+    const size_t rows = kScatter + kZero;
+    const size_t bytes = ((rows * sizeof(int64_t) + 255) & ~size_t{255}) +
+                         rows * static_cast<size_t>(base.max_sh_coeffs_rest()) * 3 * sizeof(float);
+    {
+        const auto frame = arena.begin_frame(stream);
+        ASSERT_NE(arena.get_allocator(frame, "test.shN_batch")(bytes + 4096), nullptr);
+        arena.end_frame(frame, stream);
+    }
+    ASSERT_GE(arena.get_memory_info().arena_capacity, bytes);
+
+    const auto flush = [&](SplatData& splat) {
+        LiveModelMutationGuard guard("test.shN_batch");
+        sh_value::ShNMutationBatch batch(splat);
+        batch.scatter(dest_indices, canonical);
+        batch.zero(zero_indices);
+        batch.flush();
+    };
+    flush(arena_splat);
+    EXPECT_GT(arena.get_memory_info().current_usage, 0u);
+    const auto held = arena.begin_frame(stream);
+    flush(fallback_splat);
+    arena.end_frame(held, stream);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    const auto arena_codes = arena_splat.shN().cpu().contiguous();
+    const auto fallback_codes = fallback_splat.shN().cpu().contiguous();
+    const auto arena_bounds = arena_splat.shN_value_bounds().cpu().contiguous();
+    const auto fallback_bounds = fallback_splat.shN_value_bounds().cpu().contiguous();
+    ASSERT_EQ(arena_codes.bytes(), fallback_codes.bytes());
+    ASSERT_EQ(arena_bounds.bytes(), fallback_bounds.bytes());
+    EXPECT_EQ(std::memcmp(arena_codes.data_ptr(), fallback_codes.data_ptr(), arena_codes.bytes()), 0);
+    EXPECT_EQ(std::memcmp(arena_bounds.data_ptr(), fallback_bounds.data_ptr(), arena_bounds.bytes()), 0);
+}
 
 namespace {
 
@@ -372,6 +620,46 @@ TEST(MRNFStrategyTest, DegenerateBoundsStayInvalidAndKeepFiniteMeanLearningRate)
     const float mean_lr = strategy.get_optimizer().get_param_lr(ParamType::Means);
     EXPECT_TRUE(std::isfinite(mean_lr));
     EXPECT_GT(mean_lr, 0.0f);
+}
+
+TEST(MRNFStrategyTest, RefinementPreservesThinSurfacesAndPrunesCollapsedSplats) {
+    auto splat_data = create_mrnf_test_splat_data(8);
+    MRNF strategy(splat_data);
+    auto opt_params = vanilla_mrnf_params();
+    opt_params.iterations = 1'000;
+    opt_params.start_refine = 0;
+    opt_params.stop_refine = 900;
+    opt_params.refine_every = 10;
+    opt_params.grow_until_iter = 0;
+    opt_params.grow_fraction = 0.0f;
+    opt_params.max_cap = 32;
+    strategy.initialize(opt_params);
+
+    // Flattening may shrink any normal axis below the minimum extent while
+    // leaving a useful surface. Only a splat tiny in every axis is collapsed.
+    splat_data.scaling_raw().copy_(Tensor::from_vector(
+        std::vector<float>{-30, 0, 0, 0, -30, 0, 0, 0, -30,
+                           -30, -30, -30, 0, 0, 0, 0, 0, 0,
+                           20, 20, 20, 0, 0, 0},
+        TensorShape({8, 3}), Device::CUDA));
+    splat_data.opacity_raw().copy_(Tensor::from_vector(
+        std::vector<float>{0, 0, 0, 0, -20, 0, 0, 0},
+        TensorShape({8, 1}), Device::CUDA));
+    splat_data.rotation_raw().index_put_(
+        Tensor::from_vector(std::vector<int>{5}, TensorShape({1}), Device::CUDA).to(DataType::Int64),
+        Tensor::zeros({1, 4}, Device::CUDA));
+    splat_data._densification_info.zero_();
+
+    RenderOutput render_output;
+    strategy.post_backward(10, render_output);
+
+    ASSERT_EQ(splat_data.size(), 8u);
+    ASSERT_TRUE(splat_data.deleted().is_valid());
+    const auto deleted_cpu = splat_data.deleted().cpu();
+    const bool* deleted = deleted_cpu.ptr<bool>();
+    for (size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(deleted[i], i >= 3 && i <= 6) << "splat " << i;
+    }
 }
 
 TEST(MRNFStrategyTest, LineBoundsUseFiniteSceneScaleForMeanLearningRate) {
@@ -1419,7 +1707,7 @@ TEST(MRNFStrategyTest, FarDecayScaleAppliesOnlyToFarUnfrozenRows) {
     const auto expected_raw = [](const float raw, const float decay, const float train_t) {
         const float opac = 1.0f / (1.0f + std::exp(-raw));
         float next = opac - decay * (1.0f - train_t);
-        next = std::min(std::max(next, 1e-12f), 1.0f - 1e-12f);
+        next = std::min(std::max(next, 1e-12f), std::nextafter(1.0f, 0.0f));
         return std::log(next / (1.0f - next));
     };
     const auto expected_log_s = [](const float log_s, const float decay, const float train_t) {
@@ -1941,4 +2229,574 @@ TEST(MRNFStrategyTest, BackgroundImprovementsOnKeepsProfileMechanisms) {
     EXPECT_FLOAT_EQ(strategy.effective_far_growth_cap(), kFarGrowthCap);
     EXPECT_FLOAT_EQ(strategy.effective_far_decay_scale(), kFarDecayScale);
     EXPECT_FLOAT_EQ(strategy.effective_mean_step_ratio_max(), kPerSplatMeanStepRatioMax);
+}
+
+TEST(MRNFStrategyTest, PermutationRepublishesFarMask) {
+    auto splat = create_mrnf_test_splat_data(4, 0);
+    auto params = vanilla_mrnf_params();
+    params.background_improvements = true;
+    params.max_cap = 8;
+    MRNF strategy(splat);
+    strategy.initialize(params);
+    strategy._camera_hull_valid = true;
+    strategy._far_field_mask = Tensor::from_vector(
+                                   std::vector<int>{0, 1, 0, 1}, TensorShape({4}), Device::CUDA)
+                                   .to(DataType::Bool);
+    strategy._far_growth.outside_mask = strategy._far_field_mask;
+    strategy.publish_mean_step_far_mask();
+    auto& optimizer = strategy.get_optimizer();
+    ASSERT_EQ(optimizer.mean_step_far_mask(), strategy._far_field_mask.ptr<bool>());
+    ASSERT_EQ(optimizer.mean_step_far_mask_n(), 4);
+    // Keep the old allocation alive so allocator reuse cannot hide a stale pointer.
+    const auto old_mask = strategy._far_field_mask;
+    const auto permutation = Tensor::from_vector(
+                                 std::vector<int>{1, 3, 0, 2}, TensorShape({4}), Device::CUDA)
+                                 .to(DataType::Int64);
+
+    strategy.permute_gaussian_rows(permutation);
+
+    EXPECT_NE(strategy._far_field_mask.ptr<bool>(), old_mask.ptr<bool>());
+    EXPECT_EQ(optimizer.mean_step_far_mask(), strategy._far_field_mask.ptr<bool>());
+    EXPECT_EQ(optimizer.mean_step_far_mask_n(), strategy._far_field_mask.numel());
+    EXPECT_EQ(strategy._far_growth.outside_mask.ptr<bool>(), strategy._far_field_mask.ptr<bool>());
+    const auto reordered = strategy._far_field_mask.cpu();
+    const bool* values = reordered.ptr<bool>();
+    EXPECT_TRUE(values[0]);
+    EXPECT_TRUE(values[1]);
+    EXPECT_FALSE(values[2]);
+    EXPECT_FALSE(values[3]);
+
+    // A hull refresh with no cameras must clear the borrowed pointer immediately.
+    strategy.refresh_camera_hull();
+    EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+    EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+
+    strategy._camera_hull_valid = true;
+    strategy.publish_mean_step_far_mask();
+    params.background_improvements = false;
+    strategy._params = std::make_unique<const param::OptimizationParameters>(params);
+    strategy.refresh_camera_hull();
+    EXPECT_FALSE(strategy._far_field_mask.is_valid());
+    EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+    EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+}
+
+TEST(MRNFStrategyTest, HardRemovalRepublishesFarMaskForDegenerateModel) {
+    auto splat = create_mrnf_test_splat_data(4, 0);
+    auto params = vanilla_mrnf_params();
+    params.background_improvements = true;
+    params.far_scene_min_fraction = 0.0f;
+    params.max_cap = 8;
+    MRNF strategy(splat);
+    strategy.initialize(params);
+    install_test_camera_hull(strategy);
+    auto& optimizer = strategy.get_optimizer();
+    ASSERT_TRUE(optimizer.per_splat_mean_step());
+    ASSERT_NE(optimizer.mean_step_far_mask(), nullptr);
+    ASSERT_EQ(optimizer.mean_step_far_mask_n(), 4);
+
+    // Keep the far row, whose label differs from the old first row.
+    const auto remove = Tensor::from_vector(
+                            std::vector<int>{1, 1, 1, 0}, TensorShape({4}), Device::CUDA)
+                            .to(DataType::Bool);
+    strategy.remove_gaussians(remove);
+    ASSERT_EQ(splat.size(), 1);
+    ASSERT_NE(optimizer.mean_step_far_mask(), nullptr);
+    ASSERT_EQ(optimizer.mean_step_far_mask_n(), splat.means().shape()[0]);
+    bool far = false;
+    ASSERT_EQ(cudaMemcpy(&far, optimizer.mean_step_far_mask(), sizeof(far),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(far);
+
+    optimizer.get_grad(ParamType::Means).fill_(0.2f);
+    EXPECT_NO_THROW(optimizer.step(1));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_EQ(optimizer.mean_step_far_mask_n(), splat.means().shape()[0]);
+    EXPECT_LT(splat.means().cpu().ptr<float>()[0], 3.0f);
+    const auto fused = optimizer.prepare_fastgs_fused_adam(2, nullptr);
+    EXPECT_EQ(fused.mean_step_far_mask, optimizer.mean_step_far_mask());
+    EXPECT_EQ(fused.mean_step_far_mask_n, 1);
+}
+
+TEST(MRNFStrategyTest, DeserializeRepublishesFarMaskWithDegenerateBounds) {
+    auto params = vanilla_mrnf_params();
+    params.background_improvements = true;
+    params.far_scene_min_fraction = 0.0f;
+    params.max_cap = 8;
+    auto source_splat = create_mrnf_test_splat_data(1, 0);
+    source_splat.means().fill_(3.0f);
+    MRNF source(source_splat);
+    source.initialize(params);
+    install_test_camera_hull(source);
+    std::stringstream checkpoint;
+    source_splat.serialize(checkpoint);
+    source.serialize(checkpoint);
+    checkpoint.seekg(0);
+
+    auto splat = create_mrnf_test_splat_data(1, 0);
+    MRNF restored(splat);
+    restored.initialize(params);
+    install_test_camera_hull(restored);
+    auto& optimizer = restored.get_optimizer();
+    ASSERT_NE(optimizer.mean_step_far_mask(), nullptr);
+    bool far = true;
+    ASSERT_EQ(cudaMemcpy(&far, optimizer.mean_step_far_mask(), sizeof(far),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_FALSE(far);
+
+    splat.deserialize(checkpoint);
+    restored.deserialize(checkpoint);
+    ASSERT_NE(optimizer.mean_step_far_mask(), nullptr);
+    ASSERT_EQ(optimizer.mean_step_far_mask_n(), splat.means().shape()[0]);
+    ASSERT_EQ(cudaMemcpy(&far, optimizer.mean_step_far_mask(), sizeof(far),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(far);
+    optimizer.get_grad(ParamType::Means).fill_(0.2f);
+    EXPECT_NO_THROW(optimizer.step(1));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+}
+
+namespace {
+    class FarMaskWarningCapture {
+    public:
+        FarMaskWarningCapture() : previous_level_(Logger::get().level()) {
+            Logger::get().set_level(LogLevel::Warn);
+            token_ = Logger::get().add_log_handler(
+                [this](LogLevel level, const SourceSite&, std::string_view message) {
+                    if (level == LogLevel::Warn &&
+                        message.find("mean_step_far_mask row-count mismatch") != std::string_view::npos) {
+                        messages.emplace_back(message);
+                    }
+                });
+        }
+        ~FarMaskWarningCapture() {
+            Logger::get().remove_log_handler(token_);
+            Logger::get().set_level(previous_level_);
+        }
+        std::vector<std::string> messages;
+
+    private:
+        LogLevel previous_level_;
+        LogHandlerToken token_;
+    };
+} // namespace
+
+TEST(MRNFStrategyTest, MeanStepFarMaskMismatchIsIgnoredByExplicitAdam) {
+    for (const int mask_n : {1, 4}) {
+        SCOPED_TRACE(mask_n);
+        auto splat = create_mrnf_test_splat_data(2, 0);
+        auto control_splat = create_mrnf_test_splat_data(2, 0);
+        auto params = vanilla_mrnf_params();
+        params.max_cap = 8;
+        MRNF strategy(splat);
+        MRNF control(control_splat);
+        strategy.initialize(params);
+        control.initialize(params);
+        auto& optimizer = strategy.get_optimizer();
+        auto& control_optimizer = control.get_optimizer();
+        optimizer.set_per_splat_mean_step(true, 0.5f, 1.0f, 300.0f);
+        control_optimizer.set_per_splat_mean_step(true, 0.5f, 1.0f, 300.0f);
+        const auto mask = Tensor::ones({static_cast<size_t>(mask_n)}, Device::CUDA).to(DataType::Bool);
+        optimizer.set_mean_step_far_mask(mask);
+        optimizer.get_grad(ParamType::Means).fill_(0.2f);
+        control_optimizer.get_grad(ParamType::Means).fill_(0.2f);
+        FarMaskWarningCapture warnings;
+
+        EXPECT_NO_THROW(optimizer.step(1));
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+        EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+        control_optimizer.step(1);
+        EXPECT_EQ(means_xyz(splat), means_xyz(control_splat));
+        ASSERT_EQ(warnings.messages.size(), 1u);
+        EXPECT_NE(warnings.messages[0].find("mask=" + std::to_string(mask_n) + ", means=2"), std::string::npos);
+        optimizer.step(2);
+        EXPECT_EQ(warnings.messages.size(), 1u);
+    }
+}
+
+TEST(MRNFStrategyTest, MeanStepFarMaskMismatchIsIgnoredByFusedAdam) {
+    for (const int mask_n : {1, 4}) {
+        SCOPED_TRACE(mask_n);
+        auto splat = create_mrnf_test_splat_data(2, 0);
+        auto params = vanilla_mrnf_params();
+        params.max_cap = 8;
+        MRNF strategy(splat);
+        strategy.initialize(params);
+        auto& optimizer = strategy.get_optimizer();
+        optimizer.set_per_splat_mean_step(true, 0.5f, 1.0f, 300.0f);
+        const auto mask = Tensor::ones({static_cast<size_t>(mask_n)}, Device::CUDA).to(DataType::Bool);
+        optimizer.set_mean_step_far_mask(mask);
+        FarMaskWarningCapture warnings;
+
+        const auto fused = optimizer.prepare_fastgs_fused_adam(1, nullptr);
+        EXPECT_TRUE(fused.enabled);
+        EXPECT_TRUE(fused.means.enabled);
+        EXPECT_TRUE(fused.per_splat_mean_step);
+        EXPECT_EQ(fused.mean_step_far_mask, nullptr);
+        EXPECT_EQ(fused.mean_step_far_mask_n, 0);
+        EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+        EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+        ASSERT_EQ(warnings.messages.size(), 1u);
+        EXPECT_NE(warnings.messages[0].find("mask=" + std::to_string(mask_n) + ", means=2"), std::string::npos);
+        optimizer.prepare_fastgs_fused_adam(2, nullptr);
+        EXPECT_EQ(warnings.messages.size(), 1u);
+
+        const auto current_mask = Tensor::zeros_bool({2}, Device::CUDA);
+        optimizer.set_mean_step_far_mask(current_mask);
+        const auto republished = optimizer.prepare_fastgs_fused_adam(3, nullptr);
+        EXPECT_EQ(republished.mean_step_far_mask, current_mask.ptr<bool>());
+        EXPECT_EQ(republished.mean_step_far_mask_n, 2);
+        EXPECT_EQ(warnings.messages.size(), 1u);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    }
+}
+
+TEST(MRNFStrategyTest, MeanStepFarMaskUploadsHostStorageBeforeAdam) {
+    for (const bool pinned : {false, true}) {
+        SCOPED_TRACE(pinned);
+        auto splat = create_mrnf_test_splat_data(2, 0);
+        auto control_splat = create_mrnf_test_splat_data(2, 0);
+        const auto params = vanilla_mrnf_params();
+        MRNF strategy(splat);
+        MRNF control(control_splat);
+        strategy.initialize(params);
+        control.initialize(params);
+        auto& optimizer = strategy.get_optimizer();
+        auto& control_optimizer = control.get_optimizer();
+        optimizer.set_per_splat_mean_step(true, 0.5f, 1.0f, 300.0f);
+        control_optimizer.set_per_splat_mean_step(true, 0.5f, 1.0f, 300.0f);
+        {
+            // A strided CPU view exercises both pageable/pinned upload and packing.
+            auto host = Tensor::empty({2, 2}, Device::CPU, DataType::Bool, pinned);
+            const bool values[] = {true, false, false, true};
+            std::memcpy(host.ptr<bool>(), values, sizeof(values));
+            auto mask = host.slice(1, 0, 1).squeeze(1);
+            ASSERT_FALSE(mask.is_contiguous());
+            optimizer.set_mean_step_far_mask(mask);
+            control_optimizer.set_mean_step_far_mask(mask.cuda().contiguous());
+            EXPECT_NE(optimizer.mean_step_far_mask(), mask.ptr<bool>());
+        }
+        cudaPointerAttributes attributes{};
+        ASSERT_EQ(cudaPointerGetAttributes(&attributes, optimizer.mean_step_far_mask()), cudaSuccess);
+        EXPECT_EQ(attributes.type, cudaMemoryTypeDevice);
+        bool values[2] = {};
+        ASSERT_EQ(cudaMemcpy(values, optimizer.mean_step_far_mask(), sizeof(values),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_TRUE(values[0]);
+        EXPECT_FALSE(values[1]);
+        const auto fused = optimizer.prepare_fastgs_fused_adam(1, nullptr);
+        EXPECT_EQ(fused.mean_step_far_mask, optimizer.mean_step_far_mask());
+        EXPECT_EQ(fused.mean_step_far_mask_n, 2);
+        optimizer.get_grad(ParamType::Means).fill_(0.2f);
+        control_optimizer.get_grad(ParamType::Means).fill_(0.2f);
+        optimizer.step(1);
+        control_optimizer.step(1);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        EXPECT_EQ(means_xyz(splat), means_xyz(control_splat));
+    }
+}
+
+TEST(MRNFStrategyTest, MeanStepFarMaskRetainsAllocationUntilBindingIsCleared) {
+    auto splat = create_mrnf_test_splat_data(2, 0);
+    MRNF strategy(splat);
+    strategy.initialize(vanilla_mrnf_params());
+    auto& optimizer = strategy.get_optimizer();
+    optimizer.set_per_splat_mean_step(true, 0.5f, 1.0f, 300.0f);
+    std::weak_ptr<Tensor> allocation;
+    {
+        auto owner = std::make_shared<Tensor>(Tensor::ones_bool({2}, Device::CUDA));
+        allocation = owner;
+        auto mask = Tensor::from_external_owner(
+            owner->ptr<bool>(), TensorShape({2}), Device::CUDA, DataType::Bool, owner);
+        optimizer.set_mean_step_far_mask(mask);
+        EXPECT_EQ(optimizer.mean_step_far_mask(), owner->ptr<bool>());
+    }
+    // This observes ownership directly, independent of allocator address reuse.
+    ASSERT_FALSE(allocation.expired());
+    optimizer.get_grad(ParamType::Means).fill_(0.2f);
+    optimizer.step(1);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    optimizer.set_per_splat_mean_step(false, 0.0f, 1.0f, 300.0f);
+    EXPECT_TRUE(allocation.expired());
+    EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+    EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+
+    // A from_blob view has no allocation owner to retain, so the binding must copy it.
+    for (const bool strided : {false, true}) {
+        SCOPED_TRACE(strided);
+        {
+            auto source = Tensor::ones_bool({2, 2}, Device::CUDA);
+            auto borrowed = strided
+                                ? source.slice(1, 0, 1).squeeze(1)
+                                : Tensor::from_blob(source.ptr<bool>(), TensorShape({2}), Device::CUDA, DataType::Bool);
+            ASSERT_FALSE(borrowed.owns_memory());
+            optimizer.set_mean_step_far_mask(borrowed);
+            EXPECT_NE(optimizer.mean_step_far_mask(), source.ptr<bool>());
+            // Also prove independence while the source is still allocated.
+            source.zero_();
+            EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        }
+        bool values[2] = {};
+        ASSERT_EQ(cudaMemcpy(values, optimizer.mean_step_far_mask(), sizeof(values),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_TRUE(values[0]);
+        EXPECT_TRUE(values[1]);
+    }
+    optimizer.set_mean_step_far_mask({});
+}
+
+TEST(MRNFStrategyTest, MeanStepFarMaskEmptyBindingsClearExplicitAndFusedAdam) {
+    auto splat = create_mrnf_test_splat_data(2, 0);
+    MRNF strategy(splat);
+    strategy.initialize(vanilla_mrnf_params());
+    auto& optimizer = strategy.get_optimizer();
+    optimizer.set_per_splat_mean_step(true, 0.5f, 1.0f, 300.0f);
+    for (const auto device : {Device::CPU, Device::CUDA}) {
+        optimizer.set_mean_step_far_mask(Tensor::ones_bool({2}, Device::CUDA));
+        optimizer.set_mean_step_far_mask(Tensor::empty({0}, device, DataType::Bool));
+        EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+        EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+        const auto fused = optimizer.prepare_fastgs_fused_adam(1, nullptr);
+        EXPECT_EQ(fused.mean_step_far_mask, nullptr);
+        EXPECT_EQ(fused.mean_step_far_mask_n, 0);
+        optimizer.get_grad(ParamType::Means).fill_(0.2f);
+        optimizer.step(1);
+    }
+    // External zero-size views may have non-null host storage. Do not query or upload it.
+    auto owner = std::make_shared<bool>(true);
+    auto empty = Tensor::from_external_owner(
+        owner.get(), TensorShape({0}), Device::CPU, DataType::Bool, owner);
+    ASSERT_NE(empty.data_ptr(), nullptr);
+    optimizer.set_mean_step_far_mask(Tensor::ones_bool({2}, Device::CUDA));
+    optimizer.set_mean_step_far_mask(empty);
+    EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+    EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+}
+
+TEST(MRNFStrategyTest, BackgroundToggleBuildsAndClearsFarMaskBeforeNextAdamStep) {
+    auto splat = create_mrnf_test_splat_data(4, 0);
+    auto params = vanilla_mrnf_params();
+    params.far_scene_min_fraction = 0.0f;
+    MRNF strategy(splat);
+    strategy.initialize(params);
+    install_test_camera_hull(strategy);
+    auto& optimizer = strategy.get_optimizer();
+    EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+
+    for (int iteration = 1; iteration <= 2; ++iteration) {
+        params.background_improvements = true;
+        strategy.set_optimization_params(params);
+        ASSERT_NE(optimizer.mean_step_far_mask(), nullptr);
+        ASSERT_EQ(optimizer.mean_step_far_mask_n(), 4);
+        bool values[4] = {};
+        ASSERT_EQ(cudaMemcpy(values, optimizer.mean_step_far_mask(), sizeof(values),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_FALSE(values[0]);
+        EXPECT_TRUE(values[3]);
+        const auto fused = optimizer.prepare_fastgs_fused_adam(iteration, nullptr);
+        EXPECT_EQ(fused.mean_step_far_mask, optimizer.mean_step_far_mask());
+        optimizer.get_grad(ParamType::Means).fill_(0.2f);
+        optimizer.step(iteration);
+
+        params.background_improvements = false;
+        strategy.set_optimization_params(params);
+        EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
+        EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+        EXPECT_FALSE(optimizer.per_splat_mean_step());
+    }
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+}
+
+TEST(MRNFStrategyTest, CheckpointLoadPreservesDatasetFarFieldProtection) {
+    auto original_model = create_mrnf_test_splat_data(8);
+    place_deep_far_probe(original_model);
+    MRNF original(original_model);
+    param::TrainingParameters params;
+    params.optimization = mean_step_test_params(true);
+    params.optimization.far_scene_min_fraction = 0.0f;
+    const auto dataset = make_hull_dataset();
+    original.set_training_dataset(dataset);
+    original.initialize(params.optimization);
+    ASSERT_NE(original.get_optimizer().mean_step_far_mask(), nullptr);
+
+    std::vector<uint8_t> expected_mask(8);
+    ASSERT_EQ(cudaMemcpy(expected_mask.data(), original.get_optimizer().mean_step_far_mask(),
+                         expected_mask.size(), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(expected_mask[1], 0);
+    ASSERT_EQ(expected_mask[7], 1);
+
+    std::stringstream checkpoint(std::ios::in | std::ios::out | std::ios::binary);
+    const auto saved = serialize_checkpoint(checkpoint, 100, original, params,
+                                            nullptr, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(saved);
+
+    auto resumed_model = create_mrnf_test_splat_data(8);
+    MRNF resumed(resumed_model);
+    resumed.set_training_dataset(dataset);
+    resumed.initialize(params.optimization);
+    checkpoint.seekg(0);
+    const auto loaded = load_checkpoint(checkpoint, saved->bytes, resumed, params,
+                                        nullptr, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(loaded) << loaded.error();
+    ASSERT_EQ(*loaded, 100);
+    ASSERT_NE(resumed.get_optimizer().mean_step_far_mask(), nullptr);
+    ASSERT_EQ(resumed.get_optimizer().mean_step_far_mask_n(), 8);
+    std::vector<uint8_t> actual_mask(8);
+    ASSERT_EQ(cudaMemcpy(actual_mask.data(), resumed.get_optimizer().mean_step_far_mask(),
+                         actual_mask.size(), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual_mask, expected_mask);
+}
+
+TEST(MRNFDecayTest, ZeroDecayPreservesFiniteLogitsAndStillDecaysScales) {
+    const std::vector<float> original{-80.0f, -20.0f, 0.0f, 16.85f, 20.0f, 80.0f};
+    for (const auto [decay, train_t] : {std::pair{0.0f, 0.5f}, std::pair{0.004f, 1.0f}}) {
+        auto opacity = Tensor::from_vector(original, {original.size()}, Device::CUDA);
+        auto scales = Tensor::zeros({original.size(), 3}, Device::CUDA);
+        for (int step = 0; step < 100; ++step) {
+            mrnf_strategy::launch_mrnf_decay(opacity.ptr<float>(), scales.ptr<float>(),
+                                             nullptr, 0, nullptr, 0, decay, 0.01f, 1.0f,
+                                             train_t, original.size());
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        const auto actual = opacity.cpu().to_vector();
+        for (size_t i = 0; i < original.size(); ++i)
+            EXPECT_FLOAT_EQ(actual[i], original[i]) << "row " << i;
+        const auto actual_scales = scales.cpu().to_vector();
+        EXPECT_NEAR(actual_scales[0], 100.0f * std::log(1.0f - 0.01f * (1.0f - train_t)), 1e-5f);
+    }
+}
+
+TEST(MRNFDecayTest, SaturatedAndLegacyInfiniteLogitsStayFinite) {
+    const float inf = std::numeric_limits<float>::infinity();
+    const std::vector<float> original{16.85f, 20.0f, 80.0f, inf, -inf};
+    for (const float decay : {0.0f, 1e-12f, 0.004f}) {
+        auto opacity = Tensor::from_vector(original, {original.size()}, Device::CUDA);
+        auto scales = Tensor::zeros({original.size(), 3}, Device::CUDA);
+        mrnf_strategy::launch_mrnf_decay(opacity.ptr<float>(), scales.ptr<float>(),
+                                         nullptr, 0, nullptr, 0, decay, 0.0f, 1.0f,
+                                         0.5f, original.size());
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        const auto actual = opacity.cpu().to_vector();
+        for (size_t i = 0; i < original.size(); ++i) {
+            EXPECT_TRUE(std::isfinite(actual[i])) << "row " << i << ", decay " << decay;
+            if (decay == 1e-12f && i + 1 < original.size()) {
+                const float upper = std::nextafter(1.0f, 0.0f);
+                EXPECT_NEAR(actual[i], std::log(upper / (1.0f - upper)), 1e-5f);
+            }
+            const double expected = i + 1 == original.size() ? 0.0 : 1.0 - decay * 0.5;
+            EXPECT_NEAR(1.0 / (1.0 + std::exp(-double(actual[i]))), expected, 2e-7);
+        }
+    }
+}
+
+TEST(MRNFDecayTest, FrozenRowsAndZeroFarDecayRemainUnchangedWhileNaNsStayVisible) {
+    const float inf = std::numeric_limits<float>::infinity();
+    auto opacity = Tensor::from_vector(std::vector<float>{inf, 20.0f, std::nanf(""), 20.0f}, {4}, Device::CUDA);
+    auto scales = Tensor::zeros({4, 3}, Device::CUDA);
+    const auto frozen = Tensor::from_vector(std::vector<bool>{true, false, false, false}, {4}, Device::CUDA);
+    const auto far = Tensor::from_vector(std::vector<bool>{false, true, false, false}, {4}, Device::CUDA);
+    mrnf_strategy::launch_mrnf_decay(opacity.ptr<float>(), scales.ptr<float>(),
+                                     frozen.ptr<bool>(), 4, far.ptr<bool>(), 4,
+                                     0.004f, 0.01f, 0.0f, 0.5f, 4);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const auto values = opacity.cpu().to_vector();
+    EXPECT_EQ(values[0], inf);
+    EXPECT_FLOAT_EQ(values[1], 20.0f);
+    EXPECT_TRUE(std::isnan(values[2]));
+    EXPECT_NEAR(1.0 / (1.0 + std::exp(-double(values[3]))), 0.998, 2e-7);
+    const auto actual_scales = scales.cpu().to_vector();
+    EXPECT_FLOAT_EQ(actual_scales[0], 0.0f);
+    EXPECT_FLOAT_EQ(actual_scales[3], 0.0f);
+    EXPECT_LT(actual_scales[9], 0.0f);
+}
+
+namespace {
+    SplatData create_distinct_mrnf_splat_data(const size_t n) {
+        const size_t rest = sh_rest_coefficients_for_degree(3);
+        std::vector<float> means(n * 3), sh0(n * 3), scaling(n * 3), rotation(n * 4, 0.0f), opacity(n);
+        std::vector<float> shN(n * rest * 3);
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t c = 0; c < 3; ++c) {
+                means[i * 3 + c] = 0.1f * static_cast<float>(i) + 0.01f * static_cast<float>(c);
+                sh0[i * 3 + c] = 0.02f * static_cast<float>(i % 17) - 0.1f * static_cast<float>(c);
+                scaling[i * 3 + c] = -2.0f + 0.03f * static_cast<float>((i + c) % 11);
+            }
+            rotation[i * 4 + 0] = 1.0f;
+            rotation[i * 4 + 1] = 0.01f * static_cast<float>(i % 7);
+            opacity[i] = -1.0f + 0.02f * static_cast<float>(i % 13);
+            for (size_t k = 0; k < rest * 3; ++k) {
+                shN[i * rest * 3 + k] = 0.001f * static_cast<float>((i * 31 + k * 7) % 97) - 0.05f;
+            }
+        }
+        return SplatData(3,
+                         Tensor::from_vector(means, TensorShape({n, 3}), Device::CUDA),
+                         Tensor::from_vector(sh0, TensorShape({n, 1, 3}), Device::CUDA),
+                         Tensor::from_vector(shN, TensorShape({n, rest, 3}), Device::CUDA),
+                         Tensor::from_vector(scaling, TensorShape({n, 3}), Device::CUDA),
+                         Tensor::from_vector(rotation, TensorShape({n, 4}), Device::CUDA),
+                         Tensor::from_vector(opacity, TensorShape({n, 1}), Device::CUDA),
+                         1.0f);
+    }
+} // namespace
+
+// Large growth events place children chunk by chunk. Fails if a chunk splits
+// the wrong parents, a child lands in the wrong free slot or appended row, a
+// chunk is skipped, or free-slot reuse does not continue across chunks.
+TEST(MRNFStrategyTest, ChunkedChildPlacementMatchesSingleChunk) {
+    constexpr size_t n = 64;
+    auto single_data = create_distinct_mrnf_splat_data(n);
+    auto chunked_data = create_distinct_mrnf_splat_data(n);
+    MRNF single(single_data);
+    MRNF chunked(chunked_data);
+    auto opt_params = vanilla_mrnf_params();
+    opt_params.iterations = 10'000;
+    opt_params.sh_degree_interval = 10'000;
+    opt_params.max_cap = 128;
+    single.initialize(opt_params);
+    chunked.initialize(opt_params);
+
+    const auto free_rows =
+        Tensor::from_vector(std::vector<int>{5, 17, 40}, TensorShape({3}), Device::CUDA).to(DataType::Int64);
+    for (MRNF* strategy : {&single, &chunked}) {
+        strategy->mark_as_free(free_rows);
+        strategy->_splat_data->deleted().index_put_(free_rows, Tensor::ones_bool({3}, Device::CUDA));
+    }
+
+    const auto parents = Tensor::from_vector(std::vector<int>{0, 2, 3, 7, 9, 11, 20, 21, 30, 33, 50, 60},
+                                             TensorShape({12}), Device::CUDA)
+                             .to(DataType::Int64);
+    const auto [single_reused, single_appended] = single.split_parents_into_children(parents, 12);
+    const auto [chunked_reused, chunked_appended] = chunked.split_parents_into_children(parents, 5);
+
+    EXPECT_EQ(single_reused, 3u);
+    EXPECT_EQ(single_appended, 9u);
+    EXPECT_EQ(chunked_reused, single_reused);
+    EXPECT_EQ(chunked_appended, single_appended);
+    ASSERT_EQ(chunked_data.size(), single_data.size());
+    EXPECT_EQ(chunked.free_count(), single.free_count());
+
+    EXPECT_EQ(chunked_data.means().cpu().to_vector(), single_data.means().cpu().to_vector());
+    EXPECT_EQ(chunked_data.sh0().cpu().to_vector(), single_data.sh0().cpu().to_vector());
+    EXPECT_EQ(chunked_data.scaling_raw().cpu().to_vector(), single_data.scaling_raw().cpu().to_vector());
+    EXPECT_EQ(chunked_data.rotation_raw().cpu().to_vector(), single_data.rotation_raw().cpu().to_vector());
+    EXPECT_EQ(chunked_data.opacity_raw().cpu().to_vector(), single_data.opacity_raw().cpu().to_vector());
+    EXPECT_EQ(chunked_data.deleted().to(DataType::Float32).cpu().to_vector(),
+              single_data.deleted().to(DataType::Float32).cpu().to_vector());
+
+    const auto single_sh = single_data.shN_canonical().cpu().to_vector();
+    const auto chunked_sh = chunked_data.shN_canonical().cpu().to_vector();
+    ASSERT_EQ(chunked_sh.size(), single_sh.size());
+    for (size_t i = 0; i < single_sh.size(); ++i) {
+        ASSERT_NEAR(chunked_sh[i], single_sh[i], 1e-4f) << "SH value " << i;
+    }
 }

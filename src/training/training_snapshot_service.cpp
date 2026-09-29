@@ -15,6 +15,7 @@
 #include "core/splat_exportable_storage.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor_serialization_sink.hpp"
+#include "diagnostics/vram_profiler.hpp"
 #include "lfs/cuda_scratch.hpp"
 #include "lfs/training/sh_value_codec.hpp"
 #include "strategies/istrategy.hpp"
@@ -778,6 +779,7 @@ namespace lfs::training {
             }
             ensure_device_scratch();
             calibrate_once(layout, mutating_streams);
+            device_scratch.reset();
             if (slots.empty()) {
                 slots.resize(config.ring_slots);
                 for (auto& slot : slots) {
@@ -2034,8 +2036,6 @@ namespace lfs::training {
 
             prepared->baseline_rss_bytes =
                 read_rss_bytes();
-            impl_->ensure_device_scratch();
-
             if (prepared->checkpoint_bytes >
                 std::numeric_limits<std::size_t>::max()) {
                 return snapshot_error(
@@ -2043,7 +2043,7 @@ namespace lfs::training {
                     "Checkpoint staging exceeds address space",
                     LFS_SOURCE_SITE_CURRENT());
             }
-            const auto host_memory =
+            auto host_memory =
                 read_host_memory_info();
             const auto reserve_bytes =
                 request.relaxed_host_memory_gate
@@ -2061,6 +2061,15 @@ namespace lfs::training {
             }
             const auto required_host_memory =
                 prepared->checkpoint_bytes + reserve_bytes;
+            if (request.release_host_memory &&
+                host_memory.available_bytes > 0 &&
+                host_memory.available_bytes <
+                    required_host_memory &&
+                request.release_host_memory(
+                    required_host_memory -
+                    host_memory.available_bytes) > 0) {
+                host_memory = read_host_memory_info();
+            }
             if (host_memory.available_bytes == 0 ||
                 host_memory.available_bytes <
                     required_host_memory) {
@@ -2236,6 +2245,7 @@ namespace lfs::training {
                     "synchronize snapshot mutating stream");
             }
             const auto sync_end = Clock::now();
+            impl_->ensure_device_scratch();
 
             if (request.capture_additional_cpu_state) {
                 auto captured =
@@ -2321,6 +2331,7 @@ namespace lfs::training {
                     cudaEventSynchronize(last_event),
                     "wait for last snapshot D2H");
             }
+            impl_->device_scratch.reset();
             const auto pause_end = Clock::now();
             const auto capture_rss = read_rss_bytes();
             if (capture_rss >=
@@ -2364,6 +2375,7 @@ namespace lfs::training {
                 Milliseconds(
                     pause_end - pause_begin)
                     .count();
+            lfs::diagnostics::VramProfiler::instance().mark("training_snapshot", {}, pending->metrics.device_snapshot_bytes, pending->metrics.pause_ms);
             pending->metrics.cold_path_ms =
                 pending->metrics.pause_ms +
                 (pending->metrics.cold_first_snapshot
@@ -2448,6 +2460,7 @@ namespace lfs::training {
                     impl_->d2h_stream),
                 impl_->d2h_stream,
                 "failed training snapshot capture drain");
+            impl_->device_scratch.reset();
             pending->pause_end = Clock::now();
             {
                 std::scoped_lock lock(pending->mutex);
