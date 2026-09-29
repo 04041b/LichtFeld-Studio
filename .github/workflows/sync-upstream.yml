@@ -1,0 +1,42 @@
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily at 06:00 UTC
+  workflow_dispatch:       # manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/MrNeRF/LichtFeld-Studio.git
+          git fetch upstream master
+
+      - name: Merge upstream (prefer ours on conflict)
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/master)
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+          echo "Merging $BEHIND commits from upstream..."
+          git merge upstream/master --no-edit -X ours
+
+      - name: Push
+        run: git push origin master
